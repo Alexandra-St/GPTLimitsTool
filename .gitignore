@@ -1,0 +1,40 @@
+# macOS and IDE
+.DS_Store
+*.xcuserstate
+xcuserdata/
+DerivedData/
+.idea/
+.vscode/
+*.swp
+
+# Build outputs and temporary files
+.build/
+build/
+native-prototype/build/
+tmp/
+*.log
+dist/
+
+# Local/runtime data
+diagnostics/
+exports/
+rescue/
+cache/
+cookies/
+sessions/
+
+# Local secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Internal or superseded local notes
+BETA_INSTALL.md
+BETA_RELEASE_CHECKLIST.md
+native-prototype/README.md
+native-prototype/RENDERING_INVESTIGATION.md
+
+# Non-build icon working sources (the required AppIcon.icns is tracked)
+native-prototype/AppIcon-source.png
+native-prototype/AppIcon.iconset/

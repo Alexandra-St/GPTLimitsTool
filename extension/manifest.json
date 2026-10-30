@@ -1,0 +1,29 @@
+{
+  "manifest_version": 3,
+  "name": "GPT Limits Tool",
+  "version": "0.2.0",
+  "version_name": "0.2.0-beta",
+  "description": "Shows local metadata from conversation responses already loaded by ChatGPT.",
+  "permissions": ["storage"],
+  "optional_permissions": ["notifications", "alarms"],
+  "host_permissions": ["https://chatgpt.com/*"],
+  "content_scripts": [
+    {
+      "matches": ["https://chatgpt.com/*"],
+      "js": ["aggregator.js", "history-collector.js", "calibration-summary.js", "risk-notifications.js", "rescue.js", "content.js"],
+      "run_at": "document_start",
+      "world": "ISOLATED"
+    },
+    {
+      "matches": ["https://chatgpt.com/*"],
+      "js": ["page-hook.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    }
+  ],
+  "action": {
+    "default_title": "GPT Limits Tool",
+    "default_popup": "popup.html"
+  },
+  "background": { "service_worker": "background.js" }
+}

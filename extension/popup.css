@@ -1,0 +1,192 @@
+body {
+  width: 420px;
+  margin: 0;
+  color: #202124;
+  background: #fff;
+  font: 14px/1.45 system-ui, sans-serif;
+}
+
+main {
+  padding: 16px;
+}
+
+h1 {
+  margin: 0 0 12px;
+  font-size: 17px;
+}
+
+.rescue-section {
+  margin: 0 0 12px;
+  padding: 10px 0;
+  border-bottom: 1px solid #e8eaed;
+}
+
+.rescue-panel {
+  margin-top: 8px;
+  padding: 10px;
+  background: #f8f9fa;
+  border-radius: 6px;
+}
+
+.rescue-panel p {
+  margin: 0 0 8px;
+  color: #5f6368;
+  font-size: 12px;
+}
+
+#rescue-progress-bar {
+  width: 100%;
+  margin: 0 0 8px;
+}
+
+.notification-setting {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 8px 0;
+  color: #5f6368;
+  font-size: 12px;
+}
+
+dl {
+  display: grid;
+  grid-template-columns: 1fr 1.2fr;
+  gap: 7px 12px;
+  margin: 12px 0;
+}
+
+h2 {
+  margin: 16px 0 8px;
+  font-size: 14px;
+}
+
+h3 {
+  margin: 12px 0 4px;
+  color: #5f6368;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+#monitored-chats,
+#other-tracked-chats {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+#monitored-chats li,
+#other-tracked-chats li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 4px 10px;
+  padding: 9px 0;
+  border-top: 1px solid #e8eaed;
+}
+
+.tracked-title {
+  overflow: hidden;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tracked-meta {
+  grid-column: 1;
+  color: #5f6368;
+  font-size: 12px;
+}
+
+.tracked-calibration-control {
+  grid-column: 1;
+  color: #5f6368;
+  font-size: 12px;
+}
+
+.tracked-calibration-select {
+  max-width: 190px;
+  font: inherit;
+}
+
+#calibration-summary-section {
+  margin-top: 18px;
+  padding-top: 10px;
+  border-top: 1px solid #dadce0;
+}
+
+#calibration-counts,
+.calibration-label-summary p {
+  margin: 4px 0;
+  color: #5f6368;
+  font-size: 12px;
+}
+
+.calibration-label-summary {
+  margin-top: 10px;
+}
+
+.calibration-label-summary h3 {
+  margin-top: 8px;
+}
+
+.calibration-label-summary h4 {
+  margin: 6px 0 2px;
+  font-size: 12px;
+}
+
+#calibration-points-details {
+  margin-top: 10px;
+}
+
+#calibration-points {
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.calibration-point {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: start;
+  padding: 8px 0;
+  border-top: 1px solid #e8eaed;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+}
+
+.delete-calibration-point {
+  white-space: nowrap;
+}
+
+.tracked-remove {
+  grid-column: 2;
+  grid-row: 2;
+  align-self: center;
+}
+
+.tracked-action {
+  grid-column: 2;
+  grid-row: 1;
+  align-self: center;
+}
+
+.tracked-action.monitored {
+  font-weight: 600;
+}
+
+dt {
+  color: #5f6368;
+}
+
+dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-weight: 550;
+}
+
+.note {
+  margin: 14px 0 0;
+  color: #5f6368;
+  font-size: 12px;
+}

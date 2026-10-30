@@ -1,0 +1,160 @@
+const { test } = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const vm = require('node:vm');
+const path = require('node:path');
+
+const source = fs.readFileSync(path.join(__dirname, 'page-hook.js'), 'utf8');
+function fixture(fetchImpl) {
+  const messages = [];
+  const location = { href: 'https://chatgpt.com/c/chat-secret', origin: 'https://chatgpt.com', pathname: '/c/chat-secret' };
+  const window = {
+    location,
+    performance: { now: () => 100 },
+    fetch: fetchImpl,
+    postMessage: (data) => messages.push(data),
+    addEventListener: () => {},
+  };
+  class FakeRequest { constructor(url) { this.url = url; } }
+  class FakeXHR { open() {} send() {} addEventListener() {} }
+  const context = vm.createContext({ window, location, URL, Request: FakeRequest, XMLHttpRequest: FakeXHR, setTimeout, clearTimeout, console, Date, Math, JSON, Object, Array, Number, String, Boolean, Set, Map, RegExp, Promise });
+  vm.runInContext(source, context);
+  return { window, messages };
+}
+function payload(id, time = 100) {
+  return { conversation_id: 'chat-secret', title: 'private title', page_info: { has_previous_page: true, next_cursor: 'response-cursor-secret' }, messages: [{ id, author: { role: 'user' }, content: { content_type: 'text', parts: ['private body'] }, create_time: time }] };
+}
+function response(body, url) {
+  return { ok: true, status: 200, url, headers: { get: () => 'application/json' }, clone: () => ({ json: async () => body }) };
+}
+async function drain() { await new Promise(resolve => setImmediate(resolve)); await new Promise(resolve => setImmediate(resolve)); }
+
+test('first-pass cursor chain is bounded and continuation comparisons use sanitized fingerprints', async () => {
+  const f = fixture(url => Promise.resolve(response(payload('message-secret'), url)));
+  f.window.gptLiveResumeFirstPassGeneration = 'first-generation';
+  f.window.gptLiveResumeCaptureGeneration = 'first-generation';
+  await f.window.fetch('https://chatgpt.com/backend-api/conversations/chat-secret/messages?cursor=cursor-secret');
+  await drain();
+  const firstPipeline = f.messages.find(item => item.responsePipeline)?.responsePipeline;
+  assert.equal(firstPipeline.requestOrigin, 'first_pass');
+  assert.equal(firstPipeline.requestOrdinal, 1);
+  assert.equal(firstPipeline.requestObserved, true);
+  assert.equal(firstPipeline.captureSource, 'fetch');
+  assert.equal(firstPipeline.responseObserved, true);
+  const capturedSummary = f.messages.find(item => item.summary)?.summary;
+  assert.equal(capturedSummary.sourceLineage.endpointClass, 'conversation_messages');
+  assert.equal(capturedSummary.sourceLineage.requestOrigin, 'first_pass');
+  assert.equal(capturedSummary.sourceLineage.requestOrdinal, 1);
+  assert.equal(capturedSummary.sourceLineage.generationMatchesFirstPass, true);
+  assert.ok(!JSON.stringify(capturedSummary.sourceLineage).includes('cursor-secret'));
+  assert.ok(!JSON.stringify(capturedSummary.sourceLineage).includes('first-generation'));
+  assert.match(firstPipeline.requestCursorFingerprint, /^[a-f0-9]{8}$/);
+  assert.match(firstPipeline.responsePageFingerprint, /^1:[a-f0-9]{8}$/);
+  assert.equal(f.window.gptRecordHistoryRequestAcceptance(1, true, true, 'first'), true);
+  const boundary = f.window.gptCaptureHistoryRequestBoundary();
+  assert.equal(boundary.requestCount, 1);
+  assert.equal(boundary.responseCount, 1);
+  assert.equal(boundary.requestInFlightCount, 0);
+  assert.equal(boundary.responseInFlightCount, 0);
+  assert.equal(boundary.pages[0].accepted, true);
+  assert.equal(boundary.pages[0].temporalRelation, 'first');
+  assert.equal(boundary.pages[0].hasPreviousPage, true);
+  assert.equal(JSON.stringify([boundary, firstPipeline]).includes('cursor-secret'), false);
+  assert.equal(JSON.stringify([boundary, firstPipeline]).includes('message-secret'), false);
+  assert.equal(JSON.stringify([boundary, firstPipeline]).includes('private title'), false);
+  assert.equal(JSON.stringify([boundary, firstPipeline]).includes('private body'), false);
+
+  f.window.gptLiveResumeContinuationGeneration = 'continuation-generation';
+  f.window.gptLiveResumeCaptureGeneration = 'continuation-generation';
+  await f.window.fetch('https://chatgpt.com/backend-api/conversations/chat-secret/messages?cursor=cursor-secret');
+  await drain();
+  const continuation = f.messages.filter(item => item.responsePipeline).at(-1).responsePipeline;
+  assert.equal(continuation.requestOrigin, 'continuation');
+  assert.equal(continuation.requestCursorSeenFirstPass, true);
+  assert.equal(continuation.requestCursorFirstPassMatchOrdinal, 1);
+  assert.equal(continuation.requestCursorMatchesLastFirstPass, true);
+  assert.equal(continuation.exactFirstPassPageMatch, true);
+  assert.equal(continuation.baselineIdentityOverlapCount, 1);
+  assert.equal(continuation.allItemsAlreadyKnownBaseline, true);
+  assert.equal(continuation.newIdentityCount, 0);
+  assert.equal(JSON.stringify(continuation).includes('cursor-secret'), false);
+  assert.equal(JSON.stringify(continuation).includes('message-secret'), false);
+});
+
+test('request origin stays first_pass when its response arrives after the handoff', async () => {
+  let resolveFetch;
+  const f = fixture(url => new Promise(resolve => { resolveFetch = () => resolve(response(payload('pending-message-secret'), url)); }));
+  f.window.gptLiveResumeFirstPassGeneration = 'first-generation';
+  f.window.gptLiveResumeCaptureGeneration = 'first-generation';
+  const request = f.window.fetch('https://chatgpt.com/backend-api/conversations/chat-secret/messages?cursor=pending-cursor-secret');
+  const boundary = f.window.gptCaptureHistoryRequestBoundary();
+  assert.equal(boundary.requestInFlightCount, 1);
+  assert.equal(boundary.responseInFlightCount, 0);
+  assert.equal(boundary.pendingRequestOrdinal, 1);
+  f.window.gptLiveResumeContinuationGeneration = 'continuation-generation';
+  f.window.gptLiveResumeCaptureGeneration = 'continuation-generation';
+  resolveFetch();
+  await request;
+  await drain();
+  const pipeline = f.messages.find(item => item.responsePipeline)?.responsePipeline;
+  assert.equal(pipeline.requestOrigin, 'first_pass');
+  assert.equal(pipeline.requestOrdinal, 1);
+  assert.equal(JSON.stringify(pipeline).includes('pending-cursor-secret'), false);
+  assert.equal(JSON.stringify(pipeline).includes('pending-message-secret'), false);
+});
+
+test('conversation detail captures expose endpoint class without inventing a tracked history request', async () => {
+  const f = fixture(url => Promise.resolve(response(payload('detail-message-secret'), url)));
+  const path = 'https://chatgpt.com/backend-api/conversation/chat-secret';
+  await f.window.fetch(path);
+  await drain();
+  const pipeline = f.messages.find(item => item.responsePipeline)?.responsePipeline;
+  assert.equal(pipeline.requestClass, 'conversation_detail');
+  assert.equal(pipeline.requestObserved, false);
+  assert.equal(pipeline.requestOrigin, 'unknown');
+  assert.equal(pipeline.responseObserved, true);
+  assert.equal(pipeline.captureSource, 'fetch');
+  assert.ok(!JSON.stringify(pipeline).includes('detail-message-secret'));
+});
+
+test('continuation identity telemetry uses the complete first-pass aggregate, including identities outside saved page entries', async () => {
+  const f = fixture(url => Promise.resolve(response(payload('page-only-message'), url)));
+  f.window.gptLiveResumeFirstPassGeneration = 'first-generation';
+  f.window.gptLiveResumeCaptureGeneration = 'first-generation';
+  await f.window.fetch('https://chatgpt.com/backend-api/conversations/chat-secret/messages?cursor=private-cursor');
+  await drain();
+  const pipeline = f.messages.find(item => item.responsePipeline).responsePipeline;
+  f.window.gptRecordHistoryRequestAcceptance(pipeline.requestOrdinal, true, true, 'first');
+  const boundary = f.window.gptCaptureHistoryRequestBoundary(['page-only-message', 'aggregate-only-message', 'another-aggregate-message']);
+  assert.equal(boundary.aggregateBaselineSource, 'first_pass_aggregate');
+  assert.equal(boundary.aggregateBaselineIdentityCount, 3);
+  assert.equal(boundary.savedPageEntryCount, 1);
+  f.window.gptLiveResumeContinuationGeneration = 'continuation-generation';
+  f.window.gptLiveResumeCaptureGeneration = 'continuation-generation';
+  await f.window.fetch('https://chatgpt.com/backend-api/conversations/chat-secret/messages?cursor=continuation-cursor');
+  await drain();
+  const continuation = f.messages.filter(item => item.responsePipeline).at(-1).responsePipeline;
+  assert.equal(continuation.baselineIdentitySetCount, 3);
+  assert.equal(continuation.baselineIdentityOverlapCount, 1);
+  assert.equal(continuation.allItemsAlreadyKnownBaseline, true);
+  assert.equal(continuation.newIdentityCount, 0);
+  const serialized = JSON.stringify([boundary, continuation]);
+  for (const secret of ['aggregate-only-message', 'another-aggregate-message', 'page-only-message', 'private-cursor']) assert.equal(serialized.includes(secret), false);
+});
+
+test('truncated full aggregate identity telemetry is explicitly not comparable', async () => {
+  const f = fixture(url => Promise.resolve(response(payload('late-baseline-message'), url)));
+  const aggregate = Array.from({length: 50001}, (_, index) => `baseline-private-${index}`);
+  aggregate.push('late-baseline-message');
+  const boundary = f.window.gptCaptureHistoryRequestBoundary(aggregate);
+  assert.equal(boundary.aggregateBaselineIdentitySetTruncated, true);
+  assert.equal(boundary.aggregateBaselineIdentityCount, 50000);
+  f.window.gptLiveResumeContinuationGeneration = 'continuation-generation';
+  f.window.gptLiveResumeCaptureGeneration = 'continuation-generation';
+  await f.window.fetch('https://chatgpt.com/backend-api/conversations/chat-secret/messages?cursor=continuation-cursor');
+  await drain();
+  const continuation = f.messages.filter(item => item.responsePipeline).at(-1).responsePipeline;
+  assert.equal(continuation.baselineIdentityOverlapCount, null);
+  assert.equal(continuation.allItemsAlreadyKnownBaseline, null);
+  assert.equal(JSON.stringify([boundary, continuation]).includes('late-baseline-message'), false);
+});

@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>GPT Limits Tool</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <main>
+      <h1>GPT Limits Tool</h1>
+      <p id="status" role="status">Open a ChatGPT conversation to view current-chat statistics.</p>
+      <section id="chat-rescue-section" class="rescue-section" hidden>
+        <button id="rescue-current-chat" type="button">Rescue current chat</button>
+        <div id="rescue-confirm" class="rescue-panel" hidden>
+          <p>This will automatically scroll the open chat and may take some time. Avoid interacting with the window until it finishes. The result may be Partial if the ChatGPT UI does not expose the full history. Collected text stays in memory for this rescue and is not saved by the extension unless you export it.</p>
+          <button id="start-rescue" type="button">Start rescue</button>
+          <button id="cancel-rescue-confirm" type="button">Cancel</button>
+        </div>
+        <div id="rescue-progress-panel" class="rescue-panel" hidden>
+          <p id="rescue-progress-status" role="status">Collecting…</p>
+          <progress id="rescue-progress-bar" max="100" value="0"></progress>
+          <button id="cancel-rescue-operation" type="button">Cancel</button>
+        </div>
+        <div id="rescue-result-panel" class="rescue-panel" hidden>
+          <p id="rescue-result-status" role="status"></p>
+          <button id="save-rescue-html" type="button">Save self-contained HTML</button>
+          <button id="save-rescue-text" type="button">Save as .txt</button>
+        </div>
+      </section>
+      <label class="notification-setting"><input id="desktop-risk-notifications" type="checkbox"> Desktop risk notifications <span id="desktop-risk-notifications-state">Off</span></label>
+      <button id="send-test-notification" type="button" disabled>Send test notification</button>
+      <p id="desktop-risk-notifications-help" role="status" hidden></p>
+      <label class="notification-setting"><input id="background-monitoring" type="checkbox"> Background monitoring (experimental): <span id="background-monitoring-state">Off</span></label>
+      <p id="automatic-check-schedule" role="status">Automatic checks: Off</p>
+      <label class="notification-setting" for="automatic-check-interval">Automatic monitored-chat checks
+        <select id="automatic-check-interval">
+          <option value="off">Off</option>
+          <option value="30">Every 30 minutes</option>
+          <option value="60">Every 1 hour</option>
+          <option value="180">Every 3 hours</option>
+        </select>
+      </label>
+      <p id="automatic-check-status" role="status">Last check: Not run</p>
+      <p id="automatic-check-next" role="status">Next check: —</p>
+      <details id="background-monitoring-details">
+        <summary>Background monitoring details</summary>
+        <p id="background-monitoring-help">Checks monitored chats through a temporary inactive ChatGPT tab while Chrome is running.</p>
+        <button id="check-monitored-chat" type="button" disabled>Check monitored chat now</button>
+        <p id="background-check-status" role="status">Background check: Not run</p>
+        <p id="automatic-scheduler-alarm" role="status">Scheduler alarm: Off</p>
+        <p id="automatic-scheduler-next" role="status">Next tick: —</p>
+        <p id="automatic-scheduler-last-tick" role="status">Last tick: —</p>
+        <p id="automatic-scheduler-result" role="status">Result: —</p>
+        <button id="run-automatic-tick" type="button">Run automatic tick now</button>
+      </details>
+      <button id="reset-current-chat" type="button" hidden>Reset current chat data</button>
+      <p id="reset-status" role="status" hidden></p>
+      <button id="collect-full-history" type="button" hidden>Collect full history</button>
+      <button id="stop-history-collection" type="button" hidden>Stop</button>
+      <p id="history-collection-status" role="status" hidden></p>
+      <dl id="details" hidden>
+        <dt>Chat</dt><dd id="title"></dd>
+        <dt>Messages collected</dt><dd id="message-count"></dd>
+        <dt>User</dt><dd id="user-count"></dd>
+        <dt>Assistant</dt><dd id="assistant-count"></dd>
+        <dt>Other</dt><dd id="other-count"></dd>
+        <dt>Estimated text tokens</dt><dd id="token-count"></dd>
+        <dt>Risk</dt><dd id="risk-state">Risk model unavailable — more calibration data is needed.</dd>
+        <dt>Images</dt><dd id="images-count"></dd>
+        <dt>Audio</dt><dd id="audio-count"></dd>
+        <dt>Video</dt><dd id="video-count"></dd>
+        <dt>Other attachments</dt><dd id="files-count"></dd>
+        <dt>History</dt><dd id="history-status"></dd>
+        <dt>Last updated</dt><dd id="last-updated"></dd>
+      </dl>
+      <section id="tracked-chats-section" aria-labelledby="tracked-heading" hidden>
+        <h2 id="tracked-heading">Tracked chats</h2>
+        <h3>Monitored</h3>
+        <ul id="monitored-chats"></ul>
+        <h3>Other tracked chats</h3>
+        <ul id="other-tracked-chats"></ul>
+      </section>
+      <details id="calibration-details">
+        <summary>Calibration</summary>
+        <section id="calibration-summary-section" aria-labelledby="calibration-heading" hidden>
+          <h2 id="calibration-heading">Calibration data</h2>
+          <p id="calibration-counts">Normal: 0 · Near limit: 0 · Limit reached: 0</p>
+          <button id="copy-calibration-summary" type="button">Copy calibration summary</button>
+          <p id="calibration-copy-status" role="status" hidden></p>
+          <div id="calibration-ranges"></div>
+          <div id="latest-points"></div>
+          <div id="latest-complete-points"></div>
+          <details id="risk-model-details">
+            <summary>Risk model details</summary>
+            <div id="risk-model-content"></div>
+          </details>
+          <details id="calibration-points-details">
+            <summary>Calibration points</summary>
+            <ul id="calibration-points"></ul>
+          </details>
+        </section>
+      </details>
+      <p class="note">GPT Limits Tool stores local aggregate counts and message IDs for deduplication. Message text is not stored.</p>
+    </main>
+    <script src="calibration-summary.js"></script>
+    <script src="popup.js"></script>
+  </body>
+</html>
