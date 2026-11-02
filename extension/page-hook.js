@@ -86,6 +86,14 @@
     }
   }
 
+  function potentialHistoryUrl(rawUrl) {
+    try {
+      const url = new URL(rawUrl, window.location.href);
+      return url.origin === window.location.origin && /^\/backend-api\//i.test(url.pathname) &&
+        /(conversation|messages|history|chat|thread)/i.test(url.pathname) && !matchingUrl(rawUrl);
+    } catch { return false; }
+  }
+
   function paginationConversationId(rawUrl) {
     try {
       const url = new URL(rawUrl, window.location.href);
@@ -207,11 +215,85 @@
     return typeof value === "string" && value.length > 0 ? fingerprint(value) : null;
   }
 
-  function responseMetadata(rawUrl, transport, status, liveResumeGeneration, requestCursor, requestRecord) {
+  function normalizedEndpointTemplate(rawUrl) {
+    try {
+      const url = new URL(rawUrl, window.location.href);
+      if (url.origin !== window.location.origin || !url.pathname.startsWith("/backend-api/")) return "/other";
+      if (/^\/backend-api\/conversations\/[^/]+\/messages\/?$/i.test(url.pathname)) return "/backend-api/conversations/:id/messages";
+      if (/^\/backend-api\/(?:conversation|conversations)\/[^/]+\/?$/i.test(url.pathname)) return "/backend-api/conversations/:id";
+      return "/backend-api/:other";
+    } catch { return "/other"; }
+  }
+
+  function responseContentTypeCategory(value) {
+    if (typeof value !== "string" || !value.trim()) return "unknown";
+    const mediaType = value.split(";", 1)[0].trim().toLowerCase();
+    if (mediaType === "application/json" || mediaType.endsWith("+json")) return "json";
+    if (mediaType.startsWith("text/")) return "text";
+    return "other";
+  }
+
+  function responseShape(payload) {
+    const topLevelType = payload === null ? "null" : Array.isArray(payload) ? "array" :
+      typeof payload === "object" ? "object" : ["string", "number", "boolean"].includes(typeof payload) ? typeof payload : "unknown";
+    const safeName = value => typeof value === "string" && /^[A-Za-z][A-Za-z0-9_]{0,47}$/.test(value) ? value : null;
+    const entries = payload && typeof payload === "object" && !Array.isArray(payload) ? Object.entries(payload) : [];
+    const topLevelKeyNames = entries.map(([key]) => safeName(key)).filter(Boolean).slice(0, 32);
+    const topLevelArrayCounts = entries.filter(([, value]) => Array.isArray(value)).slice(0, 32)
+      .map(([key, value]) => ({ key: safeName(key), count: Math.min(100000, value.length) })).filter(item => item.key);
+    const pageInfo = payload && typeof payload === "object" ? payload.page_info : null;
+    return {
+      topLevelType, topLevelKeyNames, topLevelArrayCounts,
+      expectedStructure: {
+        conversationId: typeof payload?.conversation_id === "string",
+        messagesArray: Array.isArray(payload?.messages),
+        mappingObject: !!payload?.mapping && typeof payload.mapping === "object" && !Array.isArray(payload.mapping),
+        pageInfoObject: !!pageInfo && typeof pageInfo === "object" && !Array.isArray(pageInfo),
+        hasPreviousPageBoolean: typeof pageInfo?.has_previous_page === "boolean",
+      },
+    };
+  }
+
+  function makeResponseParseDiagnostic(rawUrl, transport, status, contentType, payload, {
+    parserAttempted = false, parserAccepted = false, rejectionReason = "unknown",
+    extractedPageCount = 0, extractedMessageCount = null, hasPreviousPage = null,
+  } = {}) {
+    const endpointTemplate = ["/backend-api/conversations/:id/messages", "/backend-api/conversations/:id", "/backend-api/:other", "/other"].includes(rawUrl) ? rawUrl : normalizedEndpointTemplate(rawUrl);
+    const requestClass = endpointTemplate === "/backend-api/:other" || endpointTemplate === "/other" ? "other" : historyRequestClass(rawUrl);
+    let safeReason = rejectionReason;
+    if (requestClass === "other") safeReason = "endpoint_not_recognized";
+    const shape = responseShape(payload);
+    return {
+      endpointTemplate, transport: transport === "XHR" ? "XHR" : "fetch",
+      status: Number.isSafeInteger(status) && status >= 0 && status <= 599 ? status : 0,
+      contentTypeCategory: ["json","text","other","unknown"].includes(contentType) ? contentType : responseContentTypeCategory(contentType),
+      ...shape, parserAttempted: parserAttempted === true, parserAccepted: parserAccepted === true,
+      rejectionReason: ["endpoint_not_recognized", "top_level_shape_changed", "conversation_mapping_missing", "messages_array_missing", "pagination_field_changed", "parser_exception", "parsed_but_empty", "accepted", "http_error", "route_mismatch", "not_history_payload"].includes(safeReason) ? safeReason : "parser_exception",
+      extractedPageCount: Math.max(0, Math.min(1, Number.isSafeInteger(extractedPageCount) ? extractedPageCount : 0)),
+      extractedMessageCount: Number.isSafeInteger(extractedMessageCount) ? Math.max(0, Math.min(100000, extractedMessageCount)) : null,
+      hasPreviousPage: typeof hasPreviousPage === "boolean" ? hasPreviousPage : null,
+      pageUpdateCallbackFired: false,
+    };
+  }
+
+  function parsedResponseDiagnostic(rawUrl, transport, status, contentType, payload, {
+    accepted = false, rejectionReason = "unknown", extractedMessageCount = null, hasPreviousPage = null,
+  } = {}) {
+    return makeResponseParseDiagnostic(rawUrl, transport, status, contentType, payload, {
+      parserAttempted: true, parserAccepted: accepted, rejectionReason,
+      extractedPageCount: accepted ? 1 : 0, extractedMessageCount, hasPreviousPage,
+    });
+  }
+  window.gptSanitizeHistoryResponseDiagnostic = (rawUrl, transport, status, contentType, payload, options = {}) =>
+    makeResponseParseDiagnostic(rawUrl, transport, status, contentType, payload, options);
+
+  function responseMetadata(rawUrl, transport, status, liveResumeGeneration, requestCursor, requestRecord, contentType = null) {
     return {
       requestClass: historyRequestClass(rawUrl),
+      endpointTemplate: normalizedEndpointTemplate(rawUrl),
       transport,
       status,
+      contentTypeCategory: responseContentTypeCategory(contentType),
       liveResumeGeneration,
       requestCursorFingerprint: requestCursor,
       requestOrdinal: requestRecord?.ordinal ?? null,
@@ -416,10 +498,33 @@
   }
 
   function emitResponsePipeline(metadata, fields) {
-    const pipeline = buildResponsePipeline(metadata, fields);
+    const reason = fields?.rejectionReason === "http_error" ? "http_error"
+      : fields?.rejectionReason === "route_mismatch" ? "route_mismatch"
+      : fields?.rejectionReason === "payload_parse_failed" ? "parser_exception"
+      : fields?.rejectionReason === "not_history_payload" ? "top_level_shape_changed" : "parser_exception";
+    const diagnostic = fields?.responseParseDiagnostic || makeResponseParseDiagnostic(
+      metadata?.endpointTemplate || "/other", metadata?.transport || "fetch", metadata?.status || 0,
+      metadata?.contentTypeCategory || null, null,
+      { parserAttempted: false, parserAccepted: false, rejectionReason: reason },
+    );
+    const pipeline = buildResponsePipeline(metadata, { ...fields, responseParseDiagnostic: diagnostic });
     if (!pipeline) return null;
     try { window.postMessage({ source: marker, responsePipeline: pipeline }, window.location.origin); } catch {}
     return pipeline;
+  }
+
+  function emitUnrecognizedEndpointDiagnostic(rawUrl, transport, status, contentType, payload = null, parseFailed = false) {
+    const metadata = responseMetadata(rawUrl, transport, status, window.gptLiveResumeCaptureGeneration || null, null, null, contentType);
+    const diagnostic = makeResponseParseDiagnostic(rawUrl, transport, status, contentType, payload, {
+      parserAttempted: false, parserAccepted: false,
+      rejectionReason: parseFailed ? "parser_exception" : "endpoint_not_recognized",
+    });
+    emitResponsePipeline(metadata, {
+      payloadRecognized: false, itemCount: null, hasPreviousPage: null,
+      responseCursorFingerprint: null, responsePageFingerprint: null, pageActivityBounds: null,
+      routeMatches: false, rejectionReason: parseFailed ? "payload_parse_failed" : "not_history_payload",
+      responseParseDiagnostic: diagnostic,
+    });
   }
 
   function safeContentType(value) {
@@ -784,6 +889,13 @@
       routeMatches: hasConversationId && conversationId === currentConversationId(),
       rejectionReason: null,
     };
+    const pageInfo = payload && typeof payload === "object" ? payload.page_info : null;
+    const parseDiagnostic = (accepted, reason) => parsedResponseDiagnostic(rawUrl, captureSource, metadata?.status || 0,
+      metadata?.contentTypeCategory || null, payload, {
+        accepted, rejectionReason: reason,
+        extractedMessageCount: Array.isArray(messages) ? messages.length : null,
+        hasPreviousPage: typeof pageInfo?.has_previous_page === "boolean" ? pageInfo.has_previous_page : null,
+      });
     const characteristicCount = [
       typeof payload?.title === "string",
       Object.prototype.hasOwnProperty.call(payload || {}, "current_node"),
@@ -809,6 +921,7 @@
       diagnostic.error = "pagination response conversation ID does not match the open chat";
       reportDiagnostic(diagnostic);
       pipelineFields.rejectionReason = "route_mismatch";
+      pipelineFields.responseParseDiagnostic = parseDiagnostic(false, "route_mismatch");
       emitResponsePipeline(metadata, pipelineFields);
       return;
     }
@@ -824,6 +937,9 @@
         reportDiagnostic(diagnostic);
       }
       pipelineFields.rejectionReason = characteristicCount >= 2 ? "payload_parse_failed" : "not_history_payload";
+      pipelineFields.responseParseDiagnostic = parseDiagnostic(false,
+        payload?.mapping && typeof payload.mapping === "object" && !Array.isArray(payload.mapping) ? "conversation_mapping_missing" :
+        !Array.isArray(messages) ? "messages_array_missing" : "top_level_shape_changed");
       emitResponsePipeline(metadata, pipelineFields);
       return;
     }
@@ -837,6 +953,7 @@
         : "conversation response messages have an unexpected structure (message ID missing)";
       reportDiagnostic(diagnostic);
       pipelineFields.rejectionReason = "payload_parse_failed";
+      pipelineFields.responseParseDiagnostic = parseDiagnostic(false, "parser_exception");
       emitResponsePipeline(metadata, pipelineFields);
       return;
     }
@@ -863,7 +980,6 @@
       delete item.attachmentTrace;
     }
 
-    const pageInfo = payload.page_info;
     const capturedAt = Date.now();
     const summary = {
       title: typeof payload.title === "string" ? payload.title.slice(0, 500) : "",
@@ -895,6 +1011,7 @@
     latestSanitizedCapture = { summary, captureSequence: sequence };
     pipelineFields.payloadRecognized = true;
     pipelineFields.rejectionReason = null;
+    pipelineFields.responseParseDiagnostic = parseDiagnostic(true, "accepted");
     const pipeline = buildResponsePipeline(metadata, pipelineFields);
     window.postMessage({
       source: marker,
@@ -913,16 +1030,26 @@
     const liveResumeGeneration = typeof window.gptLiveResumeCaptureGeneration === "string" ? window.gptLiveResumeCaptureGeneration : null;
     const requestCursor = requestCursorFingerprint(requestUrl, args[1]?.body);
     const requestRecord = requestUrl && matchingUrl(requestUrl) ? beginHistoryRequest(requestUrl, "fetch", liveResumeGeneration, requestCursor) : null;
-    const metadata = requestRecord ? responseMetadata(requestUrl, "fetch", 0, liveResumeGeneration, requestCursor, requestRecord) : null;
+    const candidateHistoryEndpoint = potentialHistoryUrl(requestUrl);
+    const metadata = requestRecord || candidateHistoryEndpoint ? responseMetadata(requestUrl, "fetch", 0, liveResumeGeneration, requestCursor, requestRecord) : null;
     const responsePromise = originalFetch.apply(this, args);
     if (requestUrl && relevantNetworkUrl(requestUrl)) {
       responsePromise.then(async (response) => {
         requestReachedServer(requestRecord);
         if (matchingUrl(requestUrl)) reportCandidate(requestUrl, "fetch");
         recordResource(requestUrl, "fetch", { status: response.status, contentType: response.headers?.get?.("content-type"), startTime: startedAt });
-        if (!matchingUrl(requestUrl) || isStreamStatusUrl(requestUrl)) return;
+        if (!matchingUrl(requestUrl) || isStreamStatusUrl(requestUrl)) {
+          if (candidateHistoryEndpoint && !isStreamStatusUrl(requestUrl)) {
+            const contentType = response.headers?.get?.("content-type") || null;
+            if (!response.ok) { emitUnrecognizedEndpointDiagnostic(requestUrl, "fetch", response.status, contentType); return; }
+            response.clone().json().then(payload => emitUnrecognizedEndpointDiagnostic(requestUrl, "fetch", response.status, contentType, payload))
+              .catch(() => emitUnrecognizedEndpointDiagnostic(requestUrl, "fetch", response.status, contentType, null, true));
+          }
+          return;
+        }
         if (requestRecord) historyResponseInFlight++;
-        const responseMeta = responseMetadata(requestUrl, "fetch", response.status, liveResumeGeneration, requestCursor, requestRecord);
+        const contentType = response.headers?.get?.("content-type") || null;
+        const responseMeta = responseMetadata(requestUrl, "fetch", response.status, liveResumeGeneration, requestCursor, requestRecord, contentType);
         if (!response.ok) { emitResponsePipeline(responseMeta, { payloadRecognized: false, itemCount: null, hasPreviousPage: null, responseCursorFingerprint: null, responsePageFingerprint: null, pageActivityBounds: null, routeMatches: false, rejectionReason: "http_error" }); return; }
         try {
           if (response.url && new URL(response.url).origin !== window.location.origin) {
@@ -931,7 +1058,7 @@
         } catch { emitResponsePipeline(responseMeta, { payloadRecognized: false, itemCount: null, hasPreviousPage: null, responseCursorFingerprint: null, responsePageFingerprint: null, pageActivityBounds: null, routeMatches: false, rejectionReason: "route_mismatch" }); return; }
         const responseClone = response.clone();
         return responseClone.json().then(payload => capture(requestUrl, payload, "fetch", responseMeta))
-          .catch(() => emitResponsePipeline(responseMeta, { payloadRecognized: false, itemCount: null, hasPreviousPage: null, responseCursorFingerprint: null, responsePageFingerprint: null, pageActivityBounds: null, routeMatches: false, rejectionReason: "payload_parse_failed" }));
+          .catch(() => emitResponsePipeline(responseMeta, { payloadRecognized: false, itemCount: null, hasPreviousPage: null, responseCursorFingerprint: null, responsePageFingerprint: null, pageActivityBounds: null, routeMatches: false, rejectionReason: "payload_parse_failed", responseParseDiagnostic:parsedResponseDiagnostic(requestUrl,"fetch",response.status,contentType,null,{accepted:false,rejectionReason:"parser_exception"}) }));
       }).catch(() => {
         requestReachedServer(requestRecord);
         const responseMeta = metadata || responseMetadata(requestUrl, "fetch", 0, liveResumeGeneration, requestCursor, requestRecord);
@@ -962,15 +1089,24 @@
         if (matchingUrl(requestUrl)) reportCandidate(requestUrl, "XHR");
         let responseContentType = null; try { responseContentType = this.getResponseHeader("content-type"); } catch {}
         recordResource(requestUrl, "xmlhttprequest", { status: this.status, contentType: responseContentType, startTime: startedAt });
-        if (!matchingUrl(requestUrl) || isStreamStatusUrl(requestUrl)) return;
+        if (!matchingUrl(requestUrl) || isStreamStatusUrl(requestUrl)) {
+          if (potentialHistoryUrl(requestUrl) && !isStreamStatusUrl(requestUrl)) {
+            if (this.status < 200 || this.status >= 300) { emitUnrecognizedEndpointDiagnostic(requestUrl, "XHR", this.status, responseContentType); return; }
+            try {
+              const payload = this.responseType === "json" ? this.response : JSON.parse(this.responseText);
+              emitUnrecognizedEndpointDiagnostic(requestUrl, "XHR", this.status, responseContentType, payload);
+            } catch { emitUnrecognizedEndpointDiagnostic(requestUrl, "XHR", this.status, responseContentType, null, true); }
+          }
+          return;
+        }
         if (requestRecord) historyResponseInFlight++;
-        const metadata = responseMetadata(requestUrl, "XHR", this.status, liveResumeGeneration, cursor, requestRecord);
+        const metadata = responseMetadata(requestUrl, "XHR", this.status, liveResumeGeneration, cursor, requestRecord, responseContentType);
         if (this.status < 200 || this.status >= 300) { emitResponsePipeline(metadata, { payloadRecognized: false, itemCount: null, hasPreviousPage: null, responseCursorFingerprint: null, responsePageFingerprint: null, pageActivityBounds: null, routeMatches: false, rejectionReason: "http_error" }); return; }
         try {
           if (this.responseURL && new URL(this.responseURL).origin !== window.location.origin) { emitResponsePipeline(metadata, { payloadRecognized: false, itemCount: null, hasPreviousPage: null, responseCursorFingerprint: null, responsePageFingerprint: null, pageActivityBounds: null, routeMatches: false, rejectionReason: "route_mismatch" }); return; }
           const payload = this.responseType === "json" ? this.response : JSON.parse(this.responseText);
           capture(requestUrl, payload, "XHR", metadata);
-        } catch { emitResponsePipeline(metadata, { payloadRecognized: false, itemCount: null, hasPreviousPage: null, responseCursorFingerprint: null, responsePageFingerprint: null, pageActivityBounds: null, routeMatches: false, rejectionReason: "payload_parse_failed" }); }
+        } catch { emitResponsePipeline(metadata, { payloadRecognized: false, itemCount: null, hasPreviousPage: null, responseCursorFingerprint: null, responsePageFingerprint: null, pageActivityBounds: null, routeMatches: false, rejectionReason: "payload_parse_failed", responseParseDiagnostic:parsedResponseDiagnostic(requestUrl,"XHR",this.status,responseContentType,null,{accepted:false,rejectionReason:"parser_exception"}) }); }
       }, { once: true });
       for (const event of ["error", "timeout", "abort"]) this.addEventListener(event, () => {
         settle(); emitResponsePipeline(responseMeta, { payloadRecognized: false, itemCount: null, hasPreviousPage: null, responseCursorFingerprint: null, responsePageFingerprint: null, pageActivityBounds: null, routeMatches: false, rejectionReason: "request_failed" });

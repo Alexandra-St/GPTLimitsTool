@@ -42,7 +42,7 @@ You can also try opening the app from Finder with **right click → Open**. This
 
 ## Privacy
 
-The app works with your existing ChatGPT session and does not ask you for your ChatGPT password. Monitoring does not store message text. Rescue creates local HTML and TXT exports when you choose to save a conversation. Chat titles in risk notifications can be hidden in the app’s settings.
+The app works with your existing ChatGPT session and does not ask you for your ChatGPT password. The tool runs locally. No paid API is used. The app and extension do not make their own undocumented ChatGPT API requests. They do not extract cookies, tokens, or passwords. Monitoring does not store message text. Rescue creates local HTML and TXT exports when you choose to save a conversation. Chat titles in risk notifications can be hidden in the app’s settings.
 
 ## Known beta limitations
 

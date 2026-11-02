@@ -3,7 +3,7 @@ set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 build_script="$root/native-prototype/build.sh"
 build_app="$root/native-prototype/build/GPTLimitsNativePrototype.app"
-bundle_id="local.GPTLimitsTool.Feasibility"
+bundle_id="com.alexandrast.gptlimitstool"
 executable_name="GPTLimitsNativePrototype"
 install_name="GPT Limits Tool.app"
 test_mode=0

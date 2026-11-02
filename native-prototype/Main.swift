@@ -28,6 +28,36 @@ enum WindowPresentationIntent: Equatable {
     case background
 }
 
+struct SidebarDiagnosticSummary: Equatable {
+    let result:String
+    let detectedRowCount:Int
+    let pinnedRowCandidateCount:Int
+    let recognizedRouteTemplateCount:Int
+    let sidebarPresent:Bool?
+    let navPresent:Bool?
+    let asidePresent:Bool?
+    let scrollContainerCount:Int
+    let reason:String
+    let timestamp:String
+    let stage:String
+    let elapsedMs:Int
+    let exceptionCategory:String
+
+    static func sanitizedReason(_ value:String)->String {
+        let allowed=CharacterSet(charactersIn:"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")
+        let scalars=value.unicodeScalars.map { allowed.contains($0) ? Character(String($0)) : "_" }
+        let normalized=String(scalars).prefix(80)
+        return normalized.isEmpty ? "unknown":String(normalized)
+    }
+    static func make(result:String,detectedRowCount:Int,pinnedRowCandidateCount:Int,recognizedRouteTemplateCount:Int,sidebarPresent:Bool?,navPresent:Bool?,asidePresent:Bool?,scrollContainerCount:Int,reason:String,stage:String="not_run",elapsedMs:Int=0,exceptionCategory:String="none",date:Date=Date())->SidebarDiagnosticSummary {
+        let formatter=ISO8601DateFormatter();formatter.formatOptions=[.withInternetDateTime,.withFractionalSeconds]
+        return SidebarDiagnosticSummary(result:result=="success" ? "success":"failure",detectedRowCount:max(0,detectedRowCount),pinnedRowCandidateCount:max(0,pinnedRowCandidateCount),recognizedRouteTemplateCount:max(0,recognizedRouteTemplateCount),sidebarPresent:sidebarPresent,navPresent:navPresent,asidePresent:asidePresent,scrollContainerCount:max(0,scrollContainerCount),reason:sanitizedReason(reason),timestamp:formatter.string(from:date),stage:sanitizedReason(stage),elapsedMs:max(0,min(600000,elapsedMs)),exceptionCategory:sanitizedReason(exceptionCategory))
+    }
+    var displayText:String {
+        "Last sidebar diagnostic: \(result) · rows \(detectedRowCount) · pinned candidates \(pinnedRowCandidateCount) · route templates \(recognizedRouteTemplateCount) · sidebar/nav/aside \(sidebarPresent.map{$0 ? "yes":"no"} ?? "unknown")/\(navPresent.map{$0 ? "yes":"no"} ?? "unknown")/\(asidePresent.map{$0 ? "yes":"no"} ?? "unknown") · scroll containers \(scrollContainerCount) · reason \(reason) · stage \(stage) at \(elapsedMs) ms · exception \(exceptionCategory) · \(timestamp)"
+    }
+}
+
 final class Prototype: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKNavigationDelegate, WKUIDelegate, UNUserNotificationCenterDelegate, NSWindowDelegate {
     struct AutomationUpdate: Decodable {
         var token: String;var state: SafeAggregate;var overlap: Bool;var oldest: Bool;var received: Int
@@ -62,6 +92,26 @@ final class Prototype: NSObject, NSApplicationDelegate, WKScriptMessageHandler, 
     var cycleRootAcceptedPageEvents:[[String:Any]]=[]
     var cycleValidListResponses=0
     var cycleRootResponseReceived=false
+    var cycleDiscoverySource="network"
+    var cycleDOMCandidateCount=0
+    var cycleDOMAcceptedRowCount=0
+    var cycleDOMRejectedNavigationRowCount=0
+    var cycleDOMDuplicateRowCount=0
+    var cycleDOMFallbackIds=Set<String>()
+    var chatCheckTraceGeneration:String?
+    let lastChatCheckTraceOutput=NSTextField(wrappingLabelWithString:"Last standard chat check trace: not recorded")
+    let currentCycleSummaryOutput=NSTextField(wrappingLabelWithString:"Cycle summary: not checked")
+    let perChatHistoryRawOutput=NSTextField(wrappingLabelWithString:"Per-chat history response details: not recorded")
+    let conversationHistoryDiagnosticOutput=NSTextField(wrappingLabelWithString:"Current chat history source: not inspected")
+    let messageDOMStructureDiagnosticOutput=NSTextField(wrappingLabelWithString:"Current message DOM structure: not inspected")
+    var rawDiagnosticsStack:NSStackView?
+    var rawDiagnosticsToggleButton:NSButton?
+    var rawDiagnosticsVisible=false
+    var conversationHistoryDiagnosticGeneration:String?
+    var conversationHistoryDiagnosticTask:Task<Void,Never>?
+    let conversationHistoryDiagnosticTimeoutMs=9000
+    var messageDOMStructureDiagnosticGeneration:String?
+    var messageDOMStructureDiagnosticTask:Task<Void,Never>?
     var cycleRootRequests=0,cycleRootResponses=0,cycleRootRecognized=0,cycleRootResources=0,cycleRootResourceResponses=0
     var cycleRootResourceStatuses=Set<Int>()
     var cycleRootStatuses=Set<Int>()
@@ -359,6 +409,7 @@ final class Prototype: NSObject, NSApplicationDelegate, WKScriptMessageHandler, 
     var listDiagnosticHookAssignments="Unknown"
     var listDiagnosticBackendResources:[String]=[]
     var listDiagnosticTimestamp=""
+    var listDiagnosticTrafficLines=[String]()
     var pinDiagnosticRunID:UUID?
     var pinDiagnosticTimeoutTask:Task<Void,Never>?
     var pinDiagnosticRows:[Int:String]=[:]
@@ -475,8 +526,9 @@ final class Prototype: NSObject, NSApplicationDelegate, WKScriptMessageHandler, 
     var renderLeaseReadinessOwner:String?
     var renderLeaseReadinessContinuation:CheckedContinuation<[String:Any],Error>?
     var renderLeaseReadinessTimeout:DispatchWorkItem?
-    // Single runtime source of truth; the injected page hook is substituted from this value.
-let pinnedDiagnosticVersion="5.106.0"
+    // App version and injected diagnostic compatibility version are tracked separately.
+let gptLimitsAppVersion="6.2.2"
+let pinnedDiagnosticVersion="6.1.0"
     let runtimeIdentityOutput=NSTextField(wrappingLabelWithString: "Runtime identity unavailable")
     let mainWindowLifecycleOutput=NSTextField(wrappingLabelWithString:"Main window lifecycle A/B/C: not sampled")
     var mainWindowLifecycleSnapshots=[String]()
@@ -490,13 +542,22 @@ let pinnedDiagnosticVersion="5.106.0"
     var windowOrderingProbeSamples=[String]()
     var windowOrderingProbeDeadline:Date?
     let starredDiagnosticOutput=NSTextField(wrappingLabelWithString: "Starred UI diagnostic: not run")
+    let pinnedUnknownRowsRawOutput=NSTextField(wrappingLabelWithString:"Pinned proof unknown rows: not recorded")
     let lastIsolatedDiagnosticOutput=NSTextField(wrappingLabelWithString: "Last isolated diagnostic: not run")
+    let lastSidebarDiagnosticOutput=NSTextField(wrappingLabelWithString:"Last sidebar diagnostic: not run")
+    let sidebarElementStructureOutput=NSTextField(wrappingLabelWithString:"Last sidebar element structure: not run")
+    var lastSidebarDiagnosticSummary:SidebarDiagnosticSummary?
+    var sidebarDiagnosticStartedAt:Date?
+    var sidebarDiagnosticLastStage="not_run"
+    var sidebarDiagnosticLastElapsedMs=0
+    var sidebarDiagnosticExceptionCategory="none"
     var latestIsolatedDiagnosticText="Last isolated diagnostic: not run"
     let cycleOutput=NSTextField(wrappingLabelWithString: "Automatic checks: Off")
     let riskOutput=NSTextField(wrappingLabelWithString: "Risk model: Beta baseline")
     var cycleRiskNotificationsGenerated=0
     var cycleRiskNotificationsSuppressed=0
     var riskNotificationsAuthorized=false
+    var lastNotificationPermissionRequest="requested=no · granted=unknown · error=none · resulting authorization=not checked"
     var statusItem: NSStatusItem!
     var warningOpenMenuItem:NSMenuItem?
     var warningSummaryMenuItem:NSMenuItem?
@@ -517,10 +578,22 @@ let pinnedDiagnosticVersion="5.106.0"
     var mainCoverageLabel:NSTextField!
     var mainRiskModelLabel:NSTextField!
     var mainRecentResultLabel:NSTextField!
+    var mainRecentResultHeading:NSTextField!
+    var mainUILayoutSnapshotOutput:NSTextField!
+    var mainUILayoutRefreshCount=0
+    var mainUILayoutSnapshots=[String]()
     var mainRescueStatusLabel:NSTextField!
     var mainRiskList:NSStackView!
     var mainRiskRows:NSStackView!
+    var mainUncertaintySection:NSStackView!
+    var mainUncertaintyRows:NSStackView!
+    var mainUncertaintySummary:NSTextField!
+    var mainUncertaintyExpandButton:NSButton!
+    var mainUncertaintyDismissAllButton:NSButton!
+    var mainDismissedUncertaintyButton:NSButton!
     var mainRiskScrollView:NSScrollView!
+    var mainUncertaintyExpanded=false
+    var mainDismissedUncertaintyExpanded=false
     var mainCheckNowButton:NSButton!
     var mainRescueButton:NSButton!
     var settingsNotificationTitles:NSButton!
@@ -560,6 +633,7 @@ let pinnedDiagnosticVersion="5.106.0"
     var nativeRescueStartupTimeoutTask:Task<Void,Never>?
     var discovered: [String: [String: Any]] = [:]
     var authWindows: [NSWindow] = []
+    var bundleIdentityMigrationStatus="not needed"
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         showMainWindow()
@@ -567,6 +641,7 @@ let pinnedDiagnosticVersion="5.106.0"
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        bundleIdentityMigrationStatus=migrateBundleIdentityDefaultsAtStartup()
         UserDefaults.standard.register(defaults:[showChatTitlesInNotificationsDefaultsKey:true])
         installBackgroundActivationTraceObservers()
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -594,13 +669,15 @@ let pinnedDiagnosticVersion="5.106.0"
         config.userContentController.add(self, name: "activity")
         config.userContentController.add(self, name: "backendTraffic")
         config.userContentController.add(self, name: "chatCheck")
+        config.userContentController.add(self, name: "conversationHistoryDiagnostic")
+        config.userContentController.add(self, name: "messageDOMStructureDiagnostic")
         config.userContentController.add(self, name: "liveResumeDiagnostic")
         config.userContentController.add(self, name: "sidebarNavigation")
         config.userContentController.add(self, name: "nativeRescue")
         do {
             let resources = Bundle.main.resourceURL!
             var scripts = ""
-            for name in ["aggregator.js", "history-collector.js", "rescue.js", "native-rescue-bridge.js", "automation-bridge.js", "bridge.js", "page-hook.js", "conversation-list.js", "list-hook.js", "activity-hook.js"] {
+            for name in ["aggregator.js", "history-collector.js", "rescue.js", "native-rescue-bridge.js", "automation-bridge.js", "conversation-history-diagnostic.js", "bridge.js", "page-hook.js", "conversation-list.js", "list-hook.js", "activity-hook.js"] {
                 var source=try String(contentsOf: resources.appendingPathComponent(name), encoding: .utf8)
                 source=source.replacingOccurrences(of:"__PINNED_DIAGNOSTIC_VERSION__",with:pinnedDiagnosticVersion)
                 scripts += source + "\n;\n"
@@ -640,17 +717,25 @@ let pinnedDiagnosticVersion="5.106.0"
             }
             return section
         }
-        stack.addArrangedSubview(group("Session and chat checks",[route,button("Open ChatGPT session",#selector(showSession)),button("Check chat (hidden WebView)",#selector(check)),button("Hide session",#selector(hideSession)),output,nativeRescueOutput]))
-        stack.addArrangedSubview(group("Notifications and identity",[button("Send test notification",#selector(testNotification)),riskNotificationTitlesCheckbox,notificationOutput,notificationIdentityOutput]))
-        stack.addArrangedSubview(group("Recent chats",[button("Refresh recent chats",#selector(refreshRecent)),button("Check first recent chat",#selector(checkFirstRecent)),listOutput]))
-        stack.addArrangedSubview(group("Discovery diagnostics",[button("Diagnose visible home",#selector(diagnoseVisibleHome)),button("Diagnose hidden home",#selector(diagnoseHiddenHome)),listDiagnosticOutput,button("Inspect sidebar route templates",#selector(diagnoseSidebarRoutes)),button("Inspect sidebar top position",#selector(diagnoseSidebarTopPosition)),button("Inspect sidebar scroll mechanics",#selector(inspectSidebarScrollMechanics)),button("Diagnose root sidebar scrolling",#selector(diagnoseRootSidebarScroll)),button("Inspect pinned rows at sidebar top",#selector(diagnoseVisiblePinnedRows))]))
-        stack.addArrangedSubview(group("Runtime and pinned coverage",[runtimeIdentityOutput,mainWindowLifecycleOutput,button("Inspect standard window ordering",#selector(startWindowOrderingProbe)),windowOrderingProbeOutput,button("Inspect visible session rendering",#selector(inspectVisibleSessionRendering)),button("Inspect hidden WebView rendering",#selector(inspectHiddenWebViewRendering)),button("Inspect pinned prefix + activity",#selector(diagnosePinnedActivityTimestamp)),lastIsolatedDiagnosticOutput,starredDiagnosticOutput]))
-        stack.addArrangedSubview(group("Conversation viewport investigation",[button("Capture conversation layout",#selector(captureConversationLayoutNow)),sessionLayoutOutput]))
+        let rawStack=DiagnosticsStackView();rawStack.orientation = .vertical;rawStack.alignment = .leading;rawStack.spacing=18
+        rawStack.translatesAutoresizingMaskIntoConstraints=false
+        rawStack.addArrangedSubview(uiLabel("Raw diagnostics",size:15,bold:true))
+        rawStack.addArrangedSubview(group("Session and chat checks",[route,button("Open ChatGPT session",#selector(showSession)),button("Check chat (hidden WebView)",#selector(check)),button("Hide session",#selector(hideSession)),output,nativeRescueOutput,perChatHistoryRawOutput]))
+        rawStack.addArrangedSubview(group("Notifications and identity",[button("Send test notification",#selector(testNotification)),riskNotificationTitlesCheckbox,notificationOutput,notificationIdentityOutput]))
+        rawStack.addArrangedSubview(group("Recent chats",[button("Refresh recent chats",#selector(refreshRecent)),button("Check first recent chat",#selector(checkFirstRecent)),listOutput]))
+        rawStack.addArrangedSubview(group("Discovery diagnostics",[button("Diagnose visible home",#selector(diagnoseVisibleHome)),button("Diagnose hidden home",#selector(diagnoseHiddenHome)),button("Inspect sidebar route templates",#selector(diagnoseSidebarRoutes)),button("Inspect sidebar top position",#selector(diagnoseSidebarTopPosition)),button("Inspect sidebar scroll mechanics",#selector(inspectSidebarScrollMechanics)),button("Diagnose root sidebar scrolling",#selector(diagnoseRootSidebarScroll)),button("Inspect pinned rows at sidebar top",#selector(diagnoseVisiblePinnedRows)),lastSidebarDiagnosticOutput]))
+        mainUILayoutSnapshotOutput=uiLabel("Main content layout: not sampled")
+        rawStack.addArrangedSubview(group("Runtime and pinned coverage",[runtimeIdentityOutput,mainWindowLifecycleOutput,mainUILayoutSnapshotOutput,button("Inspect standard window ordering",#selector(startWindowOrderingProbe)),windowOrderingProbeOutput,button("Inspect visible session rendering",#selector(inspectVisibleSessionRendering)),button("Inspect hidden WebView rendering",#selector(inspectHiddenWebViewRendering)),button("Inspect pinned prefix + activity",#selector(diagnosePinnedActivityTimestamp)),lastIsolatedDiagnosticOutput,starredDiagnosticOutput,pinnedUnknownRowsRawOutput]))
+        rawStack.addArrangedSubview(group("Conversation viewport investigation",[button("Capture conversation layout",#selector(captureConversationLayoutNow)),sessionLayoutOutput]))
         let resumeCancel=button("Cancel same-document resume proof",#selector(cancelLiveDocumentResumeProof))
         resumeCancel.isEnabled=false;liveResumeDiagnosticCancelButton=resumeCancel
-        stack.addArrangedSubview(group("P0 same-document resume proof",[button("Run two-pass live-document proof",#selector(startLiveDocumentResumeProof)),resumeCancel,liveResumeDiagnosticOutput]))
-        stack.addArrangedSubview(group("Scheduler",[button("Automatic checks: On / Off",#selector(toggleAutomatic)),button("Run cycle now",#selector(runCycle)),cycleOutput,riskOutput]))
-        stack.addArrangedSubview(group("Personal calibration",[button("Use latest complete chat as Normal sample",#selector(markLatestNormalCalibration)),button("Use latest complete chat as Limit reached sample",#selector(markLatestLimitCalibration)),button("Clear latest calibration sample",#selector(clearLatestCalibration))]))
+        rawStack.addArrangedSubview(group("P0 same-document resume proof",[button("Run two-pass live-document proof",#selector(startLiveDocumentResumeProof)),resumeCancel,liveResumeDiagnosticOutput]))
+        rawStack.addArrangedSubview(group("Scheduler",[button("Automatic checks: On / Off",#selector(toggleAutomatic)),button("Run cycle now",#selector(runCycle)),cycleOutput,lastChatCheckTraceOutput,riskOutput]))
+        rawStack.addArrangedSubview(group("Personal calibration",[button("Use latest complete chat as Normal sample",#selector(markLatestNormalCalibration)),button("Use latest complete chat as Limit reached sample",#selector(markLatestLimitCalibration)),button("Clear latest calibration sample",#selector(clearLatestCalibration))]))
+        stack.addArrangedSubview(group("Current cycle summary",[currentCycleSummaryOutput]))
+        let rawToggle=button("Show raw diagnostics",#selector(toggleRawDiagnostics));rawDiagnosticsToggleButton=rawToggle
+        rawStack.isHidden = !rawDiagnosticsVisible;rawDiagnosticsStack=rawStack
+        stack.addArrangedSubview(rawToggle);stack.addArrangedSubview(rawStack)
         let scroll=NSScrollView(frame:panel.contentView!.bounds);scroll.autoresizingMask=[.width,.height];scroll.hasVerticalScroller=true;scroll.autohidesScrollers=true
         let document=DiagnosticsDocumentView(frame:NSRect(x:0,y:0,width:scroll.contentView.bounds.width,height:panel.contentView!.bounds.height))
         document.autoresizingMask=[]
@@ -678,9 +763,6 @@ let pinnedDiagnosticVersion="5.106.0"
         buildUserWindows()
         restoreCycle()
         UNUserNotificationCenter.current().delegate=self
-        UNUserNotificationCenter.current().requestAuthorization(options:[.alert,.sound]) { [weak self] granted,_ in
-            DispatchQueue.main.async { self?.riskNotificationsAuthorized=granted }
-        }
         updateRuntimeIdentity()
         panel.center(); session.center(); mainWindow.center()
         web.load(URLRequest(url: URL(string: "https://chatgpt.com/")!))
@@ -693,6 +775,136 @@ let pinnedDiagnosticVersion="5.106.0"
             result.append(contentsOf:diagnosticTextFields(in:view))
         }
         return result
+    }
+    func updateCurrentCycleSummary() {
+        func line(_ prefix:String)->String {
+            cycleState.lastStatus.components(separatedBy:"\n").first(where:{$0.hasPrefix(prefix)}) ?? "\(prefix) not recorded"
+        }
+        let checkedLine=line("Checked:")
+        let latest=cycleState.records.values.filter{$0.lastCheckAt != nil}.max{($0.lastCheckAt ?? 0)<($1.lastCheckAt ?? 0)}
+        let result=latest?.lastCheckResult ?? "Not checked"
+        let readiness=cycleState.lastRenderReadiness.map(renderReadinessDiagnosticSummary) ?? "not recorded"
+        let stages=cycleState.lastChatCheckTrace?.events.map{$0.stage.rawValue}.joined(separator:" → ") ?? "not recorded"
+        let historyParsing=cycleState.lastHistoryResponseParsing?.summary ?? "History response parsing: not recorded"
+        let perChatDiagnostics=cycleState.perChatHistoryDiagnostics
+        let perChatSummary=perChatDiagnostics?.summary ?? ""
+        let perChatDetails=perChatDiagnostics?.detailedResponseSummary ?? ""
+        perChatHistoryRawOutput.stringValue=perChatDetails.isEmpty ? "Per-chat history response details: not recorded" : perChatDetails
+        let pinnedUnknownRows=Array((cycleState.lastPinnedUnknownRows ?? []).prefix(PinnedUnknownRowDiagnostic.maxRows))
+        pinnedUnknownRowsRawOutput.stringValue=pinnedUnknownRows.isEmpty ? "Pinned proof unknown rows: none" : "Pinned proof unknown rows: \(pinnedUnknownRows.count)\n"+pinnedUnknownRows.map(\.detailLine).joined(separator:"\n")
+        let pinnedUnknownCompact=pinnedUnknownRows.prefix(3).map(\.compactLine).joined(separator:"\n")
+        let eventRejections=cycleState.historyProgressEventRejections?.summary ?? "none"
+        currentCycleSummaryOutput.stringValue="Build: v\(gptLimitsAppVersion) · \(gptLimitsExecutableBuildIDMarker)\n\(line("Discovery source:"))\n\(line("Coverage:"))\n\(checkedLine)\nPinned proof unknown rows: \(pinnedUnknownRows.count)\(pinnedUnknownCompact.isEmpty ? "":"\n\(pinnedUnknownCompact)")\nLast render readiness: \(readiness)\nLast chat check result: \(result)\nLast chat check trace stages: \(stages)\n\(historyParsing)\nHistory parser event rejections: \(eventRejections)\nPer-chat history diagnostics:\n\(perChatSummary.isEmpty ? "not recorded":perChatSummary)"
+    }
+    @objc func toggleRawDiagnostics() {
+        rawDiagnosticsVisible.toggle();rawDiagnosticsStack?.isHidden = !rawDiagnosticsVisible
+        rawDiagnosticsToggleButton?.title=rawDiagnosticsVisible ? "Hide raw diagnostics":"Show raw diagnostics"
+        layoutDiagnosticsDocument()
+    }
+    @objc func inspectCurrentChatHistorySource() {
+        guard !cycleRunning else {conversationHistoryDiagnosticOutput.stringValue="Current chat history source: unavailable · a cycle is running";return}
+        guard manualDiagnosticOwnerLabel()==nil else {conversationHistoryDiagnosticOutput.stringValue="Current chat history source: unavailable · another diagnostic is running";return}
+        guard sanitizedChatCheckRoute(web.url).category == .chat else {conversationHistoryDiagnosticOutput.stringValue="Current chat history source: unavailable · current route is not a chat";return}
+        let generation=UUID().uuidString;conversationHistoryDiagnosticGeneration=generation
+        conversationHistoryDiagnosticOutput.stringValue="Current chat history source: inspecting DOM and network for up to 6 seconds…"
+        let generationData=try? JSONSerialization.data(withJSONObject:[generation]),generationJSON=generationData.flatMap{String(data:$0,encoding:.utf8)} ?? "[]"
+        let script="window.gptInspectCurrentChatHistorySource?.({durationMs:5000,maxNodes:3000}).then(result=>window.webkit.messageHandlers.conversationHistoryDiagnostic.postMessage({...result,operationGeneration:\(generationJSON)[0]})).catch(()=>window.webkit.messageHandlers.conversationHistoryDiagnostic.postMessage({result:'failure',reason:'diagnostic_failed',operationGeneration:\(generationJSON)[0]})); true;"
+        web.evaluateJavaScript(script,completionHandler:nil)
+        conversationHistoryDiagnosticTask?.cancel()
+        conversationHistoryDiagnosticTask=Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds:UInt64(self?.conversationHistoryDiagnosticTimeoutMs ?? 9000)*1_000_000)
+            guard let self,self.conversationHistoryDiagnosticGeneration==generation else{return}
+            self.conversationHistoryDiagnosticGeneration=nil
+            self.conversationHistoryDiagnosticOutput.stringValue="Current chat history source: failure · diagnostic_timeout"
+            self.updateCurrentCycleSummary();self.conversationHistoryDiagnosticTask=nil
+        }
+    }
+    @objc func inspectCurrentMessageDOMStructure() {
+        guard !cycleRunning else {messageDOMStructureDiagnosticOutput.stringValue="Current message DOM structure: unavailable · a cycle is running";return}
+        guard manualDiagnosticOwnerLabel()==nil else {messageDOMStructureDiagnosticOutput.stringValue="Current message DOM structure: unavailable · another diagnostic is running";return}
+        guard sanitizedChatCheckRoute(web.url).category == .chat else {messageDOMStructureDiagnosticOutput.stringValue="Current message DOM structure: unavailable · current route is not a chat";return}
+        let generation=UUID().uuidString;messageDOMStructureDiagnosticGeneration=generation
+        messageDOMStructureDiagnosticOutput.stringValue="Current message DOM structure: inspecting bounded conversation subtree…"
+        let generationData=try? JSONSerialization.data(withJSONObject:[generation]),generationJSON=generationData.flatMap{String(data:$0,encoding:.utf8)} ?? "[]"
+        let script="const r=window.gptInspectCurrentMessageDOMStructure?.({maxNodes:2500,maxDepth:24,maxMs:1800})||{result:'failure',reason:'operation_missing'};window.webkit.messageHandlers.messageDOMStructureDiagnostic.postMessage({...r,operationGeneration:\(generationJSON)[0]}); true;"
+        web.evaluateJavaScript(script,completionHandler:nil)
+        messageDOMStructureDiagnosticTask?.cancel()
+        messageDOMStructureDiagnosticTask=Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds:5_000_000_000)
+            guard let self,self.messageDOMStructureDiagnosticGeneration==generation else{return}
+            self.messageDOMStructureDiagnosticGeneration=nil
+            self.messageDOMStructureDiagnosticOutput.stringValue="Current message DOM structure: failure · diagnostic_timeout"
+            self.updateCurrentCycleSummary();self.messageDOMStructureDiagnosticTask=nil
+        }
+    }
+    func renderCurrentMessageDOMStructureDiagnostic(_ data:[String:Any]) {
+        guard let token=data["operationGeneration"] as? String,token==messageDOMStructureDiagnosticGeneration else{return}
+        messageDOMStructureDiagnosticTask?.cancel();messageDOMStructureDiagnosticTask=nil;messageDOMStructureDiagnosticGeneration=nil
+        let result=(data["result"] as? String).flatMap{["success","failure"].contains($0) ? $0:nil} ?? "failure"
+        let reason=(data["reason"] as? String).flatMap{$0.range(of:"^[a-z0-9_]{1,48}$",options:.regularExpression) != nil ? $0:nil} ?? "snapshot_failed"
+        func count(_ key:String)->Int {max(0,min(3000,(data[key] as? NSNumber)?.intValue ?? 0))}
+        func list(_ key:String,limit:Int)->String {((data[key] as? [[String:Any]]) ?? []).prefix(limit).compactMap{item -> String? in
+            guard let name=item["name"] as? String,name.range(of:"^[a-z][a-z0-9_-]{0,20}$",options:.regularExpression) != nil else{return nil}
+            return "\(name)=\(max(0,min(3000,(item["count"] as? NSNumber)?.intValue ?? 0)))"
+        }.joined(separator:",")}
+        func names(_ key:String,limit:Int)->String {((data[key] as? [String]) ?? []).filter{$0.range(of:"^(data|aria)-[a-z0-9_-]{1,60}$",options:.regularExpression) != nil}.prefix(limit).joined(separator:",")}
+        let markers=data["markerCounts"] as? [String:Any] ?? [:]
+        func marker(_ key:String)->Int {max(0,min(3000,(markers[key] as? NSNumber)?.intValue ?? 0))}
+        let allowedRoles=Set(["article","listitem","row","group","generic","main","region","other"])
+        let signatures=((data["signatures"] as? [[String:Any]]) ?? []).prefix(12).compactMap{item -> String? in
+            let tag=(item["tag"] as? String).flatMap{$0.range(of:"^[a-z][a-z0-9-]{0,15}$",options:.regularExpression) != nil ? $0:nil} ?? "unknown"
+            let role=(item["role"] as? String).flatMap{allowedRoles.contains($0) ? $0:nil} ?? "other"
+            let dataNames=((item["dataAttributeNames"] as? [String]) ?? []).filter{$0.range(of:"^data-[a-z0-9_-]{1,60}$",options:.regularExpression) != nil}.prefix(5).joined(separator:",")
+            let ariaNames=((item["ariaAttributeNames"] as? [String]) ?? []).filter{$0.range(of:"^aria-[a-z0-9_-]{1,60}$",options:.regularExpression) != nil}.prefix(4).joined(separator:",")
+            let depth=max(0,min(24,(item["depth"] as? NSNumber)?.intValue ?? 0)),n=max(0,min(3000,(item["count"] as? NSNumber)?.intValue ?? 0)),visible=max(0,min(3000,(item["visibleCount"] as? NSNumber)?.intValue ?? 0)),tall=max(0,min(3000,(item["substantialHeightCount"] as? NSNumber)?.intValue ?? 0)),candidate=max(0,min(3000,(item["candidateCount"] as? NSNumber)?.intValue ?? 0)),vertical=max(0,min(3000,(item["verticalRepeatCount"] as? NSNumber)?.intValue ?? 0))
+            return "\(tag)/\(role) depth \(depth) data[\(dataNames.isEmpty ? "—":dataNames)] aria[\(ariaNames.isEmpty ? "—":ariaNames)] ×\(n) visible \(visible) tall \(tall) candidates \(candidate) vertical-repeat \(vertical)"
+        }.joined(separator:"; ")
+        messageDOMStructureDiagnosticOutput.stringValue="Current message DOM structure: \(result) · \(reason)\nScanned \(count("scannedNodeCount")) nodes · truncated \((data["truncated"] as? Bool).map{$0 ? "yes":"no"} ?? "unknown") · open shadow roots \(count("openShadowRootCount"))\nTags [\(list("tagCounts",limit:16))] · roles [\(list("roleCounts",limit:12))]\nMarkers: testid \(marker("testId")), message \(marker("message")), turn \(marker("turn")), author \(marker("author")), data-role \(marker("role"))\nData names [\(names("dataAttributeNames",limit:20))] · aria names [\(names("ariaAttributeNames",limit:16))]\nVisible \(count("visibleElementCount")) · substantial-height \(count("substantialHeightCount")) · scroll containers \(count("scrollContainerCount")) · nested virtualization candidates \(count("nestedVirtualizationContainerCount"))\nRepeated sibling groups \(count("repeatGroupCount")) · vertically repeated groups \(count("verticalRepeatGroupCount")) · structural row candidates \(count("candidateElementCount")) / signatures \(count("candidateSignatureCount"))\nSignatures: \(signatures.isEmpty ? "none":signatures)"
+        updateCurrentCycleSummary()
+    }
+    func renderCurrentChatHistoryDiagnostic(_ data:[String:Any]) {
+        guard let token=data["operationGeneration"] as? String,token==conversationHistoryDiagnosticGeneration else{return}
+        conversationHistoryDiagnosticTask?.cancel();conversationHistoryDiagnosticTask=nil;conversationHistoryDiagnosticGeneration=nil
+        let allowedReasons=Set(["history_source_observed","history_present_in_dom_without_network","history_network_endpoint_changed","history_response_shape_changed","history_not_loaded","not_chat_route","diagnostic_timeout","diagnostic_failed"])
+        let reason=(data["reason"] as? String).flatMap{allowedReasons.contains($0) ? $0:nil} ?? "diagnostic_failed"
+        let dom=data["dom"] as? [String:Any] ?? [:],network=data["network"] as? [[String:Any]] ?? []
+        func count(_ key:String)->Int {max(0,min(5000,(dom[key] as? NSNumber)?.intValue ?? 0))}
+        func yes(_ key:String)->String {(dom[key] as? Bool).map{$0 ? "yes":"no"} ?? "unknown"}
+        let shapes=(dom["shapes"] as? [[String:Any]] ?? []).prefix(16).map { item -> String in
+            let tag=(item["tag"] as? String).flatMap{$0.range(of:"^[a-z][a-z0-9-]{0,15}$",options:.regularExpression) != nil ? $0:nil} ?? "unknown"
+            let role=(item["role"] as? String).flatMap{["article","listitem","row","group","generic","main","region","other"].contains($0) ? $0:nil} ?? "other"
+            let attrs=(item["dataAttributeNames"] as? [String] ?? []).filter{$0.range(of:"^data-[a-z0-9_-]{1,60}$",options:.regularExpression) != nil}.prefix(12).joined(separator:",")
+            let n=max(0,min(5000,(item["count"] as? NSNumber)?.intValue ?? 0))
+            return "\(tag)/\(role) data[\(attrs.isEmpty ? "—":attrs)] ×\(n)"
+        }.joined(separator:"; ")
+        let markers=(dom["markerAttributeNames"] as? [String] ?? []).filter{$0.range(of:"^(data-[a-z0-9_-]{1,60}|aria-[a-z0-9_-]{1,60}|role)$",options:.regularExpression) != nil}.prefix(20).joined(separator:",")
+        let pagination=(dom["paginationAttributeNames"] as? [String] ?? []).filter{$0.range(of:"^(data|aria)-[a-z0-9_-]{1,60}$",options:.regularExpression) != nil}.prefix(16).joined(separator:",")
+        let route=(data["route"] as? [String:Any])?["template"] as? String
+        let safeRoute=route.flatMap{["/c/:id","/g/:id/c/:id","/:id","/:id/:id","home","other"].contains($0) ? $0:nil} ?? "other"
+        let events=network.prefix(12).map { item -> String in
+            let rawPath=item["endpointTemplate"] as? String ?? ""
+            let safePath=sanitizedHistoryEndpointTemplate(rawPath)
+            let transport=(item["transport"] as? String).flatMap{["fetch","XHR","resource"].contains($0) ? $0:nil} ?? "unknown"
+            let status=max(0,min(599,(item["status"] as? NSNumber)?.intValue ?? 0))
+            let keys=(item["topLevelKeys"] as? [String] ?? []).filter{$0.range(of:"^[A-Za-z][A-Za-z0-9_-]{0,63}$",options:.regularExpression) != nil}.prefix(16).joined(separator:",")
+            let arrays=(item["arrayCounts"] as? [[String:Any]] ?? []).prefix(8).compactMap{value -> String? in guard let key=value["key"] as? String,key.range(of:"^[A-Za-z][A-Za-z0-9_-]{0,63}$",options:.regularExpression) != nil else{return nil};let n=max(0,min(1000000,(value["count"] as? NSNumber)?.intValue ?? 0));return "\(key)=\(n)"}.joined(separator:",")
+            let recognized=(item["recognizedHistory"] as? Bool).map{$0 ? "yes":"no"} ?? "unknown"
+            let rejection=(item["parserRejectionReason"] as? String).flatMap{$0.range(of:"^[a-z0-9_]{1,48}$",options:.regularExpression) != nil ? $0:nil} ?? "unclassified"
+            return "\(safePath) · \(transport) · HTTP \(status) · keys [\(keys.isEmpty ? "—":keys)] · arrays [\(arrays.isEmpty ? "—":arrays)] · recognized \(recognized) · \(rejection)"
+        }.joined(separator:"\n")
+        conversationHistoryDiagnosticOutput.stringValue="Current chat history source: \(data["result"] as? String == "success" ? reason:"failure · \(reason)") · route \(safeRoute)\nDOM turns \(count("candidateCount")) · visible \(count("visibleCandidateCount")) · scroll containers \(count("scrollableContainerCount")) · lazy/virtualized \(yes("lazyVirtualized")) · pagination elements \(count("paginationElementCount")) · scanned \(count("scannedNodeCount"))\nMarkers [\(markers.isEmpty ? "—":markers)] · pagination attributes [\(pagination.isEmpty ? "—":pagination)]\nTurn structures: \(shapes.isEmpty ? "none":shapes)\nNetwork requests/responses: \(max(0,min(32,(data["requestCount"] as? NSNumber)?.intValue ?? 0)))/\(max(0,min(32,(data["responseCount"] as? NSNumber)?.intValue ?? 0))) · \(max(0,min(7000,(data["durationMs"] as? NSNumber)?.intValue ?? 0))) ms\n\(events.isEmpty ? "No normalized history-network events observed.":events)"
+        updateCurrentCycleSummary()
+    }
+    func sanitizedHistoryEndpointTemplate(_ value:String)->String {
+        guard value.hasPrefix("/backend-api/"),!value.contains("?"),!value.contains("#"),value.count<=180 else{return "/backend-api/:path"}
+        let known=Set(["backend-api","conversation","conversations","messages","message","history","threads","thread","chat","f","gizmos","list","items","search","page","read","slice","completion","completions"])
+        let segments=value.split(separator:"/").map(String.init)
+        let safe=segments.enumerated().map{index,segment -> String in
+            if segment==":id" || segment==":segment" {return segment}
+            if known.contains(segment.lowercased()) {return segment}
+            return ":segment"
+        }
+        return "/"+safe.prefix(10).joined(separator:"/")
     }
     func layoutDiagnosticsDocument() {
         guard let scroll=diagnosticsScrollView,let document=diagnosticsDocumentView,let stack=diagnosticsStack else{return}
@@ -840,12 +1052,27 @@ let pinnedDiagnosticVersion="5.106.0"
         mainCoverageLabel=uiLabel("Coverage: Not checked")
         mainRiskModelLabel=uiLabel("Risk model: Beta baseline")
         mainRecentResultLabel=uiLabel("No completed check yet")
-        mainRiskRows=NSStackView();mainRiskRows.orientation = .vertical;mainRiskRows.alignment = .leading;mainRiskRows.spacing=7
-        mainRiskList=NSStackView(views:[uiLabel("Persistent warnings",size:15,bold:true),mainRiskRows])
+        mainRecentResultHeading=uiLabel("Recent result",size:15,bold:true)
+        mainRiskRows=NSStackView();mainRiskRows.orientation = .vertical;mainRiskRows.alignment = .leading;mainRiskRows.spacing=9
+        mainUncertaintyRows=NSStackView();mainUncertaintyRows.orientation = .vertical;mainUncertaintyRows.alignment = .leading;mainUncertaintyRows.spacing=8
+        mainUncertaintySummary=uiLabel("No chats need a history check.")
+        mainUncertaintySummary.maximumNumberOfLines=0
+        mainUncertaintySummary.cell?.wraps=true
+        mainUncertaintySummary.cell?.isScrollable=false
+        mainUncertaintySummary.setContentCompressionResistancePriority(.defaultLow,for:.horizontal)
+        mainUncertaintyExpandButton=button("Show more",#selector(toggleUncertaintyExpansion))
+        mainUncertaintyDismissAllButton=button("Hide all until new activity",#selector(dismissAllUnchangedUncertainty))
+        mainDismissedUncertaintyButton=button("Show dismissed",#selector(toggleDismissedUncertaintyExpansion))
+        mainUncertaintySection=NSStackView(views:[uiLabel("Needs attention",size:15,bold:true),mainUncertaintySummary,mainUncertaintyDismissAllButton,mainUncertaintyRows,mainUncertaintyExpandButton,mainDismissedUncertaintyButton])
+        mainUncertaintySection.orientation = .vertical;mainUncertaintySection.alignment = .leading;mainUncertaintySection.spacing=7
+        mainRiskList=NSStackView(views:[uiLabel("Confirmed conversation risks",size:15,bold:true),mainRiskRows,mainUncertaintySection,mainRecentResultHeading,mainRecentResultLabel])
         mainRiskList.orientation = .vertical;mainRiskList.alignment = .leading;mainRiskList.spacing=10
+        mainRiskList.translatesAutoresizingMaskIntoConstraints=false
         mainRiskScrollView=NSScrollView();mainRiskScrollView.hasVerticalScroller=true;mainRiskScrollView.autohidesScrollers=true;mainRiskScrollView.drawsBackground=false
         mainRiskScrollView.translatesAutoresizingMaskIntoConstraints=false;mainRiskScrollView.documentView=mainRiskList
-        mainRiskScrollView.heightAnchor.constraint(equalToConstant:260).isActive=true
+        mainRiskScrollView.setContentHuggingPriority(.defaultLow,for:.vertical)
+        mainRiskScrollView.setContentCompressionResistancePriority(.defaultLow,for:.vertical)
+        mainRiskScrollView.heightAnchor.constraint(greaterThanOrEqualToConstant:260).isActive=true
         mainRiskList.frame=NSRect(x:0,y:0,width:500,height:260)
         mainCheckNowButton=button("Check now",#selector(runCycle))
         let openChatGPT=button("Open ChatGPT",#selector(showSession))
@@ -857,7 +1084,7 @@ let pinnedDiagnosticVersion="5.106.0"
         let secondaryActions=NSStackView(views:[settings,diagnosticsButton])
         secondaryActions.orientation = .horizontal;secondaryActions.alignment = .centerY;secondaryActions.spacing=8
         mainRescueStatusLabel=uiLabel("Rescue: ready when a conversation is open")
-        let content=NSStackView(views:[uiLabel("GPT Limits Tool",size:24,bold:true),mainMonitoringLabel,mainLastCheckLabel,mainNextCheckLabel,mainCoverageLabel,mainRiskModelLabel,mainRiskScrollView,uiLabel("Recent result",size:15,bold:true),mainRecentResultLabel,primaryActions,mainRescueStatusLabel,secondaryActions])
+        let content=NSStackView(views:[uiLabel("GPT Limits Tool",size:24,bold:true),mainMonitoringLabel,mainLastCheckLabel,mainNextCheckLabel,mainCoverageLabel,mainRiskModelLabel,mainRiskScrollView,primaryActions,mainRescueStatusLabel,secondaryActions])
         content.orientation = .vertical;content.alignment = .leading;content.spacing=16
         content.translatesAutoresizingMaskIntoConstraints=false
         let mainContainer=NSView();mainContainer.addSubview(content);mainWindow.contentView=mainContainer
@@ -865,8 +1092,13 @@ let pinnedDiagnosticVersion="5.106.0"
             content.leadingAnchor.constraint(equalTo:mainContainer.leadingAnchor,constant:24),
             content.trailingAnchor.constraint(equalTo:mainContainer.trailingAnchor,constant:-24),
             content.topAnchor.constraint(equalTo:mainContainer.topAnchor,constant:24),
-            content.bottomAnchor.constraint(lessThanOrEqualTo:mainContainer.bottomAnchor,constant:-20),
-            mainRiskRows.widthAnchor.constraint(equalTo:mainRiskList.widthAnchor)
+            content.bottomAnchor.constraint(equalTo:mainContainer.bottomAnchor,constant:-20),
+            mainRiskList.widthAnchor.constraint(equalTo:mainRiskScrollView.contentView.widthAnchor),
+            mainRiskRows.widthAnchor.constraint(equalTo:mainRiskList.widthAnchor),
+            mainUncertaintySection.widthAnchor.constraint(equalTo:mainRiskList.widthAnchor),
+            mainUncertaintyRows.widthAnchor.constraint(equalTo:mainUncertaintySection.widthAnchor),
+            mainUncertaintySummary.widthAnchor.constraint(equalTo:mainUncertaintySection.widthAnchor),
+            mainRecentResultLabel.widthAnchor.constraint(equalTo:mainRiskList.widthAnchor)
         ])
         settingsWindow=NSWindow(contentRect:NSRect(x:0,y:0,width:420,height:360),styleMask:[.titled,.closable],backing:.buffered,defer:false)
         settingsWindow.title="GPT Limits Tool — Settings"
@@ -897,46 +1129,161 @@ let pinnedDiagnosticVersion="5.106.0"
         }
         let model=currentRiskModel();mainRiskModelLabel.stringValue="Risk model: \(model.source.rawValue)"
         let nowMs=Date().timeIntervalSince1970*1000
-        let relevant=cycleState.records.values.compactMap { record -> (ChatRecord,RiskMonitoringState)? in
-            let state=monitoringState(record:record,model:model,nowMs:nowMs)
-            return state == .normal ? nil:(record,state)
+        let relevant=cycleState.records.values.compactMap { record -> (ChatRecord,RiskMonitoringState,RiskMonitoringState,RiskMonitoringState)? in
+            let completeness=monitoringState(record:record,model:model,nowMs:nowMs)
+            let lowerBoundRisk=confirmedRiskFromLowerBound(record.aggregate?.estimatedTextTokens,model:model)
+            let riskStates:[RiskMonitoringState]=[.watch,.near,.critical]
+            let riskState=riskStates.contains(completeness) ? completeness:lowerBoundRisk
+            let displayState=riskState == .normal ? completeness:riskState
+            return completeness == .normal && lowerBoundRisk == .normal ? nil:(record,completeness,lowerBoundRisk,displayState)
         }.sorted { a,b in
             func rank(_ state:RiskMonitoringState)->Int {switch state {case .critical:return 4;case .near:return 3;case .watch:return 2;case .uncertain:return 1;case .normal:return 0}}
-            if rank(a.1) != rank(b.1) {return rank(a.1)>rank(b.1)}
+            if rank(a.3) != rank(b.3) {return rank(a.3)>rank(b.3)}
             return a.0.lastSeenUpdatedAt>b.0.lastSeenUpdatedAt
         }
-        mainRiskRows.setViews([],in:.leading)
+        mainRiskRows.setViews([],in:.leading);mainUncertaintyRows.setViews([],in:.leading)
         warningAcknowledgeTagToConversationID=[:];nextWarningAcknowledgeTag=4100
-        if relevant.isEmpty && cycleState.monitoringDegraded != true {mainRiskRows.addArrangedSubview(uiLabel("No unresolved chat warnings."))}
-        for (record,state) in relevant {
-            let acknowledged=state == .uncertain && record.uncertainAcknowledgedAt.map{$0>=record.lastSeenUpdatedAt} == true
-            let title=record.title.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty ? "Untitled chat":record.title
-            let label:String
-            switch state {case .watch:label="Watch";case .near:label="Near";case .critical:label="Critical";case .uncertain:label="Uncertain";case .normal:continue}
-            let titleRow=uiLabel("⚠ \(label) · \(title)",size:13,bold:true)
-            let reason=monitoringWarningReason(record:record,model:model,nowMs:nowMs) ?? "Chat monitoring requires attention."
-            let checked=record.lastCheckAt.map{Date(timeIntervalSince1970:$0/1000).formatted(date:.abbreviated,time:.shortened)} ?? "Never"
-            let details=uiLabel("\(reason)\nLast check: \(checked) · \(record.lastCheckResult ?? "Not checked")")
-            let row=NSStackView(views:[titleRow,details]);row.orientation = .vertical;row.alignment = .leading;row.spacing=4
-            if state == .uncertain {
-                let button=NSButton(title:acknowledged ? "Restore warning badge":"Acknowledge until new activity",target:self,action:#selector(toggleWarningAcknowledgement(_:)))
+        let confirmed=relevant.filter{$0.3 != .uncertain}
+        let uncertainWithoutConfirmedRisk=relevant.filter{$0.1 == .uncertain && $0.2 == .normal}
+        let activeUncertain=uncertainWithoutConfirmedRisk.filter{warningBadgeVisible(record:$0.0,model:model,nowMs:nowMs)}
+        let dismissedUncertain=uncertainWithoutConfirmedRisk.filter{!warningBadgeVisible(record:$0.0,model:model,nowMs:nowMs)}
+        if confirmed.isEmpty {mainRiskRows.addArrangedSubview(uiLabel("No confirmed conversation risks."))}
+        if activeUncertain.isEmpty {
+            mainUncertaintySummary.stringValue="No chats need a history check."
+        } else {
+            mainUncertaintySummary.stringValue="Couldn't fully check \(activeUncertain.count) \(activeUncertain.count == 1 ? "chat":"chats").\nNo confirmed limit risk was detected for these chats, but GPT Limits Tool couldn't verify their complete history."
+        }
+        mainUncertaintyDismissAllButton.isHidden=activeUncertain.isEmpty
+        mainUncertaintyExpandButton.isHidden=activeUncertain.count<=3
+        mainUncertaintyExpandButton.title=mainUncertaintyExpanded ? "Show less":"Show \(max(0,activeUncertain.count-3)) more"
+        mainDismissedUncertaintyButton.isHidden=dismissedUncertain.isEmpty
+        mainDismissedUncertaintyButton.title=mainDismissedUncertaintyExpanded ? "Hide dismissed (\(dismissedUncertain.count))":"Show dismissed (\(dismissedUncertain.count))"
+        let visibleActive=mainUncertaintyExpanded ? activeUncertain:Array(activeUncertain.prefix(3))
+        for (record,completeness,_,state) in confirmed + visibleActive + (mainDismissedUncertaintyExpanded ? dismissedUncertain:[]) {
+            let title=record.title.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty ? "Unnamed chat":record.title
+            if completeness == .uncertain && state == .uncertain {
+                let acknowledged = !warningBadgeVisible(record:record,model:model,nowMs:nowMs)
+                let status=record.lastCheckedUpdatedAt == nil || record.lastSeenUpdatedAt>record.lastCheckedUpdatedAt! ? "New activity hasn’t been fully checked yet":"Couldn’t verify full history"
+                let titleRow=uiLabel("\(title)",size:13,bold:true)
+                let lowerBound=record.aggregate.map{$0.estimatedTextTokens}.flatMap{$0>0 ? lowerBoundUserLabel($0):nil}
+                let checked=record.lastCheckAt.map{Date(timeIntervalSince1970:$0/1000).formatted(date:.abbreviated,time:.shortened)} ?? "Not checked yet"
+                let details=uiLabel(([status]+(lowerBound.map{[$0]} ?? [])+["Last checked: \(checked)"]).joined(separator:" · "))
+                let row=NSStackView(views:[titleRow,details]);row.orientation = .vertical;row.alignment = .leading;row.spacing=3
+                let button=NSButton(title:acknowledged ? "Restore to Needs attention":"Hide until new activity",target:self,action:#selector(toggleWarningAcknowledgement(_:)))
                 button.bezelStyle = .rounded;button.tag=nextWarningAcknowledgeTag
                 warningAcknowledgeTagToConversationID[nextWarningAcknowledgeTag]=record.conversationId;nextWarningAcknowledgeTag+=1
                 row.addArrangedSubview(button)
-                if acknowledged {row.addArrangedSubview(uiLabel("Acknowledged by you · full history is still unverified."))}
+                mainUncertaintyRows.addArrangedSubview(row)
+                continue
             }
+            let label:String
+            switch state {case .watch:label="Watch";case .near:label="Near";case .critical:label="Critical";case .uncertain,.normal:continue}
+            let titleRow=uiLabel("⚠ \(label) · \(title)",size:13,bold:true)
+            let reason:String
+            if completeness == .uncertain {
+                reason="Full history not verified · \(lowerBoundUserLabel(record.aggregate?.estimatedTextTokens ?? 0))"
+            } else {
+                reason=monitoringWarningReason(record:record,model:model,nowMs:nowMs) ?? "Chat monitoring requires attention."
+            }
+            let checked=record.lastCheckAt.map{Date(timeIntervalSince1970:$0/1000).formatted(date:.abbreviated,time:.shortened)} ?? "Never"
+            let detailText=completeness == .uncertain ? "\(reason)\nLast checked: \(checked)":"\(reason)\nLast check: \(checked) · \(record.lastCheckResult ?? "Not checked")"
+            let details=uiLabel(detailText)
+            let row=NSStackView(views:[titleRow,details]);row.orientation = .vertical;row.alignment = .leading;row.spacing=4
             mainRiskRows.addArrangedSubview(row)
         }
         updateWarningIndicator(records:relevant.map{$0.0},model:model,nowMs:nowMs)
-        mainRiskList.layoutSubtreeIfNeeded();mainRiskScrollView.layoutSubtreeIfNeeded()
-        let warningWidth=mainRiskScrollView.contentView.bounds.width
-        let warningHeight=max(mainRiskScrollView.contentView.bounds.height,mainRiskList.fittingSize.height)
-        mainRiskList.frame=NSRect(x:0,y:0,width:warningWidth,height:warningHeight)
         let checkedLine=cycleState.lastStatus.components(separatedBy:"\n").first(where:{$0.hasPrefix("Checked:")})
         mainRecentResultLabel.stringValue=cycleRunning ? "Cycle in progress · \(cyclePhase)" : (checkedLine ?? (cycleState.lastCycleAt == nil ? "No completed check yet":"Last cycle did not produce a chat summary"))
+        mainRiskScrollView.layoutSubtreeIfNeeded()
+        let warningWidth=max(1,mainRiskScrollView.contentView.bounds.width)
+        mainRiskList.frame=NSRect(x:0,y:0,width:warningWidth,height:max(1,mainRiskList.frame.height))
+        mainUncertaintySummary.invalidateIntrinsicContentSize()
+        mainRecentResultLabel.invalidateIntrinsicContentSize()
+        mainRiskRows.invalidateIntrinsicContentSize()
+        mainUncertaintyRows.invalidateIntrinsicContentSize()
+        mainUncertaintySection.invalidateIntrinsicContentSize()
+        mainRiskList.invalidateIntrinsicContentSize();mainRiskList.needsLayout=true
+        mainUncertaintyRows.needsLayout=true;mainUncertaintySection.needsLayout=true;mainRiskRows.needsLayout=true
+        mainUncertaintyRows.layoutSubtreeIfNeeded();mainRiskRows.layoutSubtreeIfNeeded();mainUncertaintySection.layoutSubtreeIfNeeded()
+        mainRiskList.layoutSubtreeIfNeeded()
+        let warningHeight=max(mainRiskScrollView.contentView.bounds.height,mainRiskList.fittingSize.height)
+        mainRiskList.setFrameSize(NSSize(width:warningWidth,height:warningHeight))
+        mainRiskList.needsLayout=true;mainRiskList.layoutSubtreeIfNeeded();mainRiskScrollView.layoutSubtreeIfNeeded()
+        recordMainUILayoutSnapshot(activeCount:activeUncertain.count,selectedCount:visibleActive.count)
         let privacyTitles=showChatTitlesInNotifications(storedValue:UserDefaults.standard.object(forKey:showChatTitlesInNotificationsDefaultsKey) as? Bool)
         if settingsNotificationTitles != nil {settingsNotificationTitles.state=privacyTitles ? .on:.off}
         if settingsAutomaticChecks != nil {settingsAutomaticChecks.state=cycleState.enabled ? .on:.off}
+    }
+    func mainUILayoutRect(_ rect:NSRect)->String {
+        "(\(Int(rect.origin.x)),\(Int(rect.origin.y)),\(Int(rect.width)),\(Int(rect.height)))"
+    }
+    func mainUILayoutViewState(_ name:String,view:NSView,arrangedIn:NSStackView?=nil)->String {
+        let attached=view.window===mainWindow
+        let inMainHierarchy=mainWindow.contentView.map{view === $0 || view.isDescendant(of:$0)} ?? false
+        let fitting=view.fittingSize
+        var ancestors=[String](),ancestor=view.superview
+        while let current=ancestor {
+            ancestors.append("\(String(describing:type(of:current))):hidden=\(current.isHidden ? "yes":"no"),alpha=\(String(format:"%.2f",current.alphaValue)),frame=\(mainUILayoutRect(current.frame))")
+            if current===mainWindow.contentView {break}
+            ancestor=current.superview
+        }
+        let arrangedIndex=arrangedIn?.arrangedSubviews.firstIndex(where:{$0===view}).map(String.init) ?? "none"
+        let state="\(name){present=\(inMainHierarchy ? "yes":"no"),attached=\(attached ? "yes":"no"),hidden=\(view.isHidden ? "yes":"no"),frame=\(mainUILayoutRect(view.frame)),bounds=\(mainUILayoutRect(view.bounds)),fitting=(\(Int(fitting.width)),\(Int(fitting.height))),alpha=\(String(format:"%.2f",view.alphaValue)),arrangedIndex=\(arrangedIndex),ancestors=[\(ancestors.joined(separator:" > "))]}"
+        return state
+    }
+    func recordMainUILayoutSnapshot(activeCount:Int,selectedCount:Int) {
+        guard mainUILayoutSnapshotOutput != nil,mainRiskList != nil,mainUncertaintyRows != nil else{return}
+        mainUILayoutRefreshCount+=1
+        let rows=mainUncertaintyRows.arrangedSubviews
+        let rowStates=rows.prefix(3).enumerated().map{index,row in mainUILayoutViewState("uncertainty_row_\(index+1)",view:row,arrangedIn:mainUncertaintyRows)}
+        func index(_ view:NSView)->String {mainRiskList.arrangedSubviews.firstIndex(where:{$0===view}).map(String.init) ?? "missing"}
+        let listItems=mainRiskList.arrangedSubviews.enumerated().map{idx,view -> String in
+            if view===mainUncertaintySection{return "\(idx):needs_attention"}
+            if view===mainRecentResultHeading{return "\(idx):recent_result_heading"}
+            if view===mainRecentResultLabel{return "\(idx):recent_result_value"}
+            if view===mainRiskRows{return "\(idx):confirmed_rows"}
+            return "\(idx):other"
+        }
+        let listOrder="risk_list_arranged_order=[\(listItems.joined(separator:","))]"
+        let sectionItems=mainUncertaintySection.arrangedSubviews.enumerated().map{idx,view -> String in
+            if view===mainUncertaintySummary{return "\(idx):summary"}
+            if view===mainUncertaintyDismissAllButton{return "\(idx):hide_all"}
+            if view===mainUncertaintyRows{return "\(idx):rows"}
+            if view===mainUncertaintyExpandButton{return "\(idx):show_more"}
+            if view===mainDismissedUncertaintyButton{return "\(idx):dismissed"}
+            return "\(idx):heading"
+        }
+        let sectionOrder="needs_attention_arranged_order=[\(sectionItems.joined(separator:","))]"
+        let lines=[
+            "refresh=\(mainUILayoutRefreshCount) active=\(activeCount) collapsed_selected=\(selectedCount) row_views=\(rows.count)",
+            mainUILayoutViewState("rows_stack",view:mainUncertaintyRows,arrangedIn:mainUncertaintySection),
+            rowStates.isEmpty ? "first_rows=none":rowStates.joined(separator:"\n"),
+            "show_more{hidden=\(mainUncertaintyExpandButton.isHidden ? "yes":"no"),title=\(mainUncertaintyExpandButton.title),arrangedIndex=\(mainUncertaintySection.arrangedSubviews.firstIndex(where:{$0===mainUncertaintyExpandButton}).map(String.init) ?? "none"),frame=\(mainUILayoutRect(mainUncertaintyExpandButton.frame)),alpha=\(String(format:"%.2f",mainUncertaintyExpandButton.alphaValue))}",
+            "recent_result{heading=\(index(mainRecentResultHeading)),headingHidden=\(mainRecentResultHeading.isHidden ? "yes":"no"),headingFrame=\(mainUILayoutRect(mainRecentResultHeading.frame)),value=\(index(mainRecentResultLabel)),valueHidden=\(mainRecentResultLabel.isHidden ? "yes":"no"),valueFrame=\(mainUILayoutRect(mainRecentResultLabel.frame))}",
+            listOrder,sectionOrder
+        ]
+        mainUILayoutSnapshots.append(lines.joined(separator:"\n"))
+        if mainUILayoutSnapshots.count>8 {mainUILayoutSnapshots.removeFirst(mainUILayoutSnapshots.count-8)}
+        mainUILayoutSnapshotOutput.stringValue="Main UI layout snapshots (sanitized):\n"+mainUILayoutSnapshots.joined(separator:"\n--- refresh ---\n")
+    }
+    @objc func toggleUncertaintyExpansion() {mainUncertaintyExpanded.toggle();renderCycle()}
+    @objc func toggleDismissedUncertaintyExpansion() {mainDismissedUncertaintyExpanded.toggle();renderCycle()}
+    func lowerBoundUserLabel(_ tokens:Int)->String {
+        guard tokens>0 else{return "No counted token lower bound"}
+        if tokens>=1000 {return "At least ~\(Int((Double(tokens)/1000).rounded()))k tokens counted"}
+        return "At least \(tokens.formatted()) tokens counted"
+    }
+    @objc func dismissAllUnchangedUncertainty() {
+        let model=currentRiskModel(),nowMs=Date().timeIntervalSince1970*1000
+        for id in Array(cycleState.records.keys) {
+            guard var record=cycleState.records[id] else{continue}
+            guard monitoringState(record:record,model:model,nowMs:nowMs) == .uncertain,
+                  confirmedRiskFromLowerBound(record.aggregate?.estimatedTextTokens,model:model) == .normal,
+                  warningBadgeVisible(record:record,model:model,nowMs:nowMs) else{continue}
+            record.uncertainAcknowledgedAt=max(nowMs,record.lastSeenUpdatedAt)
+            cycleState.records[id]=record
+        }
+        saveCycle();renderCycle()
     }
     func monitoringDegradedReason()->String {
         switch cycleState.lastCoverageDetail ?? "" {
@@ -949,29 +1296,34 @@ let pinnedDiagnosticVersion="5.106.0"
     }
     func updateWarningIndicator(records:[ChatRecord],model:RiskModel,nowMs:Double) {
         var counts:[RiskMonitoringState:Int]=[:]
-        for record in records where warningBadgeVisible(record:record,model:model,nowMs:nowMs) {
-            let state=monitoringState(record:record,model:model,nowMs:nowMs);counts[state,default:0]+=1
+        for record in records {
+            let completeness=monitoringState(record:record,model:model,nowMs:nowMs)
+            let lowerBoundRisk=confirmedRiskFromLowerBound(record.aggregate?.estimatedTextTokens,model:model)
+            let confirmedStates:[RiskMonitoringState]=[.watch,.near,.critical]
+            let risk=confirmedStates.contains(completeness) ? completeness:lowerBoundRisk
+            if risk != .normal {counts[risk,default:0]+=1}
+            else if completeness == .uncertain && warningBadgeVisible(record:record,model:model,nowMs:nowMs) {counts[.uncertain,default:0]+=1}
         }
         let degraded=cycleState.monitoringDegraded == true
         var parts=[String]()
         if counts[.critical,default:0]>0 {parts.append("Critical confirmed: \(counts[.critical]!)")}
         if counts[.near,default:0]>0 {parts.append("Near confirmed: \(counts[.near]!)")}
         if counts[.watch,default:0]>0 {parts.append("Watch confirmed: \(counts[.watch]!)")}
-        if counts[.uncertain,default:0]>0 {parts.append("Uncertain: \(counts[.uncertain]!)")}
-        if degraded {parts.append("Monitoring degraded")}
-        let warningPresent = !parts.isEmpty
-        let summary=warningPresent ? parts.joined(separator:" · "):"No active warnings"
-        let total=counts.values.reduce(0,+)+(degraded ? 1:0)
-        statusItem.button?.title=warningPresent ? "GL ⚠":"GL"
+        let uncertaintyCount=counts[.uncertain,default:0]
+        if uncertaintyCount>0 {parts.append("Needs attention: \(uncertaintyCount) chat histories couldn't be fully checked")}
+        if degraded {parts.append("Recent chat coverage needs attention")}
+        let confirmedCount=counts[.critical,default:0]+counts[.near,default:0]+counts[.watch,default:0]
+        let summary=parts.isEmpty ? "No confirmed risks or checks needing attention":parts.joined(separator:" · ")
+        statusItem.button?.title=confirmedCount>0 ? "GL ⚠":"GL"
         statusItem.button?.toolTip="GPT Limits Tool · \(summary)"
         statusItem.button?.setAccessibilityLabel("GPT Limits Tool · \(summary)")
-        warningOpenMenuItem?.title=warningPresent ? "⚠ Open GPT Limits Tool · \(total) warnings":"Open GPT Limits Tool"
+        warningOpenMenuItem?.title=confirmedCount>0 ? "⚠ Open GPT Limits Tool · \(confirmedCount) confirmed risks":"Open GPT Limits Tool"
         warningSummaryMenuItem?.title=summary
     }
     @objc func toggleWarningAcknowledgement(_ sender:NSButton) {
         guard let id=warningAcknowledgeTagToConversationID[sender.tag],var record=cycleState.records[id] else{return}
         if let acknowledged=record.uncertainAcknowledgedAt,acknowledged>=record.lastSeenUpdatedAt {record.uncertainAcknowledgedAt=nil}
-        else {record.uncertainAcknowledgedAt=Date().timeIntervalSince1970*1000}
+        else {record.uncertainAcknowledgedAt=max(Date().timeIntervalSince1970*1000,record.lastSeenUpdatedAt)}
         cycleState.records[id]=record;saveCycle();renderCycle()
     }
     func coverageStatusUserLabel(_ status:CoverageStatus)->String {
@@ -985,27 +1337,48 @@ let pinnedDiagnosticVersion="5.106.0"
         scheduleCycle();renderCycle()
     }
     @objc func requestNotificationPermission() {
+        lastNotificationPermissionRequest="requested=yes · granted=unknown · error=none · resulting authorization=pending"
+        settingsNotificationStatus.stringValue="Notifications: Requesting permission…"
+        refreshNotificationIdentityDiagnostics()
         UNUserNotificationCenter.current().requestAuthorization(options:[.alert,.sound]) { [weak self] granted,error in
             DispatchQueue.main.async {
                 guard let self else{return}
                 self.riskNotificationsAuthorized=granted && error==nil
-                self.refreshNotificationAuthorization()
+                let grantValue=error == nil ? (granted ? "yes":"no") : "unknown"
+                let errorValue:String
+                if let error {
+                    let nsError=error as NSError
+                    errorValue="\(nsError.domain == "UNErrorDomain" ? "UNErrorDomain":"other_error") code \(nsError.code)"
+                } else {errorValue="none"}
+                self.lastNotificationPermissionRequest="requested=yes · granted=\(grantValue) · error=\(errorValue) · resulting authorization=checking"
+                self.refreshNotificationAuthorization { status in
+                    self.lastNotificationPermissionRequest="requested=yes · granted=\(grantValue) · error=\(errorValue) · resulting authorization=\(self.notificationAuthorizationLabel(status))"
+                    self.refreshNotificationIdentityDiagnostics()
+                }
             }
         }
     }
-    func refreshNotificationAuthorization() {
+    func notificationAuthorizationLabel(_ status:UNAuthorizationStatus)->String {
+        switch status {case .authorized:return "allowed";case .denied:return "denied";case .provisional:return "provisional";case .notDetermined:return "not_determined";@unknown default:return "unavailable"}
+    }
+    func refreshNotificationAuthorization(completion:((UNAuthorizationStatus)->Void)?=nil) {
         UNUserNotificationCenter.current().getNotificationSettings { [weak self] settings in
             DispatchQueue.main.async {
                 guard let self else{return}
+                let status=settings.authorizationStatus
                 let label:String
-                switch settings.authorizationStatus {case .authorized:label="Allowed";case .denied:label="Denied — enable in System Settings";case .provisional:label="Allowed quietly";case .notDetermined:label="Not requested";@unknown default:label="Unavailable"}
+                switch status {case .authorized:label="Allowed";case .denied:label="Denied — enable in System Settings";case .provisional:label="Allowed quietly";case .notDetermined:label="Not requested";@unknown default:label="Unavailable"}
                 self.settingsNotificationStatus.stringValue="Notifications: \(label)"
+                completion?(status)
             }
         }
     }
     func refreshNotificationIdentityDiagnostics() {
         let info=Bundle.main.infoDictionary ?? [:]
         let bundleID=Bundle.main.bundleIdentifier ?? "unavailable"
+        let runtimeBundlePath=Bundle.main.bundleURL.path
+        let runtimeVersion=info["CFBundleShortVersionString"] as? String ?? "unavailable"
+        let runtimeBuild=info["GPTLimitsBuildID"] as? String ?? "unavailable"
         let currentPath=Bundle.main.bundleURL.standardizedFileURL.path
         let resolvedPath=NSWorkspace.shared.urlForApplication(withBundleIdentifier:bundleID)?.standardizedFileURL.path ?? "unresolved"
         let iconName=(info["CFBundleIconFile"] as? String) ?? "unavailable"
@@ -1014,7 +1387,7 @@ let pinnedDiagnosticVersion="5.106.0"
         let appIcon=NSWorkspace.shared.icon(forFile:currentPath)
         let maxIcon=appIcon.representations.map{max($0.pixelsWide,$0.pixelsHigh)}.max() ?? 0
         let launchServicesMatch=resolvedPath==currentPath
-        notificationIdentityOutput.stringValue="Notification identity: \(bundleID) · LaunchServices resolves installed bundle: \(launchServicesMatch ? "yes":"no") · CFBundleIconFile \(iconName), asset \(iconExists ? "present":"missing"), largest NSWorkspace icon rep \(maxIcon) px · UNUserNotificationCenter belongs to this running identity; macOS exposes no supported API to list older notification registrations."
+        notificationIdentityOutput.stringValue="Running bundle path: \(runtimeBundlePath)\nRunning bundle ID: \(bundleID)\nRunning version: \(runtimeVersion)\nRunning build: \(runtimeBuild)\nNotification identity: \(bundleID) · LaunchServices resolves installed bundle: \(launchServicesMatch ? "yes":"no") · CFBundleIconFile \(iconName), asset \(iconExists ? "present":"missing"), largest NSWorkspace icon rep \(maxIcon) px · UNUserNotificationCenter belongs to this running identity; macOS exposes no supported API to list older notification registrations.\nPermission request: \(lastNotificationPermissionRequest)"
         UNUserNotificationCenter.current().getNotificationSettings { [weak self] settings in
             DispatchQueue.main.async {
                 guard let self else{return}
@@ -1029,8 +1402,8 @@ let pinnedDiagnosticVersion="5.106.0"
         let info=Bundle.main.infoDictionary ?? [:]
         let bundleBuildVersion=info["GPTLimitsBuildVersion"] as? String ?? "unavailable"
         let bundleBuildID=info["GPTLimitsBuildID"] as? String ?? "unavailable"
-        guard bundleBuildVersion==pinnedDiagnosticVersion,
-              gptLimitsExecutableBuildVersionMarker==pinnedDiagnosticVersion,
+        guard bundleBuildVersion==gptLimitsAppVersion,
+              gptLimitsExecutableBuildVersionMarker==gptLimitsAppVersion,
               bundleBuildID==gptLimitsExecutableBuildIDMarker else { return "unexpected" }
         let stableRoot="/Users/alexandra/Projects/GPTLimitsTool/native-prototype/build/GPTLimitsNativePrototype.app/Contents/MacOS/"
         let installedRoot="/Applications/GPT Limits Tool.app/Contents/MacOS/"
@@ -1264,10 +1637,13 @@ let pinnedDiagnosticVersion="5.106.0"
         let executableBuildID=gptLimitsExecutableBuildIDMarker
         let source=runtimeSourceClassification()
         let diagnosticOwner=manualDiagnosticOwnerLabel()
-        runtimeIdentityOutput.stringValue="Runtime diagnostic version: v\(pinnedDiagnosticVersion)\nRuntime build version: v\(bundleBuildVersion)\nRuntime build ID: \(bundleBuildID)\nExecutable build ID: \(executableBuildID)\nBuild timestamp UTC: \(buildTimestamp)\nRuntime executable: \(executable)\nRuntime bundle: \(bundle)\nPID: \(ProcessInfo.processInfo.processIdentifier)\nRuntime source: \(source)\nScheduler running: \(cycleRunning ? "Yes":"No")\nDiagnostic running: \(diagnosticOwner == nil ? "No":"Yes") · owner \(diagnosticOwner ?? "none")\nRender lease: \(backgroundRenderLeaseReport)\nRender lease restore: focus snapshot captured \(backgroundRenderLeaseFocusSnapshotCaptured ? "yes":"no") · window ordering preserved \(backgroundRenderLeaseWindowOrderingRestored) · key/main preserved \(backgroundRenderLeaseKeyMainRestored) · GPT Limits Tool activation unchanged \(backgroundRenderLeaseApplicationActivationRestored) · ownership released \(backgroundRenderLeaseOwnershipReleased)\nBackground focus: frontmost preserved \(backgroundFocusCycleFrontmostPreserved) · GPT Limits Tool was frontmost during samples \(backgroundFocusCycleSawGPTFrontmost ? "yes":"no") · activation unchanged \(backgroundFocusCycleActivationUnchanged) · key/main preserved \(backgroundFocusCycleKeyMainPreserved) · window ordering preserved \(backgroundFocusCycleWindowOrderingPreserved)\nBackground focus stages: \(backgroundFocusCycleSamples.isEmpty ? "not sampled":backgroundFocusCycleSamples.joined(separator:" | "))\nBackground presentation trace: \(backgroundPresentationTrace.isEmpty ? "none":backgroundPresentationTrace.joined(separator:" | "))\nGlobal window order: \(globalWindowOrderSummary) · live \(globalWindowOrderLastSample)\nWindow ordering probe: \(windowOrderingProbeOutput.stringValue)\nVisible session presentation: \(visibleSessionPresentationReport)\nDiagnostics geometry: \(diagnosticsLayoutTelemetry)"
+        let renderReadinessLine=cycleState.lastRenderReadiness.map(renderReadinessDiagnosticSummary) ?? "not recorded"
+        runtimeIdentityOutput.stringValue="Runtime diagnostic version: v\(pinnedDiagnosticVersion)\nRuntime build version: v\(bundleBuildVersion)\nRuntime build ID: \(bundleBuildID)\nExecutable build ID: \(executableBuildID)\nBuild timestamp UTC: \(buildTimestamp)\nCurrent bundle ID: \(Bundle.main.bundleIdentifier ?? "unavailable") · bundle identity migration: \(bundleIdentityMigrationStatus)\nRuntime executable: \(executable)\nRuntime bundle: \(bundle)\nPID: \(ProcessInfo.processInfo.processIdentifier)\nRuntime source: \(source)\nScheduler running: \(cycleRunning ? "Yes":"No")\nDiagnostic running: \(diagnosticOwner == nil ? "No":"Yes") · owner \(diagnosticOwner ?? "none")\nRender lease: \(backgroundRenderLeaseReport)\nLast render readiness:\n\(renderReadinessLine)\nRender lease restore: focus snapshot captured \(backgroundRenderLeaseFocusSnapshotCaptured ? "yes":"no") · window ordering preserved \(backgroundRenderLeaseWindowOrderingRestored) · key/main preserved \(backgroundRenderLeaseKeyMainRestored) · GPT Limits Tool activation unchanged \(backgroundRenderLeaseApplicationActivationRestored) · ownership released \(backgroundRenderLeaseOwnershipReleased)\nBackground focus: frontmost preserved \(backgroundFocusCycleFrontmostPreserved) · GPT Limits Tool was frontmost during samples \(backgroundFocusCycleSawGPTFrontmost ? "yes":"no") · activation unchanged \(backgroundFocusCycleActivationUnchanged) · key/main preserved \(backgroundFocusCycleKeyMainPreserved) · window ordering preserved \(backgroundFocusCycleWindowOrderingPreserved)\nBackground focus stages: \(backgroundFocusCycleSamples.isEmpty ? "not sampled":backgroundFocusCycleSamples.joined(separator:" | "))\nBackground presentation trace: \(backgroundPresentationTrace.isEmpty ? "none":backgroundPresentationTrace.joined(separator:" | "))\nGlobal window order: \(globalWindowOrderSummary) · live \(globalWindowOrderLastSample)\nWindow ordering probe: \(windowOrderingProbeOutput.stringValue)\nVisible session presentation: \(visibleSessionPresentationReport)\nDiagnostics geometry: \(diagnosticsLayoutTelemetry)"
     }
     func manualDiagnosticOwnerLabel()->String? {
         reconcileStaleListDiagnosticGeneration()
+        if conversationHistoryDiagnosticGeneration != nil {return "conversation history diagnostic"}
+        if messageDOMStructureDiagnosticGeneration != nil {return "message DOM structure diagnostic"}
         if liveResumeDiagnosticGeneration != nil {return "same-document resume proof"}
         if pinnedActivityDiagnosticToken != nil || pinnedActivityLaunchPending {return "pinned prefix + activity"}
         if renderDiagnosticToken != nil {return "hidden WebView rendering"}
@@ -1321,6 +1697,7 @@ let pinnedDiagnosticVersion="5.106.0"
         restoreInteractiveWindowState();presentWindow(panel,intent:.userInitiated,callSite:"menu_diagnostics")
         recordMainWindowLifecycleSnapshot("B diagnostics presentation returned")
         DispatchQueue.main.async { self.recordMainWindowLifecycleSnapshot("B diagnostics next runloop") }
+        updateRuntimeIdentity()
         refreshNotificationIdentityDiagnostics()
     }
     @objc func showMainWindow() { restoreInteractiveWindowState();presentWindow(mainWindow,intent:.userInitiated,callSite:"menu_main_window");renderUserUI() }
@@ -1718,6 +2095,7 @@ let pinnedDiagnosticVersion="5.106.0"
     }
     @objc func diagnoseVisibleHome(){startListDiagnostic(visible:true)}
     @objc func diagnoseHiddenHome(){startListDiagnostic(visible:false)}
+    @objc func inspectRecentChatListTraffic(){startListDiagnostic(visible:false,inspectRecentTraffic:true)}
     @objc func diagnoseStarredControl() {
         guard !cycleRunning else {starredDiagnosticOutput.stringValue="Starred UI diagnostic unavailable while a cycle is running.";return}
         guard web.url?.host == "chatgpt.com" else {starredDiagnosticOutput.stringValue="Diagnostic hook available: No · current target is not the ChatGPT session page.";return}
@@ -1807,8 +2185,8 @@ let pinnedDiagnosticVersion="5.106.0"
         }
     }
     @objc func diagnoseSidebarTopPosition() {
-        guard !cycleRunning else {setLastIsolatedDiagnostic("Last isolated diagnostic: v\(pinnedDiagnosticVersion) · unavailable · a cycle is running.");return}
-        guard web.url?.host == "chatgpt.com" else {setLastIsolatedDiagnostic("Last isolated diagnostic: v\(pinnedDiagnosticVersion) · unavailable · ChatGPT session page is not active.");return}
+        guard !cycleRunning else {storeSidebarDiagnosticFailure("cycle_running");setLastIsolatedDiagnostic("Last isolated diagnostic: v\(pinnedDiagnosticVersion) · unavailable · a cycle is running.");return}
+        guard web.url?.host == "chatgpt.com" else {storeSidebarDiagnosticFailure("chatgpt_session_not_active");setLastIsolatedDiagnostic("Last isolated diagnostic: v\(pinnedDiagnosticVersion) · unavailable · ChatGPT session page is not active.");return}
         pinDiagnosticTimeoutTask?.cancel();let runID=UUID();pinDiagnosticRunID=runID
         updateRuntimeIdentity()
         setLastIsolatedDiagnostic("Last isolated diagnostic: v\(pinnedDiagnosticVersion) · measuring sidebar top position.")
@@ -1821,7 +2199,7 @@ let pinnedDiagnosticVersion="5.106.0"
             DispatchQueue.main.async { guard let self,self.pinDiagnosticRunID==runID else{return}
                 guard error==nil,(value as? String)==self.pinnedDiagnosticVersion else {self.finishIsolatedDiagnostic("Last isolated diagnostic: unavailable · hook version mismatch or missing.");return}
                 let script="void window.gptInspectSidebarTopPosition?.().then(result=>window.webkit.messageHandlers.starredDiagnostic.postMessage({sidebarTopPositionResult:result})).catch(()=>window.webkit.messageHandlers.starredDiagnostic.postMessage({sidebarTopPositionError:'failed'})); true;"
-                self.web.evaluateJavaScript(script) { _,invokeError in if invokeError != nil {DispatchQueue.main.async {self.finishIsolatedDiagnostic("Last isolated diagnostic: v\(self.pinnedDiagnosticVersion) · failed safely · command delivery error.")}} }
+                self.web.evaluateJavaScript(script) { _,invokeError in if invokeError != nil {DispatchQueue.main.async {self.finishSidebarDiagnosticFailure("command_delivery_failed","Last isolated diagnostic: v\(self.pinnedDiagnosticVersion) · failed safely · command delivery error.")}} }
             }
         }
     }
@@ -2092,29 +2470,95 @@ let pinnedDiagnosticVersion="5.106.0"
         guard web.url?.host == "chatgpt.com" else {setLastIsolatedDiagnostic("Last isolated diagnostic: v\(pinnedDiagnosticVersion) · unavailable · ChatGPT session page is not active.");return}
         pinDiagnosticTimeoutTask?.cancel()
         let runID=UUID();pinDiagnosticRunID=runID
+        sidebarDiagnosticStartedAt=Date();sidebarDiagnosticLastStage="operation_started";sidebarDiagnosticLastElapsedMs=0;sidebarDiagnosticExceptionCategory="none";lastSidebarDiagnosticSummary=nil
+        lastSidebarDiagnosticOutput.stringValue="Last sidebar diagnostic: running · stage operation_started · elapsed 0 ms"
         updateRuntimeIdentity()
         setLastIsolatedDiagnostic("Last isolated diagnostic: v\(pinnedDiagnosticVersion) · checking sidebar top and visible conversation rows.")
         pinDiagnosticTimeoutTask=Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds:45_000_000_000)
             guard let self,self.pinDiagnosticRunID==runID else{return}
-            self.finishIsolatedDiagnostic("Last isolated diagnostic: v\(self.pinnedDiagnosticVersion) · stopped at the 45 s safety deadline.")
+            self.finishSidebarDiagnosticFailure("hard_timeout","Last isolated diagnostic: v\(self.pinnedDiagnosticVersion) · stopped at the 45 s safety deadline.")
         }
         web.evaluateJavaScript("window.pinnedDiagnosticVersion || null") { [weak self] value,error in
             DispatchQueue.main.async {
                 guard let self,self.pinDiagnosticRunID==runID else{return}
-                guard error == nil,(value as? String)==self.pinnedDiagnosticVersion else {self.finishIsolatedDiagnostic("Last isolated diagnostic: unavailable · hook version mismatch or missing.");return}
+                guard error == nil,(value as? String)==self.pinnedDiagnosticVersion else {self.finishSidebarDiagnosticFailure("bridge_hook_missing_or_mismatch","Last isolated diagnostic: unavailable · hook version mismatch or missing.");return}
                 let invocation="""
-                void window.gptInspectVisiblePinnedRows({maxRows:13,hardTimeoutMs:40000}).then(result => {
-                  window.webkit.messageHandlers.starredDiagnostic.postMessage({visiblePinnedRowsResult:result});
+                void window.gptInspectVisiblePinnedRows({maxRows:13,hardTimeoutMs:40000,sidebarDiagnosticRunID:'\(runID.uuidString)'}).then(result => {
+                  window.webkit.messageHandlers.starredDiagnostic.postMessage({visiblePinnedRowsResult:result,sidebarDiagnosticRunID:'\(runID.uuidString)'});
                 }).catch(() => {
-                  window.webkit.messageHandlers.starredDiagnostic.postMessage({visiblePinnedRowsError:'visible_pinned_rows_failed'});
+                  window.webkit.messageHandlers.starredDiagnostic.postMessage({visiblePinnedRowsError:'visible_pinned_rows_failed',sidebarDiagnosticRunID:'\(runID.uuidString)'});
                 }); true;
                 """
                 self.web.evaluateJavaScript(invocation) { _,invokeError in
-                    if invokeError != nil {DispatchQueue.main.async {self.finishIsolatedDiagnostic("Last isolated diagnostic: v\(self.pinnedDiagnosticVersion) · failed safely · command delivery error.")}}
+                    if invokeError != nil {DispatchQueue.main.async {self.finishSidebarDiagnosticFailure("command_delivery_failed","Last isolated diagnostic: v\(self.pinnedDiagnosticVersion) · failed safely · command delivery error.")}}
                 }
             }
         }
+    }
+    @objc func inspectSidebarElementStructure() {
+        guard !cycleRunning else {sidebarElementStructureOutput.stringValue="Last sidebar element structure: unavailable · a cycle is running.";return}
+        guard pinDiagnosticRunID == nil else {sidebarElementStructureOutput.stringValue="Last sidebar element structure: unavailable · another diagnostic is running.";return}
+        guard web.url?.host == "chatgpt.com" else {sidebarElementStructureOutput.stringValue="Last sidebar element structure: unavailable · ChatGPT session page is not active.";return}
+        let runID=UUID();pinDiagnosticRunID=runID
+        sidebarElementStructureOutput.stringValue="Last sidebar element structure: running · bounded sidebar-only scan"
+        updateRuntimeIdentity()
+        pinDiagnosticTimeoutTask=Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds:8_000_000_000)
+            guard let self,self.pinDiagnosticRunID==runID else{return}
+            self.pinDiagnosticRunID=nil;self.pinDiagnosticTimeoutTask=nil
+            self.sidebarElementStructureOutput.stringValue="Last sidebar element structure: failure · native_timeout"
+            self.updateRuntimeIdentity()
+        }
+        let token=runID.uuidString
+        let script="""
+        void window.gptInspectSidebarElementStructure?.({hardTimeoutMs:5000}).then(result => {
+          window.webkit.messageHandlers.starredDiagnostic.postMessage({sidebarElementStructureResult:result,sidebarStructureDiagnosticRunID:'\(token)'});
+        }).catch(error => {
+          window.webkit.messageHandlers.starredDiagnostic.postMessage({sidebarElementStructureError:error?.name==='TimeoutError'?'TimeoutError':'Error',sidebarStructureDiagnosticRunID:'\(token)'});
+        }); true;
+        """
+        web.evaluateJavaScript(script) { [weak self] _,error in
+            guard error != nil else{return}
+            DispatchQueue.main.async {
+                guard let self,self.pinDiagnosticRunID==runID else{return}
+                self.pinDiagnosticTimeoutTask?.cancel();self.pinDiagnosticTimeoutTask=nil;self.pinDiagnosticRunID=nil
+                self.sidebarElementStructureOutput.stringValue="Last sidebar element structure: failure · bridge_unavailable"
+                self.updateRuntimeIdentity()
+            }
+        }
+    }
+    func renderSidebarElementStructure(_ raw:[String:Any])->String {
+        func boundedCount(_ value:Any?,_ cap:Int)->Int { min(Swift.max(0,(value as? NSNumber)?.intValue ?? 0),cap) }
+        func safeToken(_ value:Any?,pattern:String)->String? {
+            guard let value=value as? String,value.range(of:pattern,options:.regularExpression) != nil else{return nil};return value
+        }
+        let counts=raw["counts"] as? [String:Any] ?? [:]
+        let stableRouteSegments=Set(["settings","auth","login","logout","share","library","explore","search","workspace","account","help","new","home","recent","archived","projects","project","features","about"])
+        func safeRoute(_ value:String)->String? {
+            guard value=="/" || value.hasPrefix("/"),value.utf8.count<=240 else{return nil}
+            let segments=value.split(separator:"/").map(String.init)
+            guard segments.allSatisfy({$0==":id" || stableRouteSegments.contains($0)}) else{return nil}
+            return value
+        }
+        let routes=(raw["routeTemplates"] as? [[String:Any]] ?? []).prefix(40).compactMap { item -> String? in
+            guard let route=(item["template"] as? String).flatMap(safeRoute) else{return nil}
+            return "\(route)×\(boundedCount(item["count"],1200))"
+        }
+        let candidates=(raw["rowCandidates"] as? [[String:Any]] ?? []).prefix(30).compactMap { item -> String? in
+            guard let tag=safeToken(item["tag"],pattern:"^[a-z][a-z0-9-]{0,15}$") else{return nil}
+            let roleSet=Set(["none","link","button","listitem","list","tree","group","navigation","heading","menuitem","other","presentation"])
+            let role=(item["role"] as? String).flatMap{roleSet.contains($0) ? $0:nil} ?? "other"
+            let data=(item["dataAttributeNames"] as? [String] ?? []).prefix(24).compactMap{safeToken($0,pattern:"^data-[a-z0-9_-]{1,64}$")}.joined(separator:",")
+            let template=(item["hrefTemplate"] as? String).flatMap(safeRoute) ?? "none"
+            return "\(tag)/\(role) · data [\(data)] · href \((item["hasHref"] as? Bool)==true ? "yes":"no") \(template) · depth \(boundedCount(item["depth"],32)) · matches \(boundedCount(item["count"],1200))"
+        }
+        let aria=(counts["ariaAttributeNames"] as? [String] ?? []).prefix(64).compactMap{safeToken($0,pattern:"^aria-[a-z0-9_-]{1,64}$")}.joined(separator:",")
+        let pinned=(raw["pinnedMarkerAttributeNames"] as? [String] ?? []).prefix(32).compactMap{safeToken($0,pattern:"^data-[a-z0-9_-]{1,64}$")}.joined(separator:",")
+        let status=(raw["status"] as? String).flatMap{["success","partial","failure"].contains($0) ? $0:nil} ?? "failure"
+        let reason=safeToken(raw["reason"],pattern:"^[A-Za-z0-9_-]{1,48}$") ?? "invalid_result"
+        let elapsed=boundedCount(raw["elapsedMs"],5000),nodes=boundedCount(raw["nodeCount"],1200)
+        return "Last sidebar element structure: \(status) · \(reason) · \(elapsed) ms · nodes \(nodes) · roots \(boundedCount(raw["rootCount"],16)) (nav \(boundedCount(raw["navCount"],16)), aside \(boundedCount(raw["asideCount"],16)))\nCounts: a[href] \(boundedCount(counts["hrefAnchors"],1200)) · button \(boundedCount(counts["buttons"],1200)) · role=link \(boundedCount(counts["roleLinks"],1200)) · role=button \(boundedCount(counts["roleButtons"],1200)) · data-testid \(boundedCount(counts["dataTestID"],1200)) · data-state \(boundedCount(counts["dataState"],1200)) · aria attributes \(boundedCount(counts["ariaAttributeCount"],24000))\nARIA names: \(aria.isEmpty ? "none":aria)\nRoutes: \(routes.isEmpty ? "none":routes.joined(separator:", "))\nRow candidates (tag/role · data names · href template · depth · matches):\n\(candidates.isEmpty ? "none":candidates.joined(separator:"\n"))\nPossible pinned-marker attribute names: \(pinned.isEmpty ? "none":pinned)"
     }
     func renderDOMSummary(_ data:[String:Any])->String {
         let ready=data["documentReadyState"] as? String ?? "unknown"
@@ -2185,6 +2629,29 @@ let pinnedDiagnosticVersion="5.106.0"
         case .readinessFailed(let reason):return reason
         }
     }
+    func recordRenderReadiness(phase:String,result:RenderReadinessResult,reason:String) {
+        cycleState.recordRenderReadiness(phase:phase,result:result,reason:reason,routeCategory:renderReadinessRouteCategory(web.url))
+        saveCycle()
+        updateRuntimeIdentity()
+    }
+    func renderReadinessFailureCode(_ error:Error)->String {
+        let nsError=error as NSError
+        if nsError.domain==NSURLErrorDomain {return "navigation_failed"}
+        let reason=renderLeaseFailureReason(error)
+        switch reason {
+        case "render_readiness_timeout":return "timeout"
+        case "render_readiness_unavailable":return "bridge_result_missing"
+        case "page_unavailable":return "unexpected_page"
+        case "render_lease_unavailable":return "render_lease_unavailable"
+        default:return sanitizedRenderReadinessCode(reason,fallback:"readiness_failed")
+        }
+    }
+    func recordRenderReadinessNavigationFailure(_ error:Error) {
+        guard cycleRunning,backgroundRenderLease != nil else{return}
+        let nsError=error as NSError
+        let reason=nsError.domain==NSURLErrorDomain ? "navigation_failed":"navigation_error"
+        recordRenderReadiness(phase:"navigation",result:.failure,reason:reason)
+    }
     func acquireBackgroundRenderSurface(owner:String) async throws {
         try await acquireBackgroundRenderSurface(owner:owner,waitForConversationLinks:true)
     }
@@ -2192,7 +2659,10 @@ let pinnedDiagnosticVersion="5.106.0"
         try await acquireBackgroundRenderSurface(owner:owner,waitForConversationLinks:false)
     }
     func acquireBackgroundRenderSurface(owner:String,waitForConversationLinks:Bool) async throws {
-        guard web.url?.host=="chatgpt.com" else { throw BackgroundRenderLeaseError.pageUnavailable }
+        guard web.url?.host=="chatgpt.com" else {
+            recordRenderReadiness(phase:"route",result:.failure,reason:"unexpected_page")
+            throw BackgroundRenderLeaseError.pageUnavailable
+        }
         if globalWindowOrderMonitor==nil {beginGlobalWindowOrderMonitoring()}
         guard backgroundRenderLease==nil,backgroundRenderLeaseGate.acquire(owner) else { throw BackgroundRenderLeaseError.busy }
         recordBackgroundFocusSample("before background render lease")
@@ -2212,6 +2682,7 @@ let pinnedDiagnosticVersion="5.106.0"
         let activated=web.window===session && !web.isHidden && web.bounds.width>0 && web.bounds.height>0 &&
             session.ignoresMouseEvents && NSApp.isActive==original.appActive && session.isKeyWindow==original.keyWindow && session.isMainWindow==original.mainWindow
         guard activated else {
+            recordRenderReadiness(phase:"surface",result:.failure,reason:"render_surface_unavailable")
             _=restoreBackgroundRenderSurface(owner:owner)
             backgroundRenderLeaseReport="acquired no · render surface inactive · restored yes"
             throw BackgroundRenderLeaseError.activationFailed
@@ -2229,6 +2700,7 @@ let pinnedDiagnosticVersion="5.106.0"
             backgroundRenderLeaseReport="acquired yes · render surface active yes · waiting for conversation links"
             let value=try await evaluateRenderReadiness(owner:owner,timeoutSeconds:19)
             let readiness=value["readiness"] as? [String:Any] ?? [:]
+            let preflight=value["preflight"] as? [String:Any] ?? [:]
             backgroundRenderLeaseReadiness=readiness
             let links=(readiness["finalSnapshotCount"] as? NSNumber)?.intValue ?? 0
             let status=readiness["status"] as? String ?? "unknown"
@@ -2239,6 +2711,9 @@ let pinnedDiagnosticVersion="5.106.0"
             let firstPositive=(readiness["firstPositiveCount"] as? NSNumber)?.intValue ?? 0
             let firstLinkMs=(readiness["timeToFirstPositiveMs"] as? NSNumber)?.intValue
             backgroundRenderLeaseTimeToFirstConversationLinkMs=firstLinkMs
+            let readinessSuccess=ready && links>0
+            let readinessReason=readinessSuccess ? "snapshot_ready" : (status=="snapshot_ready" ? "no_conversation_links":status)
+            recordRenderReadiness(phase:preflight["stage"] as? String ?? "readiness",result:readinessSuccess ? .success:.failure,reason:readinessReason)
             let elapsed=Int(Date().timeIntervalSince(before)*1000)
             let firstLinkText=firstLinkMs.map(String.init) ?? "unknown"
             backgroundRenderLeaseReport="acquired yes · render surface active yes · conversation links \(links) · firstPositive \(firstPositive) · timeToFirstLinks \(firstLinkText) ms · readiness \(status) · signature changes \(signatureChanges) · unrelated mutation checks \(unrelatedMutations) · timeToStable \(stableMs) ms · \(elapsed) ms"
@@ -2250,6 +2725,7 @@ let pinnedDiagnosticVersion="5.106.0"
             try Task.checkCancellation()
         } catch {
             if backgroundRenderLease?.owner==owner {
+                recordRenderReadiness(phase:"readiness",result:.failure,reason:renderReadinessFailureCode(error))
                 let restored=restoreBackgroundRenderSurface(owner:owner)
                 let nsError=error as NSError
                 backgroundRenderLeaseReport += " · primaryFailureReason render_readiness_bridge_error · readiness bridge error \(nsError.domain):\(nsError.code) · cleanupFailureReason \(restored ? "none":"render_surface_restore_failed") · cleanup \(restored ? "completed":"failed")"
@@ -2288,7 +2764,7 @@ let pinnedDiagnosticVersion="5.106.0"
         if cycleRunning {setLastIsolatedDiagnostic("Last isolated diagnostic: unavailable · scheduler is running.");return}
         if let owner=manualDiagnosticOwnerLabel() {setLastIsolatedDiagnostic("Last isolated diagnostic: unavailable · \(owner) diagnostic is active.");return}
         let runtimeSource=runtimeSourceClassification()
-        guard pinnedDiagnosticVersion=="5.106.0", runtimeSource != "unexpected" else {setLastIsolatedDiagnostic("Last isolated diagnostic: unavailable · runtime identity gate failed.");return}
+        guard pinnedDiagnosticVersion=="6.1.0", runtimeSource != "unexpected" else {setLastIsolatedDiagnostic("Last isolated diagnostic: unavailable · runtime identity gate failed.");return}
         guard web.url?.host=="chatgpt.com" else {setLastIsolatedDiagnostic("Last isolated diagnostic: unavailable · ChatGPT session page is not active.");return}
         let token=UUID().uuidString;renderDiagnosticToken=token;renderDiagnosticHiddenDOM=[:]
         let original=renderControlState(),originalLevel=session.level,originalFrame=web.frame,originalWindowFrame=session.frame
@@ -2378,7 +2854,7 @@ let pinnedDiagnosticVersion="5.106.0"
         guard renderDiagnosticToken==nil,pinDiagnosticRunID==nil,!listDiagnosticGenerationGate.isActive else {rejectPinnedActivityLaunch("diagnostic_running");return}
         guard backgroundRenderLease==nil else {rejectPinnedActivityLaunch("render_lease_unavailable");return}
         let runtimeSource=runtimeSourceClassification()
-        guard pinnedDiagnosticVersion=="5.106.0", runtimeSource != "unexpected" else {rejectPinnedActivityLaunch("runtime_gate_failed");return}
+        guard pinnedDiagnosticVersion=="6.1.0", runtimeSource != "unexpected" else {rejectPinnedActivityLaunch("runtime_gate_failed");return}
         guard web.url?.host == "chatgpt.com" else {rejectPinnedActivityLaunch("page_unavailable");return}
         pinnedActivityLaunchStage="gate_passed"
         setLastIsolatedDiagnostic("Last isolated diagnostic: State: starting\nStage: gate_passed\nOperation active: No")
@@ -3921,6 +4397,43 @@ let pinnedDiagnosticVersion="5.106.0"
     func finishPinDiagnostic(_ message:String) {
         pinDiagnosticTimeoutTask?.cancel();pinDiagnosticTimeoutTask=nil;pinDiagnosticRunID=nil;starredDiagnosticOutput.stringValue=message;updateRuntimeIdentity()
     }
+    func sidebarDiagnosticElapsedNow()->Int {
+        guard let started=sidebarDiagnosticStartedAt else{return sidebarDiagnosticLastElapsedMs}
+        return max(sidebarDiagnosticLastElapsedMs,min(45000,Int(Date().timeIntervalSince(started)*1000)))
+    }
+    func recordSidebarDiagnosticStage(_ payload:[String:Any]) {
+        let allowedStages:Set<String>=["operation_started","document_ready","sidebar_lookup_started","sidebar_found","sidebar_not_found","row_scan_started","row_scan_finished","route_template_scan_started","route_template_scan_finished","callback_returned","readiness_started","top_started","prefix_started"]
+        guard let stage=payload["stage"] as? String,allowedStages.contains(stage) else{return}
+        sidebarDiagnosticLastStage=stage
+        if let elapsed=(payload["elapsedMs"] as? NSNumber)?.intValue {sidebarDiagnosticLastElapsedMs=max(0,min(45000,elapsed))}
+        let allowedExceptions:Set<String>=["none","Error","TypeError","RangeError","SyntaxError","SecurityError","TimeoutError","javascript_exception","external_timeout"]
+        if let exception=payload["exceptionCategory"] as? String,exception != "none",allowedExceptions.contains(exception){sidebarDiagnosticExceptionCategory=exception}
+        let exceptionText=sidebarDiagnosticExceptionCategory=="none" ? "":" · exception \(sidebarDiagnosticExceptionCategory)"
+        lastSidebarDiagnosticOutput.stringValue="Last sidebar diagnostic: running · stage \(sidebarDiagnosticLastStage) · elapsed \(sidebarDiagnosticElapsedNow()) ms\(exceptionText)"
+    }
+    func storeSidebarDiagnosticSummary(_ summary:SidebarDiagnosticSummary) {
+        lastSidebarDiagnosticSummary=summary
+        lastSidebarDiagnosticOutput.stringValue=summary.displayText
+        updateCurrentCycleSummary()
+    }
+    func storeSidebarDiagnosticFailure(_ reason:String) {
+        storeSidebarDiagnosticSummary(.make(result:"failure",detectedRowCount:0,pinnedRowCandidateCount:0,recognizedRouteTemplateCount:0,sidebarPresent:nil,navPresent:nil,asidePresent:nil,scrollContainerCount:0,reason:reason,stage:sidebarDiagnosticLastStage,elapsedMs:sidebarDiagnosticElapsedNow(),exceptionCategory:reason=="hard_timeout" ? "TimeoutError":sidebarDiagnosticExceptionCategory))
+    }
+    func storeSidebarDiagnosticResult(_ result:[String:Any]) {
+        let raw=result["sidebarDiagnosticSummary"] as? [String:Any] ?? [:]
+        let number:([String:Any],String)->Int={ object,key in (object[key] as? NSNumber)?.intValue ?? 0 }
+        let flag:([String:Any],String)->Bool?={ object,key in object[key] as? Bool }
+        let summary=SidebarDiagnosticSummary.make(result:raw["result"] as? String ?? "failure",
+            detectedRowCount:number(raw,"detectedRowCount"),pinnedRowCandidateCount:number(raw,"pinnedRowCandidateCount"),
+            recognizedRouteTemplateCount:number(raw,"recognizedRouteTemplateCount"),sidebarPresent:flag(raw,"sidebarPresent"),
+            navPresent:flag(raw,"navPresent"),asidePresent:flag(raw,"asidePresent"),scrollContainerCount:number(raw,"scrollContainerCount"),
+            reason:raw["reason"] as? String ?? result["stopReason"] as? String ?? "result_summary_missing",stage:sidebarDiagnosticLastStage,elapsedMs:sidebarDiagnosticElapsedNow(),exceptionCategory:raw["exceptionCategory"] as? String ?? sidebarDiagnosticExceptionCategory)
+        storeSidebarDiagnosticSummary(summary)
+    }
+    func finishSidebarDiagnosticFailure(_ reason:String,_ message:String) {
+        storeSidebarDiagnosticFailure(reason)
+        finishIsolatedDiagnostic(message)
+    }
     func setLastIsolatedDiagnostic(_ message:String) {
         latestIsolatedDiagnosticText=message
         lastIsolatedDiagnosticOutput.stringValue=message
@@ -4027,7 +4540,21 @@ let pinnedDiagnosticVersion="5.106.0"
             finishIsolatedDiagnostic(message);return
         }
         if payload["sidebarTopPositionError"] != nil {finishIsolatedDiagnostic("Last isolated diagnostic: v\(pinnedDiagnosticVersion) · top_unproven · reason diagnostic_error.");return}
-        if let result=payload["visiblePinnedRowsResult"] as? [String:Any] {
+        if let result=payload["sidebarElementStructureResult"] as? [String:Any],let token=payload["sidebarStructureDiagnosticRunID"] as? String,token==pinDiagnosticRunID?.uuidString {
+            pinDiagnosticTimeoutTask?.cancel();pinDiagnosticTimeoutTask=nil;pinDiagnosticRunID=nil
+            sidebarElementStructureOutput.stringValue=renderSidebarElementStructure(result)
+            updateRuntimeIdentity();return
+        }
+        if payload["sidebarElementStructureError"] != nil,let token=payload["sidebarStructureDiagnosticRunID"] as? String,token==pinDiagnosticRunID?.uuidString {
+            pinDiagnosticTimeoutTask?.cancel();pinDiagnosticTimeoutTask=nil;pinDiagnosticRunID=nil
+            sidebarElementStructureOutput.stringValue="Last sidebar element structure: failure · sanitized_exception"
+            updateRuntimeIdentity();return
+        }
+        if let stage=payload["visiblePinnedRowsStage"] as? [String:Any],let token=payload["sidebarDiagnosticRunID"] as? String,token==pinDiagnosticRunID?.uuidString {recordSidebarDiagnosticStage(stage);return}
+            if let result=payload["visiblePinnedRowsResult"] as? [String:Any],let token=payload["sidebarDiagnosticRunID"] as? String,token==pinDiagnosticRunID?.uuidString {
+            sidebarDiagnosticLastStage="callback_returned";sidebarDiagnosticLastElapsedMs=sidebarDiagnosticElapsedNow()
+            if let exception=(result["sidebarDiagnosticSummary"] as? [String:Any])?["exceptionCategory"] as? String {sidebarDiagnosticExceptionCategory=exception}
+            storeSidebarDiagnosticResult(result)
             pinDiagnosticTimeoutTask?.cancel();pinDiagnosticTimeoutTask=nil;pinDiagnosticRunID=nil
             func yes(_ value:Any?)->String {(value as? Bool)==true ? "Yes":"No"}
             func count(_ value:Any?)->String {(value as? NSNumber).map{String($0.intValue)} ?? "0"}
@@ -4049,7 +4576,7 @@ let pinnedDiagnosticVersion="5.106.0"
             setLastIsolatedDiagnostic(message.replacingOccurrences(of:"\nTop:",with:"\nScroll: \(scrollText)\nTop:"))
             return
         }
-        if payload["visiblePinnedRowsError"] != nil {finishIsolatedDiagnostic("Last isolated diagnostic: v\(pinnedDiagnosticVersion) · failed safely · result contained no row data.");return}
+        if payload["visiblePinnedRowsError"] != nil,let token=payload["sidebarDiagnosticRunID"] as? String,token==pinDiagnosticRunID?.uuidString {sidebarDiagnosticExceptionCategory="javascript_exception";finishSidebarDiagnosticFailure("javascript_operation_failed","Last isolated diagnostic: v\(pinnedDiagnosticVersion) · failed safely · result contained no row data.");return}
         if let result=payload["firstRowStructureResult"] as? [String:Any] {
             pinDiagnosticTimeoutTask?.cancel();pinDiagnosticTimeoutTask=nil;pinDiagnosticRunID=nil
             func yes(_ value:Any?) -> String {(value as? Bool)==true ? "Yes":"No"}
@@ -4180,20 +4707,30 @@ let pinnedDiagnosticVersion="5.106.0"
         starredDiagnosticOutput.stringValue += "\nPinned candidate: \(candidate["tag"] as? String ?? "none") / \(candidate["role"] as? String ?? "none") · expanded \(candidate["ariaExpanded"] as? String ?? "absent") · aria attributes [\(ariaAttrs)] · data attributes [\(dataAttrs)] · ID present \(yes(candidate["idPresent"]))\nARIA: \(relation("ariaControls")) · \(relation("ariaLabelledby")) · \(relation("ariaOwns"))\nCandidate parent chain (max 5):\n\(parentChain.isEmpty ? "none":parentChain)\nPinned flat region: found \(yes(region["found"])) · non-nested/virtualized \(yes(region["nonNested"])) · sibling nodes \(count(region["siblingCount"])) · conversations \(regionCounts["conversationLinks"] ?? 0) · projects \(regionCounts["projectLinks"] ?? 0) · unknown \(regionCounts["unknownLinks"] ?? 0)"
         starredDiagnosticOutput.stringValue += "\nObserved passive list responses (includes initial page load):\n\(observed.isEmpty ? "none":observed)\nStarred=true source observed: \(yes(source["starredTrueSourceAvailable"])) · pinned matches \(count(source["starredTrueOverlapCount"])) · update_time available: \(yes((source["observedStreams"] as? [[String:Any]])?.contains(where: { ($0["starred"] as? Bool)==true && ($0["containsUpdateTime"] as? Bool)==true })))"
     }
-    func startListDiagnostic(visible:Bool) {
+    func startListDiagnostic(visible:Bool,inspectRecentTraffic:Bool=false) {
         guard !cycleRunning else {listDiagnosticOutput.stringValue="List diagnostics unavailable while a cycle is running.";return}
         if let owner=manualDiagnosticOwnerLabel() {listDiagnosticOutput.stringValue="List diagnostics unavailable · \(owner) diagnostic is active.";updateRuntimeIdentity();return}
         guard let generation=listDiagnosticGenerationGate.tryBegin() else {listDiagnosticOutput.stringValue="List diagnostics unavailable · another diagnostic is active.";return}
-        listDiagnosticTask?.cancel();listDiagnosticMode=visible ? "Visible home":"Hidden home"
+        listDiagnosticTask?.cancel();listDiagnosticMode=inspectRecentTraffic ? "Recent-chat list traffic":(visible ? "Visible home":"Hidden home")
         listDiagnosticRequests=0;listDiagnosticRequestIDs=[];listDiagnosticResponses=0;listDiagnosticFailures=0;listDiagnosticRecognized=false;listDiagnosticStatusCodes=[]
         listDiagnosticResourceObserved=false;listDiagnosticResourceCompleted=false;listDiagnosticResourceInitiator="Unknown";listDiagnosticResourceStart=nil;listDiagnosticResourceStatus=nil
         listDiagnosticLastTransport="Unknown";listDiagnosticLastMethod="Unknown";listDiagnosticLastPath="Unknown";listDiagnosticLastStatus=nil
         listDiagnosticKeys=[];listDiagnosticFieldTypes="";listDiagnosticItemsType="Unknown";listDiagnosticItemCount=nil
-        listDiagnosticPage="Pending";listDiagnosticViewport="Pending";listDiagnosticSidebar="Pending";listDiagnosticFetchHookActive="Unknown";listDiagnosticXHRHookActive="Unknown";listDiagnosticHookAssignments="Unknown";listDiagnosticBackendResources=[];listDiagnosticTimestamp=""
-        listDiagnosticOutput.stringValue="\(listDiagnosticMode): loading ChatGPT home; passively observing list requests for 45 seconds."
+        listDiagnosticPage="Pending";listDiagnosticViewport="Pending";listDiagnosticSidebar="Pending";listDiagnosticFetchHookActive="Unknown";listDiagnosticXHRHookActive="Unknown";listDiagnosticHookAssignments="Unknown";listDiagnosticBackendResources=[];listDiagnosticTimestamp="";listDiagnosticTrafficLines=[]
+        listDiagnosticOutput.stringValue="\(listDiagnosticMode): loading ChatGPT home; capturing only sanitized backend traffic for at most 45 seconds."
         updateRuntimeIdentity()
         _=presentWindow(session,intent:.background,callSite:"manual_background_home_diagnostic")
-        web.load(URLRequest(url:URL(string:"https://chatgpt.com/")!))
+        let home=URL(string:"https://chatgpt.com/")!
+        let loadHome={ [weak self] in guard let self,self.listDiagnosticGenerationGate.owns(generation) else{return};self.web.load(URLRequest(url:home)) }
+        if inspectRecentTraffic {
+            web.evaluateJavaScript("sessionStorage.setItem('gpt-limits-inspect-recent-list-traffic','1'); true") { [weak self] _,error in
+                DispatchQueue.main.async { [weak self] in
+                    guard let self,self.listDiagnosticGenerationGate.owns(generation) else{return}
+                    if error != nil {self.finishListDiagnosticCancellation(generation:generation);self.listDiagnosticOutput.stringValue="Recent-chat list traffic diagnostic unavailable · could not arm a one-navigation in-memory capture.";return}
+                    loadHome()
+                }
+            }
+        } else {loadHome()}
         listDiagnosticTask=Task { @MainActor [weak self] in
             do {try await Task.sleep(nanoseconds:45_000_000_000)} catch {
                 guard let self=self,self.listDiagnosticGenerationGate.owns(generation) else{return}
@@ -4213,6 +4750,38 @@ let pinnedDiagnosticVersion="5.106.0"
     }
     func finishListDiagnostic(generation:UUID) {
         guard listDiagnosticGenerationGate.owns(generation) else{return}
+        if listDiagnosticMode=="Recent-chat list traffic" {
+            web.evaluateJavaScript("window.gptEndRecentListTrafficCapture?.()") { [weak self] result,_ in
+                DispatchQueue.main.async {
+                    guard let self,self.listDiagnosticGenerationGate.owns(generation) else{return}
+                    if let events=result as? [[String:Any]] {self.listDiagnosticTrafficLines=self.formatRecentListTraffic(events)}
+                    self.finishListDiagnosticNow(generation:generation)
+                }
+            }
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds:1_000_000_000)
+                guard let self,self.listDiagnosticGenerationGate.owns(generation) else{return}
+                self.finishListDiagnosticNow(generation:generation)
+            }
+            return
+        }
+        finishListDiagnosticNow(generation:generation)
+    }
+    func formatRecentListTraffic(_ events:[[String:Any]])->[String] {
+        events.suffix(50).compactMap { item in
+            guard let path=item["pathname"] as? String,path.hasPrefix("/backend-api/"),path.range(of:"^/backend-api/[A-Za-z0-9_:/.-]{1,180}$",options:.regularExpression) != nil else{return nil}
+            let kind=(item["event"] as? String).flatMap{["request","response","failure","shape","resource"].contains($0) ? $0:nil} ?? "unknown"
+            let transport=(item["transport"] as? String).flatMap{["fetch","XHR","resource","unknown"].contains($0) ? $0:nil} ?? "unknown"
+            let status=(item["status"] as? NSNumber).map{String(max(100,min(599,$0.intValue)))} ?? "—"
+            let keys=(item["topLevelKeys"] as? [String] ?? []).filter{$0.range(of:"^[A-Za-z0-9_]{1,64}$",options:.regularExpression) != nil}.prefix(40).joined(separator:",")
+            let arrays=(item["arrayCounts"] as? [[String:Any]] ?? []).prefix(8).compactMap{array -> String? in guard let key=array["key"] as? String,key.range(of:"^[A-Za-z0-9_]{1,64}$",options:.regularExpression) != nil,let count=(array["count"] as? NSNumber)?.intValue,count>=0 else{return nil};return "\(key)=\(min(count,1_000_000))"}.joined(separator:",")
+            let recognized=(item["recognized"] as? Bool).map{$0 ? "yes":"no"} ?? "unknown"
+            let rejection=(item["parserRejectionReason"] as? String).flatMap{$0.range(of:"^[a-z0-9_]{1,48}$",options:.regularExpression) != nil ? $0:nil} ?? "not_evaluated"
+            return "\(kind) · \(transport) · \(path) · HTTP \(status) · keys [\(keys.isEmpty ? "—":keys)] · arrays [\(arrays.isEmpty ? "—":arrays)] · recognized \(recognized) · parser reason \(rejection)"
+        }
+    }
+    func finishListDiagnosticNow(generation:UUID) {
+        guard listDiagnosticGenerationGate.owns(generation) else{return}
         let completedMode=listDiagnosticMode
         let timingResponse=listDiagnosticResourceObserved && listDiagnosticResourceCompleted
         let effectiveResponses=listDiagnosticResponses+(timingResponse && listDiagnosticResponses==0 ? 1:0)
@@ -4225,7 +4794,9 @@ let pinnedDiagnosticVersion="5.106.0"
         let items=listDiagnosticItemCount.map(String.init) ?? "unknown"
         let resourceStart=listDiagnosticResourceStart.map{String($0)+" ms"} ?? "—"
         let otherResources=listDiagnosticBackendResources.isEmpty ? "—" : listDiagnosticBackendResources.joined(separator:"; ")
-        listDiagnosticOutput.stringValue="\(completedMode) · \(reason.rawValue)\nRequest: \(listDiagnosticRequests>0 || listDiagnosticResourceObserved ? "Yes":"No") · fetch/XHR: \(listDiagnosticRequests) · resource timing: \(listDiagnosticResourceObserved ? "Yes":"No") · Response: \(effectiveResponses>0 ? "Yes":"No") · Parser: \(parser)\n\(listDiagnosticLastMethod) \(listDiagnosticLastPath) · \(listDiagnosticLastTransport) · HTTP \(status) · \(listDiagnosticTimestamp) · resource start \(resourceStart)\nResponse keys: \(keys) · items: \(listDiagnosticItemsType) / \(items) · types: \(listDiagnosticFieldTypes)\nPage: \(listDiagnosticPage) · viewport: \(listDiagnosticViewport) · sidebar: \(listDiagnosticSidebar) · fetch hook active: \(listDiagnosticFetchHookActive) · XHR hook active: \(listDiagnosticXHRHookActive) · wrapper reassignments: \(listDiagnosticHookAssignments)\nBackend API resources: \(otherResources)"
+        let traffic=listDiagnosticTrafficLines.isEmpty ? "none observed":"\(listDiagnosticTrafficLines.count) sanitized events\n"+listDiagnosticTrafficLines.suffix(24).joined(separator:"\n")
+        listDiagnosticOutput.stringValue="\(completedMode) · \(reason.rawValue)\nRequest: \(listDiagnosticRequests>0 || listDiagnosticResourceObserved ? "Yes":"No") · fetch/XHR: \(listDiagnosticRequests) · resource timing: \(listDiagnosticResourceObserved ? "Yes":"No") · Response: \(effectiveResponses>0 ? "Yes":"No") · Parser: \(parser)\n\(listDiagnosticLastMethod) \(listDiagnosticLastPath) · \(listDiagnosticLastTransport) · HTTP \(status) · \(listDiagnosticTimestamp) · resource start \(resourceStart)\nResponse keys: \(keys) · items: \(listDiagnosticItemsType) / \(items) · types: \(listDiagnosticFieldTypes)\nPage: \(listDiagnosticPage) · viewport: \(listDiagnosticViewport) · sidebar: \(listDiagnosticSidebar) · fetch hook active: \(listDiagnosticFetchHookActive) · XHR hook active: \(listDiagnosticXHRHookActive) · wrapper reassignments: \(listDiagnosticHookAssignments)\nRecent-chat list traffic:\n\(traffic)\nBackend API resources: \(otherResources)"
+        updateCurrentCycleSummary()
         listDiagnosticTask=nil
         listDiagnosticMode=""
         guard listDiagnosticGenerationGate.finish(generation) else{return}
@@ -4326,6 +4897,8 @@ let pinnedDiagnosticVersion="5.106.0"
     }
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
         if message.frameInfo.isMainFrame,message.frameInfo.securityOrigin.host=="chatgpt.com" {
+            if message.name=="conversationHistoryDiagnostic",let data=message.body as? [String:Any] {renderCurrentChatHistoryDiagnostic(data);return}
+            if message.name=="messageDOMStructureDiagnostic",let data=message.body as? [String:Any] {renderCurrentMessageDOMStructureDiagnostic(data);return}
             if message.name=="liveResumeDiagnostic",let data=message.body as? [String:Any] {handleLiveDocumentResumeDiagnostic(data);return}
             if message.name=="nativeRescue",let data=message.body as? [String:Any] {
                 handleNativeRescueMessage(data);return
@@ -4416,6 +4989,7 @@ let pinnedDiagnosticVersion="5.106.0"
                 else if data["event"] as? String=="continuation_stage" {recordChatCheckContinuationStage(data)}
                 else if data["event"] as? String=="continuation_response_pipeline" {recordChatCheckContinuationResponse(data)}
                 else if data["event"] as? String=="first_pass_identity_provenance" {recordChatCheckIdentityProvenance(data)}
+                else if data["event"] as? String=="history_response_parse_diagnostic" {recordChatCheckHistoryResponseParsing(data)}
                 return
             }
             if message.name=="activity",let data=message.body as? [String:Any] {
@@ -4691,10 +5265,29 @@ let pinnedDiagnosticVersion="5.106.0"
     }
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         if webView===web,let active=chatCheckNavigation,navigation===active,
-           let expected=chatCheckExpectedConversationID,conversationID(in:webView.url)==expected {
-            navigationFinished=true
-            if var telemetry=chatCheckTelemetry {telemetry.routeReached=true;chatCheckTelemetry=telemetry}
-            recordChatCheckStage("route_reached")
+           let expected=chatCheckExpectedConversationID,
+           let generation=chatCheckTelemetry?.operationGeneration {
+            let observedURL=webView.url
+            recordPersistedChatCheckTrace(stage:.navigationFinished,result:.success,reason:.navigationFinished,
+                                          generation:generation,url:observedURL)
+            let routeMatches=conversationID(in:webView.url)==expected
+            recordPersistedChatCheckTrace(stage:.conversationRouteObserved,result:routeMatches ? .success:.failure,
+                                          reason:routeMatches ? .expectedRoute:(sanitizedChatCheckRoute(observedURL).template=="home" ? .unexpectedRoute:.conversationRouteNotObserved),
+                                          generation:generation,url:observedURL)
+            webView.evaluateJavaScript("document.readyState") { [weak self] value,error in
+                DispatchQueue.main.async {
+                    guard let self else{return}
+                    let ready=error==nil && (value as? String)=="complete"
+                    self.recordPersistedChatCheckTrace(stage:.documentReady,result:ready ? .success:.failure,
+                        reason:error != nil ? .documentEvaluationFailed:(ready ? .documentComplete:.documentNotReady),
+                        generation:generation,url:observedURL)
+                }
+            }
+            if routeMatches {
+                navigationFinished=true
+                if var telemetry=chatCheckTelemetry {telemetry.routeReached=true;chatCheckTelemetry=telemetry}
+                recordChatCheckStage("route_reached")
+            }
         }
         if webView===web {recordRootTriggerDelegate("finished",navigation:navigation)}
         if webView===web,let active=cyclePinnedNavigation,navigation===active {cyclePinnedNavigationFinished=true}
@@ -4720,8 +5313,14 @@ let pinnedDiagnosticVersion="5.106.0"
         recordPinnedActivityNavigationStage("navigation_committed",token:token)
     }
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        if webView===web {recordRenderReadinessNavigationFailure(error)}
         if webView===web {recordRootTriggerDelegate("provisional_failed",navigation:navigation,failed:true)}
-        if webView===web,let active=chatCheckNavigation,navigation===active {recordChatCheckStage("navigation_provisional_failed")}
+        if webView===web,let active=chatCheckNavigation,navigation===active {
+            if let generation=chatCheckTelemetry?.operationGeneration {
+                recordPersistedChatCheckTrace(stage:.navigationFinished,result:.failure,reason:.navigationFailed,generation:generation)
+            }
+            recordChatCheckStage("navigation_provisional_failed")
+        }
         if let (token,id,ordinal)=isCurrentPinnedNavigation(navigation,webView:webView) {
             pinnedActivityNavigationError=navigationErrorSummary(error)
             recordPinnedActivityNavigationStage("navigation_provisional_failed",token:token)
@@ -4731,8 +5330,14 @@ let pinnedDiagnosticVersion="5.106.0"
         output.stringValue = "Navigation failed (code \((error as NSError).code)); session/capture unconfirmed."
     }
     func webView(_ webView:WKWebView,didFail navigation:WKNavigation!,withError error:Error) {
+        if webView===web {recordRenderReadinessNavigationFailure(error)}
         if webView===web {recordRootTriggerDelegate("failed",navigation:navigation,failed:true)}
-        if webView===web,let active=chatCheckNavigation,navigation===active {recordChatCheckStage("navigation_failed")}
+        if webView===web,let active=chatCheckNavigation,navigation===active {
+            if let generation=chatCheckTelemetry?.operationGeneration {
+                recordPersistedChatCheckTrace(stage:.navigationFinished,result:.failure,reason:.navigationFailed,generation:generation)
+            }
+            recordChatCheckStage("navigation_failed")
+        }
         if let (token,id,ordinal)=isCurrentPinnedNavigation(navigation,webView:webView) {
             pinnedActivityNavigationError=navigationErrorSummary(error)
             recordPinnedActivityNavigationStage("navigation_failed",token:token)

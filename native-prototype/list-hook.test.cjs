@@ -106,6 +106,39 @@ test('PerformanceResourceTiming finds list resources outside the wrapped fetch/X
  assert.equal(JSON.stringify(c.diagnostics).includes('private'),false);
 });
 
+test('recent-chat traffic diagnostic returns bounded normalized endpoint and response shape without user data',async()=>{
+ const body={items:[{id:'PRIVATE_CHAT_ID',title:'PRIVATE_CHAT_TITLE',snippet:'PRIVATE_MESSAGE'}],cursor:'PRIVATE_CURSOR',private_field:'PRIVATE_VALUE'};
+ const c=makeContext(async()=>({status:200,clone:()=>({json:async()=>body})}));
+ c.window.gptBeginStarredNetworkWindow();
+ await c.window.fetch('/backend-api/sidebar/list/PRIVATE_ENDPOINT?token=PRIVATE_TOKEN');await new Promise(setImmediate);
+ c.window.gptRecentListTrafficCaptureArmed=true;
+ const result=c.window.gptEndRecentListTrafficCapture();
+ assert.ok(result.length<=50);assert.equal(result.at(-1).event,'shape');
+ assert.equal(result.at(-1).pathname,'/backend-api/sidebar/list/:id');
+ assert.equal(result.at(-1).transport,'fetch');assert.equal(result.at(-1).status,200);
+ assert.deepEqual(Array.from(result.at(-1).topLevelKeys),['items','cursor','private_field']);
+ assert.deepEqual(JSON.parse(JSON.stringify(result.at(-1).arrayCounts)),[{key:'items',count:1}]);
+ assert.equal(result.at(-1).recognized,false);assert.equal(result.at(-1).parserRejectionReason,'endpoint_not_registered');
+ const serialized=JSON.stringify(result);
+ for(const secret of ['PRIVATE_CHAT_ID','PRIVATE_CHAT_TITLE','PRIVATE_MESSAGE','PRIVATE_CURSOR','PRIVATE_TOKEN','PRIVATE_ENDPOINT','PRIVATE_VALUE','?token'])assert.equal(serialized.includes(secret),false,`traffic diagnostic leaked ${secret}`);
+});
+
+test('recent-chat traffic parser diagnostic reports accepted and rejected list shapes without response values',async()=>{
+ const responses=[
+  {status:200,clone:()=>({json:async()=>({items:[{id:'PRIVATE_ID',title:'PRIVATE_TITLE',update_time:'2026-10-30T00:00:00Z'}],offset:0})})},
+  {status:200,clone:()=>({json:async()=>({items:{private:'value'},cursor:'PRIVATE_CURSOR'})})}
+ ];
+ const c=makeContext(async()=>responses.shift());c.window.gptBeginStarredNetworkWindow();
+ await c.window.fetch('/backend-api/conversations?cursor=PRIVATE_QUERY');
+ await c.window.fetch('/backend-api/conversations?cursor=PRIVATE_QUERY_2');await new Promise(setImmediate);
+ c.window.gptRecentListTrafficCaptureArmed=true;const result=c.window.gptEndRecentListTrafficCapture();
+ const shapes=result.filter(item=>item.event==='shape');assert.equal(shapes.length,2);
+ assert.equal(shapes[0].recognized,true);assert.equal(shapes[0].parserRejectionReason,'none');
+ assert.equal(shapes[1].recognized,false);assert.equal(shapes[1].parserRejectionReason,'items_not_array');
+ assert.deepEqual(JSON.parse(JSON.stringify(shapes[0].arrayCounts)),[{key:'items',count:1}]);
+ for(const secret of ['PRIVATE_ID','PRIVATE_TITLE','PRIVATE_QUERY','PRIVATE_QUERY_2','PRIVATE_CURSOR','value'])assert.equal(JSON.stringify(result).includes(secret),false);
+});
+
 test('root discovery health snapshot is sanitized and detects the active generation and wrappers',()=>{
  const c=makeContext(async()=>{throw Error('unused');},null,[],{token:'cycle-token-private',secret:'ephemeral-secret'});
  c.context.document.querySelectorAll=selector=>selector==='a[href]'?[{href:'https://chatgpt.com/c/private-conversation-id'}]

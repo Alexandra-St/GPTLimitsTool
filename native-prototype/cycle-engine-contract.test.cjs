@@ -62,7 +62,7 @@ test('v5.84 diagnostic readiness grants one progress-gated stabilization grace u
  assert.match(phase,/sidebarScrollReadinessAcceptance\(now:now\)\.accepted/);assert.match(phase,/now>=sidebarScrollReadinessCurrentDeadline/);
  const finish=section(source,'func finishSidebarScrollReadiness(','@objc func diagnoseVisiblePinnedRows(');
  for(const field of ['phaseABudgetMs','stabilizationGraceMs','absoluteReadinessCapMs','firstPositiveTimestampMs','lastSemanticChangeTimestampMs','extensionActivated','stableSnapshotAccepted'])assert.ok(finish.includes(field),`missing ${field}`);
- assert.match(source,/let pinnedDiagnosticVersion="5.106.0"/);
+ assert.match(source,/let pinnedDiagnosticVersion="6.1.0"/);
 });
 
 test('root discovery provenance allows only one bounded home retry and sanitized hook state',()=>{
@@ -206,7 +206,7 @@ test('v5.13 isolated probe launch is visible, single-owner, and acknowledged bef
  const ack=section(main,'func armPinnedActivityBridgeAckDeadline','func startPinnedActivityProbe');
  const start=section(main,'func startPinnedActivityProbe','func pinnedActivityStatusText');
  const bridge=fs.readFileSync(path.join(__dirname,'automation-bridge.js'),'utf8');
-assert.match(main,/let pinnedDiagnosticVersion="5.106.0"/);
+assert.match(main,/let pinnedDiagnosticVersion="6.1.0"/);
  assert.ok(action.indexOf('pinnedActivityLaunchStage="action_received"')<action.indexOf('continuePinnedActivityLaunch()'));
  assert.ok(action.indexOf('setLastIsolatedDiagnostic("Last isolated diagnostic: State: starting\\nStage: action_received')>=0);
  assert.match(action,/pinnedActivityDiagnosticToken != nil \|\| pinnedActivityLaunchPending/);
@@ -224,7 +224,7 @@ assert.match(main,/let pinnedDiagnosticVersion="5.106.0"/);
 });
 
 test('v5.17 activity fallback uses in-memory ownership and sends native navigation without preparation evaluation',()=>{
-assert.match(main,/let pinnedDiagnosticVersion="5.106.0"/);
+assert.match(main,/let pinnedDiagnosticVersion="6.1.0"/);
  const resolve=section(main,'func resolveNextPinnedActivity(token:String)','func handlePinnedActivityProbe(');
  const navigation=section(main,'func beginPinnedActivityNavigation','func isCurrentPinnedNavigation(');
  const scheduler=section(main,'func schedulePinnedActivityResolver(token:String)','@MainActor func resolveNextPinnedActivity(');
@@ -263,7 +263,7 @@ assert.match(main,/let pinnedDiagnosticVersion="5.106.0"/);
 });
 
 test('v5.86 isolated pinned activity holds an ownership-based lease through resolution and cleans up only at terminal completion',()=>{
- assert.match(main,/let pinnedDiagnosticVersion="5.106.0"/);
+ assert.match(main,/let pinnedDiagnosticVersion="6.1.0"/);
  const lease=section(main,'func recordPinnedActivityLeaseStage','@MainActor func beginPinnedSidebarNavigation');
  assert.match(lease,/backgroundRenderLease\?\.owner==token/);
  assert.match(lease,/backgroundRenderLeaseGate\.owner==token/);
@@ -288,8 +288,8 @@ test('v5.86 isolated pinned activity holds an ownership-based lease through reso
 });
 
 test('v5.19 uses inline WKWebView snapshots after load without a fire-and-forget observer',()=>{
-assert.match(main,/let pinnedDiagnosticVersion="5.106.0"/);
-assert.match(main,/guard pinnedDiagnosticVersion=="5.106.0", runtimeSource != "unexpected"/);
+assert.match(main,/let pinnedDiagnosticVersion="6.1.0"/);
+assert.match(main,/guard pinnedDiagnosticVersion=="6.1.0", runtimeSource != "unexpected"/);
  const begin=section(main,'@MainActor func beginPinnedActivityNavigation','func isCurrentPinnedNavigation');
  assert.match(begin,/safeNavigationRouteTemplate\(resolvedWebView\.url\)/);
  assert.match(begin,/pinnedActivityTargetDiffersFromCurrent=/);
@@ -314,7 +314,7 @@ assert.match(main,/guard pinnedDiagnosticVersion=="5.106.0", runtimeSource != "u
 });
 
 test('v5.14 readiness preserves signature telemetry and timestamp dispatch has explicit terminal gates in v5.16',()=>{
-assert.match(main,/let pinnedDiagnosticVersion="5.106.0"/);
+assert.match(main,/let pinnedDiagnosticVersion="6.1.0"/);
  const bridge=fs.readFileSync(path.join(__dirname,'automation-bridge.js'),'utf8');
  const readiness=section(bridge,'const waitForConversationRowsReady=','window.gptWaitForConversationRowsReady=');
  assert.match(readiness,/exactConversationRouteFromAnchor\(anchor\)/);
@@ -382,7 +382,7 @@ test('production and isolated prefix paths share snapshot-aware row capacity and
  assert.match(engineSource,/window\.gptInspectVisiblePinnedRows\(\{maxRows:20/);
  assert.match(engineSource,/Traversal capacity: snapshot rows .*required rows .*selected budget .*absolute cap .*budget sufficient .*processed rows/);
  assert.match(bridge,/snapshot_exceeds_traversal_cap/);
- assert.match(main,/let pinnedDiagnosticVersion="5.106.0"/);
+ assert.match(main,/let pinnedDiagnosticVersion="6.1.0"/);
 });
 
 test('successful pinned-prefix result separates completion reason from failure',()=>{
@@ -413,6 +413,24 @@ test('complete base triggers one pinned prefix pass, never a required starred en
  assert.match(start,/discoverPinnedPrefix\(renderLeaseOwner:renderLeaseOwner\)/);assert.match(start,/starredProofState\.finishFallback\(proof\)[\s\S]*starredProofState:starredProofState/);
  assert.match(start,/discoveryRateLimited/);assert.match(engine,/cyclePinnedReport/);
  assert.match(model,/30 \* 60/);
+});
+test('visible Octane DOM fallback feeds ordinary chat checks but remains incomplete and cannot replace network discovery',()=>{
+ const start=section(engine,'func startCycle(trigger:String)','func checkRecord(');
+ const fallback=section(engine,'func collectVisibleSidebarDOMFallbackIfNeeded()','func rootSidebarMetadataLine()');
+ assert.match(start,/if await collectVisibleSidebarDOMFallbackIfNeeded\(\) \{\s*stallDetail="dom_fallback_visible_sidebar_rows_only"/);
+ assert.match(fallback,/cycleValidListResponses==0/);assert.match(fallback,/!cycleRootResponseReceived/);assert.match(fallback,/!discoveryRateLimited/);
+ assert.match(fallback,/backgroundRenderLeaseReadiness\["ready"\] as\? Bool == true/);
+ assert.match(fallback,/firstPositiveCount/);assert.match(fallback,/finalStableCount/);assert.match(fallback,/sidebarRegionFound/);
+ assert.match(fallback,/gptCollectVisibleSidebarDOMFallback/);assert.match(fallback,/cycleDiscoverySource="dom_fallback"/);
+ assert.doesNotMatch(fallback,/cycleState\.records\[id\]\s*=/,'fallback IDs are not persisted as placeholder records before checking');
+ assert.match(start,/cycleState\.records\[id\] \?\? ChatRecord\(conversationId:id,title:"Chat",lastSeenUpdatedAt:0/,'existing records and lower bounds are retained; new temporary candidates are check-only');
+ assert.match(fallback,/dom_fallback_visible_sidebar_rows_only/);
+ assert.match(start,/let checkCandidates=Array\(checkCandidatesByID\.values\)[\s\S]*cycleState\.queue\(checkCandidates\)/);
+ assert.match(start,/self\.checkRecord\(record,budget:checkBudget\)/,'fallback IDs use the ordinary per-chat check path');
+ assert.match(start,/if !cycleRootResponseReceived\s*\{\s*composite\.status = \.incompleteStall;\s*composite\.detail=stallDetail/);
+ assert.match(start,/baseDiscoveryComplete,!explicitStarredObserved/,'pinned-prefix proof remains limited to complete network base discovery');
+ assert.match(start,/let baseDiscoveryProven=baseDiscoveryComplete && cycleRootResponseReceived/);
+ assert.match(start,/cycleDiscoverySource="network";cycleDOMCandidateCount=0/);
 });
 test('automatic Complete is gated by current-cycle pinned activity and reports decision provenance',()=>{
  const start=section(engine,'func startCycle(trigger:String)','func checkRecord(');
@@ -460,7 +478,7 @@ test('old pinned metadata resolution never configures full history; only recent 
  const loader=section(engine,'func loadPinnedActivity','func checkRecord(');
  assert.doesNotMatch(loader,/gptConfigureCheck|gptScrollHistory/);
  assert.match(engine,/lastSeenUpdatedAt>=cycleCutoffTimestamp/);
- assert.match(engine,/let queue=cycleState.queue\(recent\)/);
+ assert.match(engine,/let checkCandidates=Array\(checkCandidatesByID\.values\)[\s\S]*let queue=cycleState\.queue\(checkCandidates\)/);
  assert.match(main,/cycleRootStatuses.insert\(429\)/);
 });
 
@@ -494,12 +512,63 @@ test('production per-chat timeouts preserve sanitized stage and operation eviden
  assert.match(start,/clearChatCheckState\(ownerGeneration:chatCheckTelemetry\?\.operationGeneration \?\? "",caller:"timeout handler"\)/);
  assert.match(record,/defer \{_=clearChatCheckState/);
  assert.match(record,/navigationObjectReturned=true/);
- assert.match(record,/Failed · no_progress/);
+ assert.match(model,/terminal:"Failed · no_progress/);
+ assert.match(record,/noProgressTerminalDecision/);
  assert.match(start,/cycleFreshRiskCounts\["Unknown",default:0\] \+= 1/);
  assert.match(model,/var timeoutSubtype/);
  assert.match(model,/stageBeforeFinish \?\? stage/);
  assert.match(model,/hookHealthRecorded \? [\s\S]*: "unobserved"/);
  assert.doesNotMatch(activityHook,/messageText|responseBody|rawURL/);
+});
+
+test('no-progress terminal uses accepted page evidence without requiring a live automation update',()=>{
+ const record=section(engine,'func checkRecord(','\n}');
+ const parser=section(engine,'func recordChatCheckHistoryResponseParsing(',' func cycleProvenanceSummary(');
+ const nativePage=section(engine,'func recordChatCheckPage(',' func recordChatCheckActivity(');
+ assert.match(model,/func isHistoryProgressProven\(acceptedPages:Int,pageUpdateCallbacks:Int,producedMessages:Int,paginationProgressObserved:Bool\)->Bool/);
+ assert.match(model,/struct ChatCheckProgressAccumulator/);
+ assert.match(model,/func noProgressTerminalDecision\(existing:SafeAggregate\?,candidate:SafeAggregate\?,hasProvenHistoryProgress:Bool,hasPreviousPage:Bool\?,completionProven:Bool,subtype:String\)/);
+ assert.match(record,/let matchingUpdate=automationUpdate\.flatMap/);
+ assert.match(record,/let progressState=telemetry\?\.checkProgress \?\? ChatCheckProgressAccumulator\(\)/);
+ assert.match(record,/hasProvenHistoryProgress:progressState\.hasProvenHistoryProgress[\s\S]*completionProven:progressState\.historyCompleteProven/);
+ assert.match(record,/hasPreviousPage:progressState\.hasPreviousPage/);
+ assert.doesNotMatch(record,/hasPreviousPage:matchingUpdate\?\.state\.hasPreviousPage \?\? progressState\.hasPreviousPage/);
+ assert.match(parser,/telemetry\.checkProgress\.observeParsedResponse\(entry\)/);
+ assert.match(parser,/chatCheckTelemetry=telemetry[\s\S]*cycleState\.observePerChatHistoryDiagnostic\(telemetry\)/);
+ assert.match(nativePage,/telemetry\.checkProgress\.observeNativePage\(/);
+ assert.match(model,/mutating func observe\(telemetry:ChatCheckStageTelemetry\)[\s\S]*parserAccepted=telemetry\.checkProgress\.parserAccepted[\s\S]*pagesProduced=telemetry\.checkProgress\.pagesProduced/);
+ assert.match(record,/noProgressTerminalDecision\(existing:record\.aggregate,candidate:matchingUpdate\?\.state[\s\S]*if decision\.terminal\.hasPrefix\("Partial"\) \{return\(decision\.aggregate,decision\.terminal\)\}/);
+ assert.match(record,/if update\.state\.historyComplete \{[\s\S]*record\.aggregate\?\.historyComplete != true \|\| update\.overlap \|\| update\.oldest/);
+ assert.doesNotMatch(model,/func hasProvenHistoryProgress\([^}]*historyResponses/);
+ assert.match(model,/usableCandidate\.messagesCollected>=existing\.messagesCollected && usableCandidate\.estimatedTextTokens>=existing\.estimatedTextTokens/);
+});
+
+test('continuation carries canonical parser progress and rejected generations are recorded safely',()=>{
+ const record=section(engine,'func checkRecord(','\n}');
+ const parser=section(engine,'func recordChatCheckHistoryResponseParsing(',' func cycleProvenanceSummary(');
+ assert.match(engine,/historyProgress:firstTelemetry\.checkProgress/);
+ assert.match(record,/telemetry\.checkProgress=continuation\.historyProgress/);
+ assert.match(record,/telemetry\.hasPreviousPage=continuation\.historyProgress\.hasPreviousPage \?\? continuation\.aggregate\.hasPreviousPage/);
+ assert.match(parser,/historyProgressEventRejectionReason\(eventGeneration:eventGeneration,activeGeneration:automationToken,telemetryGeneration:telemetryGeneration\)/);
+ assert.match(parser,/recordHistoryProgressEventRejection\(rejection\)/);
+ assert.match(model,/func historyProgressEventRejectionReason\(/);
+ assert.match(model,/struct HistoryProgressEventRejectionState:Codable,Equatable/);
+ assert.match(main,/History parser event rejections:/);
+});
+
+test('current DOM turn evidence is sampled in the standard check and distinguishes rendered history from missing network history',()=>{
+ const bridge=fs.readFileSync(path.join(__dirname,'automation-bridge.js'),'utf8');
+ const detector=section(bridge,'window.gptConversationTurnReadiness=',' let liveResumeRun=null;');
+ const record=section(engine,'func checkRecord(','\n}');
+ const evidence=section(engine,'func recordChatCheckDOMTurnEvidence(',' func recordChatCheckContinuationResponse(');
+ assert.match(detector,/\[data-turn-key\]/);assert.match(detector,/GptHistoryCollector\.findScrollableContainers/);
+ assert.match(detector,/outermostCandidates/);assert.match(detector,/data-user-message-bubble/);assert.match(detector,/data-chatgpt-agent-turn-start/);
+ assert.match(detector,/let source='legacy'/);assert.doesNotMatch(detector,/textContent|innerText|data-turn-key.*getAttribute/);
+ assert.match(record,/window\.gptConversationTurnReadiness\?\.\(\)/);assert.match(record,/recordChatCheckDOMTurnEvidence/);
+ assert.match(evidence,/renderedDOMTurnCount/);assert.doesNotMatch(evidence,/historyResponses\s*=|historyComplete\s*=|processedMessageIds/);
+ assert.match(record,/renderedDOMTurnCount \?\? 0\)>0,chatCheckTelemetry\?\.historyResponses==0[\s\S]*Partial · rendered_history_without_network/);
+ assert.match(model,/rendered_dom_history_without_network/);
+ assert.match(model,/renderedDOMTurnCount/);
 });
 
 test('v5.42 per-chat ownership fences stale cleanup and reports each pagination page without identifiers',()=>{
@@ -615,7 +684,8 @@ test('v5.104 budget decisions are explicit, pure, and preserve existing bounded 
  assert.match(start,/var continuationUsed=false/);
  assert.match(start,/cycleBudgetSkipped/);
  assert.match(start,/if workerStopped && remainingBudget>0 \{[\s\S]*checkBudget\.beginContinuation/);
- assert.match(record,/Partial · no_progress/);
+ assert.match(model,/terminal:"Partial · no_progress/);
+ assert.match(record,/noProgressTerminalDecision/);
 });
 
 test('v5.1 isolated prefix reuses its pinned IDs for bounded activity resolution',()=>{
@@ -632,7 +702,7 @@ test('v5.1 isolated prefix reuses its pinned IDs for bounded activity resolution
  assert.doesNotMatch(diagnostic,/gptConfigureCheck|gptScrollHistory|fetch\(/);
  assert.match(main,/pinnedActivityExpectedConversationID/);assert.match(main,/pinnedActivityItemTimeoutTask/);assert.ok(diagnostic.includes('Recent:'));
  assert.match(main,/button\("Inspect pinned prefix \+ activity",\s*#selector\(diagnosePinnedActivityTimestamp\)\)/);
-assert.match(main,/let pinnedDiagnosticVersion="5.106.0"/);
+assert.match(main,/let pinnedDiagnosticVersion="6.1.0"/);
  assert.match(bridge,/PINNED_DIAGNOSTIC_VERSION='__PINNED_DIAGNOSTIC_VERSION__'/);
  assert.match(main,/replacingOccurrences\(of:"__PINNED_DIAGNOSTIC_VERSION__",with:pinnedDiagnosticVersion\)/);
  assert.match(main,/Bundle\.main\.executableURL\?\.standardizedFileURL\.path/);
@@ -643,7 +713,7 @@ assert.match(main,/let pinnedDiagnosticVersion="5.106.0"/);
  assert.match(main,/gptLimitsExecutableBuildIDMarker/);
  assert.match(main,/ProcessInfo\.processInfo\.processIdentifier/);
  assert.ok(main.includes('Runtime source: \\(source)'));
-assert.match(main,/guard pinnedDiagnosticVersion=="5.106.0", runtimeSource != "unexpected"/);
+assert.match(main,/guard pinnedDiagnosticVersion=="6.1.0", runtimeSource != "unexpected"/);
  assert.match(bridge,/stageRun=async\(stage,fn,timeoutMs\)/);assert.match(bridge,/boundedDiagnosticAwait\(stage,fn,timeoutMs\)/);
  for(const stage of ['invoke_started','readiness_started','readiness_completed','top_started','top_completed','prefix_started','prefix_completed','menu_cleanup_started','menu_cleanup_completed','cleanup_started','cleanup_completed','finished'])assert.ok(bridge.includes(`'${stage}'`),`missing JS stage ${stage}`);
  assert.match(main,/handlePinnedActivityProgress/);assert.match(main,/stage_timeout:/);assert.match(main,/pinnedActivityJSPromiseStatus/);assert.match(main,/pinnedActivitySwiftCompletion/);
@@ -665,7 +735,7 @@ assert.match(main,/guard pinnedDiagnosticVersion=="5.106.0", runtimeSource != "u
 });
 
 test('v5.2 timestamp lifecycle blocks premature finish and terminalizes every item exactly once',()=>{
-assert.match(main,/let pinnedDiagnosticVersion="5.106.0"/);
+assert.match(main,/let pinnedDiagnosticVersion="6.1.0"/);
  assert.match(model,/enum PinnedTimestampState: String/);for(const state of ['not_started','resolving','resolved','partial','timeout','error','skipped'])assert.ok(model.includes(`"${state}"`));
  assert.match(model,/var isTerminal:Bool/);assert.match(model,/func pinnedTimestampAggregateState/);assert.match(model,/func pinnedTimestampItemCanTransition/);assert.match(model,/func pinnedDiagnosticCanFinish/);assert.match(model,/itemStates\.contains\("pending"\)/);
  const progress=section(main,'func handlePinnedActivityProgress','func updatePinnedActivityStage');assert.match(progress,/if stage=="finished" \{return\}/);
@@ -682,7 +752,7 @@ test('v5.6 timestamp provenance separates passive cache, navigation, and activit
  const main=fs.readFileSync(path.join(__dirname,'Main.swift'),'utf8');
  const hook=fs.readFileSync(path.join(__dirname,'activity-hook.js'),'utf8');
  const list=fs.readFileSync(path.join(__dirname,'list-hook.js'),'utf8');
-assert.match(main,/let pinnedDiagnosticVersion="5.106.0"/);
+assert.match(main,/let pinnedDiagnosticVersion="6.1.0"/);
  const resolver=section(main,'func resolveNextPinnedActivity(token:String)','func handlePinnedActivityProbe');
  assert.ok(resolver.indexOf('if validPinnedActivity(record)')<resolver.indexOf('fallback_started'));
  for(const state of ['timestamp_started','passive_lookup_started','passive_lookup_hit','passive_lookup_miss','fallback_started','fallback_navigation_started','timestamp_resolved'])assert.ok(resolver.includes(`"${state}"`),`missing provenance stage ${state}`);
@@ -704,7 +774,7 @@ test('v5.7 preserves exact pinned routes and sequences native navigation before 
  const main=fs.readFileSync(path.join(__dirname,'Main.swift'),'utf8');
  const bridge=fs.readFileSync(path.join(__dirname,'automation-bridge.js'),'utf8');
  const engine=fs.readFileSync(path.join(__dirname,'CycleEngine.swift'),'utf8');
-assert.match(main,/let pinnedDiagnosticVersion="5.106.0"/);
+assert.match(main,/let pinnedDiagnosticVersion="6.1.0"/);
  assert.match(bridge,/exactConversationRouteFromAnchor/);
  assert.match(bridge,/frontendRoute:pinnedRoutes\.get\(conversationId\)\|\|null/);
  const resolver=section(main,'func resolveNextPinnedActivity(token:String)','func handlePinnedActivityProbe');
@@ -733,7 +803,7 @@ assert.match(main,/let pinnedDiagnosticVersion="5.106.0"/);
 
 test('v5.4 hidden render experiment is non-key, bounded, read-only, and restores captured window state',()=>{
  const main=fs.readFileSync(path.join(__dirname,'Main.swift'),'utf8');
-assert.match(main,/let pinnedDiagnosticVersion="5.106.0"/);
+assert.match(main,/let pinnedDiagnosticVersion="6.1.0"/);
  const action=section(main,'@objc func inspectHiddenWebViewRendering()','func finishHiddenRenderDiagnostic(');
  assert.match(action,/let original=renderControlState\(\)/);
  assert.match(action,/window\.gptRenderStateSnapshot/);assert.match(action,/gptInspectRenderDOM/);assert.match(action,/renderSurfaceActive:false/);assert.match(action,/timeoutMs:5000/);assert.match(action,/Task\.sleep\(nanoseconds:8_000_000_000\)/);
@@ -748,7 +818,7 @@ assert.match(main,/let pinnedDiagnosticVersion="5.106.0"/);
 });
 
 test('v5.5 background render lease is exclusive, bounded, used for sidebar paths, and restored before chat checks',()=>{
-assert.match(main,/let pinnedDiagnosticVersion="5.106.0"/);
+assert.match(main,/let pinnedDiagnosticVersion="6.1.0"/);
  assert.match(main,/BackgroundRenderLeaseGate/);
  assert.match(main,/session\.ignoresMouseEvents=true/);
  assert.doesNotMatch(main,/orderFrontRegardless/);
@@ -768,7 +838,7 @@ assert.match(main,/let pinnedDiagnosticVersion="5.106.0"/);
  const cycle=section(engine,'func startCycle(trigger:String)','func discoverPinnedPrefix(');
  assert.match(cycle,/acquireBackgroundRenderSurface\(owner:renderLeaseOwner\)/);
  assert.match(cycle,/restoreBackgroundRenderSurface\(owner:renderLeaseOwner\)/);
- assert.ok(cycle.indexOf('restoreBackgroundRenderSurface(owner:renderLeaseOwner)') < cycle.indexOf('let queue=cycleState.queue(recent)'));
+ assert.ok(cycle.indexOf('restoreBackgroundRenderSurface(owner:renderLeaseOwner)') < cycle.indexOf('let checkCandidates=Array(checkCandidatesByID.values)'));
  const diagnostic=section(main,'@objc func diagnosePinnedActivityTimestamp()','func startPinnedActivityProbe(');
  assert.match(diagnostic,/acquireBackgroundRenderSurfaceForPinnedDiagnostic\(owner:token\)/);
  const diagnosticLease=section(main,'func acquireBackgroundRenderSurfaceForPinnedDiagnostic','func acquireBackgroundRenderSurface(owner:String,waitForConversationLinks:Bool)');
@@ -804,7 +874,7 @@ test('v5.82 readiness telemetry and terminal verdict share one acceptance predic
  assert.match(finish,/let acceptance=sidebarScrollReadinessAcceptance\(now:DispatchTime\.now\(\)\.uptimeNanoseconds\)/);
  assert.match(finish,/acceptance\.accepted \? "snapshot_ready"/);assert.match(finish,/"stableSnapshotAccepted":acceptance\.accepted/);
  assert.match(finish,/"stableCountCondition":acceptance\.countCondition/);assert.match(finish,/"stableDurationCondition":acceptance\.durationCondition/);
- assert.match(main,/let pinnedDiagnosticVersion="5.106.0"/);
+ assert.match(main,/let pinnedDiagnosticVersion="6.1.0"/);
 });
 
 test('v5.34 automatic and isolated prefix share readiness and top proof while retaining the production render lease',()=>{
@@ -874,7 +944,7 @@ test('isolated pinned-group diagnostic targets the shared ChatGPT WebView and re
 test('first-row pin diagnostic uses one semantic menu button without native hover',()=>{
  assert.match(main,/button\("Inspect sidebar route templates",\s*#selector\(diagnoseSidebarRoutes\)\)/);
  for(const label of ['Inspect sidebar top position','Inspect pinned rows at sidebar top','Inspect hidden WebView rendering','Inspect pinned prefix + activity']) assert.ok(main.includes(`button("${label}"`),`missing diagnostics action ${label}`);
-assert.match(main,/let pinnedDiagnosticVersion="5.106.0"/);
+assert.match(main,/let pinnedDiagnosticVersion="6.1.0"/);
  assert.match(main,/var latestIsolatedDiagnosticText="Last isolated diagnostic: not run"/);
  assert.match(main,/func setLastIsolatedDiagnostic\(_ message:String\)/);
  const menuResult=section(main,'if let result=payload["firstRowMenuResult"]','if let progress=payload["topChatPinProgress"]');
@@ -882,7 +952,7 @@ assert.match(main,/let pinnedDiagnosticVersion="5.106.0"/);
  assert.match(menuResult,/pinActionPresent/);assert.match(menuResult,/unpinActionPresent/);assert.match(menuResult,/menuLeftOpen/);
  const routeDiagnostic=fs.readFileSync(path.join(__dirname,'automation-bridge.js'),'utf8');
  assert.match(routeDiagnostic,/window\.gptInspectSidebarRoutes=\(\)=>/);
- assert.match(routeDiagnostic,/acceptedTemplates:\['\/c\/<id>','\/g\/<id>\/c\/<id>','\/g\/<id> \(project\)'\]/);
+ assert.match(routeDiagnostic,/acceptedTemplates:\['\/c\/<id>','\/g\/<id>\/c\/<id>','\/g\/<id> \(project\)','\/<id> \(Octane sidebar item\)','\/<id>\/<id> \(Octane sidebar item\)'\]/);
  assert.match(routeDiagnostic,/safeRouteTemplate/);
  assert.match(routeDiagnostic,/PINNED_DIAGNOSTIC_VERSION='__PINNED_DIAGNOSTIC_VERSION__'/);
  const action=section(main,'@objc func diagnoseFirstRowMenuTrigger()','    func finishPinDiagnostic(');
@@ -920,7 +990,7 @@ test('v4.5 readiness and pinned-prefix share bounded row wait and top proof, pre
 
 test('v5.22 awaits an exactly-once bounded activity wait and preserves child timeout reason',()=>{
  const main=fs.readFileSync(path.join(__dirname,'Main.swift'),'utf8');
-assert.match(main,/let pinnedDiagnosticVersion="5.106.0"/);
+assert.match(main,/let pinnedDiagnosticVersion="6.1.0"/);
  const begin=section(main,'@MainActor func beginPinnedActivityNavigation','func isCurrentPinnedNavigation');
  assert.ok(begin.indexOf('pinnedActivityWaiterArmed=true')<begin.indexOf('resolvedWebView.load('));
  assert.ok(begin.indexOf('pinnedActivityWaiterToken=token')<begin.indexOf('resolvedWebView.load('));
@@ -949,11 +1019,11 @@ assert.match(main,/let pinnedDiagnosticVersion="5.106.0"/);
  assert.match(finish,/Navigation\/menu cleanup:/);assert.match(finish,/Render lease cleanup:/);assert.match(finish,/Overall cleanup:/);assert.match(finish,/backgroundRenderLeaseRestoreDetails/);
  const restore=section(main,'func restoreBackgroundRenderSurface(owner:String)->Bool','func withBackgroundRenderSurface');
  for(const field of ['frameRestored','orderingRestored','ignoresMouseEventsRestored','ownershipReleased'])assert.ok(restore.includes(field),`missing restore substep ${field}`);
-assert.match(main,/guard pinnedDiagnosticVersion=="5.106.0", runtimeSource != "unexpected"/);
+assert.match(main,/guard pinnedDiagnosticVersion=="6.1.0", runtimeSource != "unexpected"/);
 });
 
 test('v5.23 passively observes sanitized responses while native operation filtering remains isolated',()=>{
-assert.match(main,/let pinnedDiagnosticVersion="5.106.0"/);
+assert.match(main,/let pinnedDiagnosticVersion="6.1.0"/);
  assert.match(main,/config\.userContentController\.add\(self, name: "backendTraffic"\)/);
  const hook=fs.readFileSync(path.join(__dirname,'activity-hook.js'),'utf8');
  assert.match(hook,/window\.gptObserveBackendResponse=/);
@@ -985,7 +1055,7 @@ test('v5.32 uses anchor.click and a bounded native route observer',()=>{
  const routeWait=section(main,'@MainActor func beginPinnedSidebarRouteWait','@MainActor func finishPinnedSidebarNavigation');
  const routePoll=section(main,'@MainActor func pollPinnedSidebarRoute','@MainActor func beginPinnedSidebarRouteWait');
  const sidebarDispatch=section(main,'@MainActor func beginPinnedSidebarNavigation','@MainActor func finishPinnedSidebarNavigation');
-assert.match(main,/let pinnedDiagnosticVersion="5.106.0"/);
+assert.match(main,/let pinnedDiagnosticVersion="6.1.0"/);
  assert.match(main,/name: "sidebarNavigation"/);
  assert.match(main,/message\.name=="sidebarNavigation"/);
  assert.match(resolver,/record\["frontendRoute"\]/);assert.match(resolver,/beginPinnedSidebarNavigation\(id:id,route:exactRoute/);
@@ -1072,22 +1142,27 @@ test('native risk UI uses a local beta fallback and only sanitized transition no
  assert.match(engine,/latest Complete checked chat/);
  assert.match(engine,/empirically labeled Limit reached/);
  assert.match(main,/Use latest complete chat as Normal sample/);
-assert.match(main,/pinnedDiagnosticVersion="5.106.0"/);
+assert.match(main,/pinnedDiagnosticVersion="6.1.0"/);
 });
 
 test('missed-warning recovery retains partial progress and separates accepted dispatch from observation',()=>{
  assert.match(model,/func riskNotificationNeeded\(previousObservedRank:Int\?,lastAcceptedRank:Int\?,next:RiskAssessment\)/);
+ assert.match(model,/func incompleteRiskNotificationNeeded\(measurement:RiskMeasurementStatus,lastAcceptedRank:Int\?,lowerBoundTokens:Int\?,model:RiskModel\)->String\?/);
+ assert.match(model,/case \.near:rank=2;case \.critical:rank=3;case \.normal,\.uncertain,\.watch:return nil/);
+ assert.match(model,/rank>lastAcceptedRank!/);
+ assert.match(model,/func partialRiskNotificationContent\(level:String\)/);
  assert.match(model,/enum RiskMonitoringState:String/);
  assert.match(model,/func monitoringState\(record:ChatRecord/);
  assert.doesNotMatch(model,/func shouldNotifyUncertain/);
  assert.match(model,/func shouldRetryRootDiscovery/);
  assert.match(model,/func retryRiskNotificationLevel/);
+ assert.match(engine,/finalMeasurement=riskMeasurementStatus\(result:saved\.lastCheckResult,aggregate:saved\.aggregate\)[\s\S]*finalMeasurement != \.complete[\s\S]*incompleteRiskNotificationNeeded\(measurement:finalMeasurement,lastAcceptedRank:saved\.lastNotifiedRiskRank,lowerBoundTokens:aggregate\.estimatedTextTokens,model:model\)[\s\S]*submitMonitoredNotification\(kind:"risk",level:level,body:content\.body,conversationID:saved\.conversationId\)/);
  assert.doesNotMatch(model,/func uncertainNotificationContent/);
  assert.match(model,/var partialObservedActivityAt:Double\?/);
  assert.match(model,/var paginationBoundaryMessageCount:Int\?/);
  assert.match(model,/replayingSavedBoundary/);
  assert.match(engine,/saved\.lastCheckResult="Partial · pagination_checkpoint"/);
- assert.match(engine,/saved\.aggregate=progress\.state/);
+ assert.match(engine,/saved\.aggregate=partialAggregate/);
  assert.match(engine,/cycleState\.monitoringDegraded = monitoringDiscoveryDegraded\(/);
  assert.match(engine,/userVisibleDelivery:"unknown"/);
  assert.match(engine,/notificationAuditStatus\(outcome:.*userVisibleDelivery/);
@@ -1099,9 +1174,57 @@ test('missed-warning recovery retains partial progress and separates accepted di
  assert.match(main,/⚠ Monitoring degraded/);
  assert.match(main,/state == \.uncertain/);
  assert.match(model,/This active chat could not be fully checked; it may be approaching its limit/);
- assert.match(main,/if counts\[\.uncertain,default:0\]>0 \{parts\.append\("Uncertain:/);
- assert.match(main,/if degraded \{parts\.append\("Monitoring degraded"\)\}/);
- assert.match(main,/statusItem\.button\?\.title=warningPresent \? "GL ⚠":"GL"/);
+ assert.match(main,/if uncertaintyCount>0 \{parts\.append\("Needs attention:/);
+ assert.match(main,/if degraded \{parts\.append\("Recent chat coverage needs attention"\)\}/);
+ assert.match(main,/statusItem\.button\?\.title=confirmedCount>0 \? "GL ⚠":"GL"/);
+});
+
+test('v6.1.1 partial-risk notifications use one post-result decision for timeout and other incomplete outcomes',()=>{
+ assert.match(model,/func incompleteRiskNotificationNeeded\(measurement:RiskMeasurementStatus,lastAcceptedRank:Int\?,lowerBoundTokens:Int\?,model:RiskModel\)->String\?/);
+ assert.match(model,/guard measurement != \.complete else\{return nil\}[\s\S]*partialRiskNotificationNeeded/);
+ assert.match(model,/case \.near:rank=2;case \.critical:rank=3;case \.normal,\.uncertain,\.watch:return nil/);
+ assert.match(engine,/case \.failure\(let error\):[\s\S]*let partialAggregate=timeoutProgressPartialAggregate[\s\S]*terminal="Partial · pagination_progressing · per_chat_timeout[\s\S]*saved\.lastCheckResult=terminal[\s\S]*terminal="Timed out · per_chat_timeout[\s\S]*saved\.lastCheckResult=terminal[\s\S]*saved\.lastCheckResult="Failed · check_error"/);
+ assert.match(engine,/let finalMeasurement=riskMeasurementStatus\(result:saved\.lastCheckResult,aggregate:saved\.aggregate\)[\s\S]*if let aggregate=saved\.aggregate,finalMeasurement != \.complete[\s\S]*incompleteRiskNotificationNeeded\(measurement:finalMeasurement,lastAcceptedRank:saved\.lastNotifiedRiskRank,lowerBoundTokens:aggregate\.estimatedTextTokens,model:model\)/);
+ assert.match(engine,/func finishNotificationAudit[\s\S]*if kind=="risk",let rank=riskRank\(level\) \{record\.lastNotifiedRiskRank=rank\}/);
+ assert.match(main,/let gptLimitsAppVersion="6\.2\.2"/);
+ assert.match(main,/let pinnedDiagnosticVersion="6\.1\.0"/);
+ assert.match(main,/guard bundleBuildVersion==gptLimitsAppVersion,[\s\S]*gptLimitsExecutableBuildVersionMarker==gptLimitsAppVersion/);
+});
+
+test('v6.2.2 persists sanitized per-chat navigation and history trace through terminal result',()=>{
+ assert.match(model,/enum ChatCheckTraceStage:String,Codable,CaseIterable\s*\{[\s\S]*?checkStarted="check_started"[\s\S]*?terminalResult="terminal_result"/);
+ assert.match(model,/struct ChatCheckTraceEvent:Codable,Equatable\s*\{[^}]*let elapsedMs:Int[^}]*let routeTemplate:String[^}]*let timestamp:Date/);
+ assert.match(model,/func sanitizedChatCheckRoute\(_ url:URL\?\)/);
+ assert.match(model,/return SanitizedChatCheckRoute\(template:"\/c\/:id",category:\.chat\)/);
+ assert.match(model,/return SanitizedChatCheckRoute\(template:"\/:id\/:id",category:\.chat\)/);
+ assert.match(engine,/cycleState\.beginChatCheckTrace\(route:sanitizedChatCheckRoute\(web\.url\)\)[\s\S]*saveCycle\(\)/);
+ assert.match(engine,/recordPersistedChatCheckTrace\(stage:\.navigationRequested/);
+ assert.match(main,/recordPersistedChatCheckTrace\(stage:\.navigationFinished[\s\S]*stage:\.conversationRouteObserved[\s\S]*stage:\.documentReady/);
+ assert.match(engine,/recordPersistedChatCheckTrace\(stage:\.historyWaitStarted/);
+ assert.match(engine,/recordPersistedChatCheckTrace\(stage:\.historyResponseObserved/);
+ assert.match(engine,/recordPersistedChatCheckTrace\(stage:\.historyRowsObserved/);
+ assert.match(engine,/finishPersistedChatCheckTrace\(terminalResult:[\s\S]*stage:\.terminalResult/);
+ assert.match(engine,/lastChatCheckTraceOutput\.stringValue=cycleState\.lastChatCheckTrace\?\.displayText/);
+ assert.match(model,/let elapsed=max\(0,min\(600000,Int\(at\.timeIntervalSince\(startedAt\)\*1000\)\)\)/);
+ assert.match(model,/enum ChatCheckTraceReason:String,Codable/);
+ const traceEvent=section(model,'struct ChatCheckTraceEvent:Codable,Equatable {','struct PersistedChatCheckTrace:Codable,Equatable');
+ assert.doesNotMatch(traceEvent,/conversationId|rawURL|title|query|cookie|token/);
+});
+
+test('pinned unknown-row diagnostics are bounded, persisted, and do not alter pinned proof classification',()=>{
+ const model=fs.readFileSync(path.join(__dirname,'CycleModel.swift'),'utf8');
+ const engine=fs.readFileSync(path.join(__dirname,'CycleEngine.swift'),'utf8');
+ const main=fs.readFileSync(path.join(__dirname,'Main.swift'),'utf8');
+ const bridge=fs.readFileSync(path.join(__dirname,'automation-bridge.js'),'utf8');
+ assert.match(bridge,/const unknownRowDiagnostics=rows\.filter\(row=>row\.status==='unknown'\)\.slice\(0,20\)/);
+ assert.match(bridge,/dataAttributeNames,ariaAttributeNames,visible,conversationRouteClassification:route,navigationRowClassification:navigationClassification,pinnedStarredClassification:'unknown'/);
+ assert.match(engine,/statuses\.contains\("unknown"\) \{proofFailureReason="unknown_row_in_stable_snapshot"\}/);
+ assert.match(engine,/result\["unknownRowDiagnostics"\][\s\S]*compactMap\(PinnedUnknownRowDiagnostic\.make\)/);
+ assert.match(engine,/cycleState\.lastPinnedUnknownRows=\[\]/);
+ assert.match(model,/var lastPinnedUnknownRows:\[PinnedUnknownRowDiagnostic\]\? = nil/);
+ assert.match(model,/static let maxRows=20/);
+ assert.ok(main.includes('Pinned proof unknown rows: \\(pinnedUnknownRows.count)'));
+ assert.match(main,/pinnedUnknownRowsRawOutput/);
 });
 
 test('v5.45 user dashboard separates diagnostics and restores interactive input after render cleanup',()=>{
@@ -1115,11 +1238,11 @@ test('v5.45 user dashboard separates diagnostics and restores interactive input 
  for(const label of ['focus snapshot captured','window ordering preserved','key\/main preserved','GPT Limits Tool activation unchanged','first responder preserved','ownership released']) assert.ok(restore.includes(label),`missing cleanup telemetry ${label}`);
  assert.match(main,/@objc func showMainWindow\(\)[\s\S]*restoreInteractiveWindowState\(\)/);
  const dashboard=section(main,'func buildUserWindows()','func runtimeSourceClassification()');
- for(const label of ['Monitoring: Off','Last check: Never','Next check: Off','Coverage: Not checked','Persistent warnings','Recent result','Check now','Open ChatGPT','Settings…','Diagnostics…']) assert.ok(dashboard.includes(label),`missing dashboard element ${label}`);
+ for(const label of ['Monitoring: Off','Last check: Never','Next check: Off','Coverage: Not checked','Confirmed conversation risks','Needs attention','Recent result','Check now','Open ChatGPT','Settings…','Diagnostics…']) assert.ok(dashboard.includes(label),`missing dashboard element ${label}`);
  assert.doesNotMatch(dashboard,/runtimeIdentityOutput|listDiagnosticOutput|cycleOutput|pinnedDiagnostic/);
  assert.match(main,/@objc func showPanel\(\)[\s\S]*?presentWindow\(panel,intent:\.userInitiated,callSite:"menu_diagnostics"\)/);
  assert.match(main,/@objc func setAutomaticChecks/);
- assert.match(main,/func refreshNotificationAuthorization\(\)/);
+ assert.match(main,/func refreshNotificationAuthorization\(completion:/);
  assert.match(model,/func userFacingRiskLabel/);
  assert.match(model,/func userFacingRiskChatTitle/);
  assert.match(model,/return \("GPT Limits Tool"/);
@@ -1128,7 +1251,7 @@ test('v5.45 user dashboard separates diagnostics and restores interactive input 
 });
 
 test('v5.45 Open ChatGPT restores a visible interactive WebView and defers across render ownership',()=>{
-assert.match(main,/let pinnedDiagnosticVersion="5.106.0"/);
+assert.match(main,/let pinnedDiagnosticVersion="6.1.0"/);
  const show=section(main,'@objc func showSession','@objc func hideSession');
  assert.match(show,/restoreVisibleSessionPresentation\(\)/);
  const restore=section(main,'func restoreVisibleSessionPresentation()','@objc func hideSession');
@@ -1161,7 +1284,7 @@ test('v5.49 manual diagnostics release terminal ownership and allow the next dia
  assert.match(main,/listDiagnosticTask\?\.isCancelled/);
  assert.match(main,/func manualDiagnosticOwnerLabel\(\)[\s\S]*reconcileStaleListDiagnosticGeneration\(\)/);
  assert.match(main,/Diagnostic running:/);
- const start=section(main,'func startListDiagnostic(visible:Bool)','func finishListDiagnostic(generation:UUID)');
+ const start=section(main,'func startListDiagnostic(visible:Bool,','func finishListDiagnostic(generation:UUID)');
  assert.match(start,/listDiagnosticGenerationGate\.tryBegin\(\)/);
  assert.match(start,/guard let self=self,self\.listDiagnosticGenerationGate\.owns\(generation\) else\{return\}/);
  assert.match(start,/finishListDiagnosticCancellation\(generation:generation\)/);
@@ -1171,7 +1294,7 @@ test('v5.49 manual diagnostics release terminal ownership and allow the next dia
 });
 
 test('v5.52 visible ChatGPT restore records sanitized paintability and invalidates only the existing WebView display',()=>{
- assert.match(main,/let pinnedDiagnosticVersion="5.106.0"/);
+ assert.match(main,/let pinnedDiagnosticVersion="6.1.0"/);
  const snapshot=section(main,'func sessionPresentationSnapshot()->String','func sessionRenderDOMSummary');
  assert.match(snapshot,/session\.isVisible/);assert.match(snapshot,/hitTest/);assert.match(snapshot,/higherWindowCoversCenter/);assert.match(snapshot,/web\.wantsLayer/);
  assert.match(main,/window\.gptSessionRenderSnapshot\?\.\(\) \|\| null/);
@@ -1255,7 +1378,7 @@ test('v5.65 background presentation never activates, orders, or focuses windows'
   const end=main.indexOf('\n    }',start);const action=main.slice(start,end);
   assert.doesNotMatch(action,/NSApp\.activate|makeKeyAndOrderFront|orderFront|orderOut/ ,`${actionName} changes presentation`);
  }
- const listDiagnostic=section(main,'func startListDiagnostic(visible:Bool)','func finishListDiagnostic(generation:UUID)');
+ const listDiagnostic=section(main,'func startListDiagnostic(visible:Bool,','func finishListDiagnostic(generation:UUID)');
  assert.doesNotMatch(listDiagnostic,/NSApp\.activate|makeKeyAndOrderFront|orderFront|orderOut/);
  const popup=section(main,'func webView\(_ webView: WKWebView, createWebViewWith','func webViewDidClose');
  assert.match(popup,/let userInitiated = NSApp\.isActive && session\.isKeyWindow && !cycleRunning && backgroundRenderLease==nil/);
@@ -1298,7 +1421,7 @@ test('v5.66 sidebar scroll inspection is a single manual read-only traversal and
  const bridge=fs.readFileSync(path.join(__dirname,'automation-bridge.js'),'utf8');
  const diagnostic=section(bridge,'window.gptDiagnoseRootSidebarScroll=async','window.gptInspectRootSidebarMetadata=');
  for(const field of ['scrollOwnerFound','clientHeight','scrollHeight','scrollTop','uniqueIdentitiesSeen','newIdentities','previousIdentitiesMissingFromDOM','virtualized','lazyLoadingObserved','boundedEndCandidate','endOfListProof:\'unavailable\'','rootUniverseComplete:false','scrollRestoreSuccessful'])assert.ok(diagnostic.includes(field),`missing sidebar traversal evidence ${field}`);
- assert.doesNotMatch(diagnostic,/title|innerText|textContent|href:|messageText/);
+ assert.doesNotMatch(diagnostic,/title|innerText|textContent|(?:^|[,\s])href:|messageText/);
 });
 
 
@@ -1392,7 +1515,7 @@ test('v5.73 isolated diagnostic uses bounded snapshot-derived traversal and pres
  const inspector=section(bridge,'window.gptInspectVisiblePinnedRows=async(options={})=>','window.gptRunPinnedSidebarDiagnostic=async()=>');
  assert.match(inspector,/Math\.min\(600000,Number\(options\.hardTimeoutMs\)\|\|40000\)/);
  assert.match(inspector,/Math\.min\(90000,Math\.max\(15000,5000\+Math\.min\(absoluteSnapshotSafetyCap,prefixSnapshot\.length\)\*2500\)\)/);
- assert.match(inspector,/deadline-Date\.now\(\)-10000/);
+ assert.match(inspector,/deadline-Date\.now\(\)-\(manualDiagnosticRun\?manualDiagnosticReserveMs:10000\)/);
  assert.match(inspector,/stopReason='traversal_timeout'/);
  assert.match(inspector,/processedRows:rows\.length,pinnedCount:/);
  assert.match(inspector,/const absoluteSnapshotSafetyCap=32/);

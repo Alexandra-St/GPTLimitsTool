@@ -1,4 +1,5 @@
 import CryptoKit
+import Foundation
 
 struct DiagnosticOperationGenerationGate {
  private(set) var activeGeneration:UUID?
@@ -217,6 +218,106 @@ struct SafeAggregate: Codable {
  var responsesCaptured: Int
  var updatedAt: Double?
 }
+struct ChatCheckProgressAccumulator {
+ var parserAttempted=0
+ var parserAccepted=0
+ var acceptedParsedPages=0
+ var parserRejected=0
+ var pagesProduced=0
+ var producedMessages=0
+ var uniqueMessagesProduced=0
+ var parserPageUpdateCallbacks=0
+ var nativePageUpdateCallbacks=0
+ var paginationProgressObserved=false
+ var hasPreviousPage:Bool?
+ var historyCompleteProven=false
+ var pageUpdateCallbacks:Int {max(parserPageUpdateCallbacks,nativePageUpdateCallbacks)}
+ var hasProvenHistoryProgress:Bool {
+  isHistoryProgressProven(acceptedPages:acceptedParsedPages,pageUpdateCallbacks:pageUpdateCallbacks,
+   producedMessages:max(producedMessages,uniqueMessagesProduced),paginationProgressObserved:paginationProgressObserved)
+ }
+ mutating func observeParsedResponse(_ entry:HistoryResponseParseEntry) {
+  if entry.parserAttempted {
+   parserAttempted=min(100000,parserAttempted+1)
+   if entry.parserAccepted {
+    parserAccepted=min(100000,parserAccepted+1)
+    acceptedParsedPages=min(100000,acceptedParsedPages+entry.extractedPageCount)
+    pagesProduced=min(100000,pagesProduced+entry.extractedPageCount)
+   }
+   else {parserRejected=min(100000,parserRejected+1)}
+  }
+  if entry.parserAccepted,let count=entry.extractedMessageCount {producedMessages=min(100000,producedMessages+count)}
+  if entry.pageUpdateCallbackFired {parserPageUpdateCallbacks=min(100000,parserPageUpdateCallbacks+1)}
+  if let value=entry.hasPreviousPage {hasPreviousPage=value}
+ }
+ mutating func observeNativePage(newlyAddedMessages:Int,hasPreviousPage:Bool?,paginationProgressObserved:Bool) {
+  nativePageUpdateCallbacks=min(100000,nativePageUpdateCallbacks+1)
+  uniqueMessagesProduced=min(100000,uniqueMessagesProduced+max(0,newlyAddedMessages))
+  if let value=hasPreviousPage {self.hasPreviousPage=value}
+  self.paginationProgressObserved = self.paginationProgressObserved || paginationProgressObserved
+ }
+ mutating func recordCompletionProof(){historyCompleteProven=true}
+}
+func isHistoryProgressProven(acceptedPages:Int,pageUpdateCallbacks:Int,producedMessages:Int,paginationProgressObserved:Bool)->Bool {
+ acceptedPages>0 || pageUpdateCallbacks>0 || producedMessages>0 || paginationProgressObserved
+}
+func historyProgressEventRejectionReason(eventGeneration:String?,activeGeneration:String?,telemetryGeneration:String?)->String? {
+ guard let eventGeneration,!eventGeneration.isEmpty else{return "missing_generation"}
+ guard let activeGeneration,!activeGeneration.isEmpty,eventGeneration==activeGeneration else{return "stale_generation"}
+ guard let telemetryGeneration,!telemetryGeneration.isEmpty else{return "no_active_check"}
+ guard telemetryGeneration==activeGeneration else{return "owner_mismatch"}
+ return nil
+}
+struct HistoryProgressEventRejectionState:Codable,Equatable {
+ var counts:[String:Int]=[:]
+ var lastReason="none"
+ var total:Int {counts.values.reduce(0,+)}
+ mutating func record(_ reason:String) {
+  guard ["missing_generation","stale_generation","no_active_check","owner_mismatch"].contains(reason) else{return}
+  counts[reason]=min(100000,(counts[reason] ?? 0)+1);lastReason=reason
+ }
+ var summary:String {
+  let details=counts.keys.sorted().map{"\($0)=\(counts[$0] ?? 0)"}.joined(separator:", ")
+  return details.isEmpty ? "none":"\(details) · last \(lastReason)"
+ }
+}
+struct NoProgressTerminalDecision {
+ let terminal:String
+ let aggregate:SafeAggregate?
+}
+func noProgressTerminalDecision(existing:SafeAggregate?,candidate:SafeAggregate?,hasProvenHistoryProgress:Bool,hasPreviousPage:Bool?,completionProven:Bool,subtype:String)->NoProgressTerminalDecision {
+ if completionProven,let candidate,candidate.historyComplete,candidate.hasPreviousPage==false {
+  return NoProgressTerminalDecision(terminal:"Complete",aggregate:candidate)
+ }
+ guard hasProvenHistoryProgress,hasPreviousPage==true,!completionProven else {
+  return NoProgressTerminalDecision(terminal:"Failed · no_progress · \(subtype)",aggregate:existing)
+ }
+ let usableCandidate=candidate.flatMap{$0.historyComplete && $0.hasPreviousPage==false ? nil:$0}
+ var selected:SafeAggregate?
+ if let existing,let usableCandidate {
+  selected = usableCandidate.messagesCollected>=existing.messagesCollected && usableCandidate.estimatedTextTokens>=existing.estimatedTextTokens ? usableCandidate:existing
+ } else {selected=usableCandidate ?? existing}
+ if var partial=selected {
+  partial.historyComplete=false;partial.hasPreviousPage=true
+  return NoProgressTerminalDecision(terminal:"Partial · no_progress · \(subtype)",aggregate:partial)
+ }
+ return NoProgressTerminalDecision(terminal:"Partial · no_progress · \(subtype)",aggregate:nil)
+}
+func timeoutProgressPartialAggregate(existing:SafeAggregate?,candidate:SafeAggregate?,hasPreviousPage:Bool?,acceptedPages:Int,pageUpdateCallbacks:Int,producedMessages:Int,paginationProgressObserved:Bool=false,completionProven:Bool=false)->SafeAggregate? {
+ guard hasPreviousPage==true,!completionProven,isHistoryProgressProven(acceptedPages:acceptedPages,pageUpdateCallbacks:pageUpdateCallbacks,producedMessages:producedMessages,paginationProgressObserved:paginationProgressObserved),
+       let candidate,!(candidate.historyComplete && candidate.hasPreviousPage==false) else{return nil}
+ if let existing,
+    candidate.messagesCollected<existing.messagesCollected || candidate.estimatedTextTokens<existing.estimatedTextTokens {
+  var preserved=existing
+  preserved.historyComplete=false
+  preserved.hasPreviousPage=true
+  return preserved
+ }
+ var partial=candidate
+ partial.historyComplete=false
+ partial.hasPreviousPage=true
+ return partial
+}
 enum RiskModelSource: String { case betaBaseline = "Beta baseline", personalCalibration = "Personal calibration" }
 enum RiskMeasurementStatus: String { case complete = "Complete", partial = "Partial", unknown = "Unknown" }
 struct RiskCalibrationSample {
@@ -286,6 +387,17 @@ func riskNotificationNeeded(previousObservedRank:Int?,lastAcceptedRank:Int?,next
  if let previousObservedRank,rank>previousObservedRank {return ["Normal","Watch","Near","Critical"][rank]}
  return nil
 }
+func partialRiskNotificationNeeded(lastAcceptedRank:Int?,lowerBoundTokens:Int?,model:RiskModel)->String? {
+ let confirmed=confirmedRiskFromLowerBound(lowerBoundTokens,model:model)
+ let rank:Int
+ switch confirmed {case .near:rank=2;case .critical:rank=3;case .normal,.uncertain,.watch:return nil}
+ guard lastAcceptedRank == nil || rank>lastAcceptedRank! else{return nil}
+ return rank==2 ? "Near":"Critical"
+}
+func incompleteRiskNotificationNeeded(measurement:RiskMeasurementStatus,lastAcceptedRank:Int?,lowerBoundTokens:Int?,model:RiskModel)->String? {
+ guard measurement != .complete else{return nil}
+ return partialRiskNotificationNeeded(lastAcceptedRank:lastAcceptedRank,lowerBoundTokens:lowerBoundTokens,model:model)
+}
 func retryRiskNotificationLevel(lastOutcome:String?,previousObservedRank:Int?,lastAcceptedRank:Int?,next:RiskAssessment)->String? {
  guard ["add_error","permission_denied","interrupted"].contains(lastOutcome ?? "") else{return nil}
  return riskNotificationNeeded(previousObservedRank:previousObservedRank,lastAcceptedRank:lastAcceptedRank,next:next)
@@ -301,9 +413,16 @@ func monitoringDiscoveryDegraded(baseDiscoveryComplete:Bool,rootResponseReceived
 }
 func isMonitoringDiscoveryFailure(_ detail:String?)->Bool {
  guard let detail=detail?.lowercased() else{return false}
- return detail=="no_list_response" || detail=="root_http_429" || detail.hasPrefix("root_request_without_response") || detail.hasPrefix("root_response_unclassified") || detail.hasPrefix("root_trigger_") || detail=="render_surface_readiness_failed" || detail=="hard_safety_timeout_600s"
+ return detail=="no_list_response" || detail=="dom_fallback_visible_sidebar_rows_only" || detail=="root_http_429" || detail.hasPrefix("root_request_without_response") || detail.hasPrefix("root_response_unclassified") || detail.hasPrefix("root_trigger_") || detail=="render_surface_readiness_failed" || detail=="hard_safety_timeout_600s"
 }
 enum RiskMonitoringState:String {case normal="Normal",uncertain="Uncertain",watch="Watch",near="Near",critical="Critical"}
+func confirmedRiskFromLowerBound(_ lowerBoundTokens:Int?,model:RiskModel)->RiskMonitoringState {
+ guard let tokens=lowerBoundTokens,tokens>=0 else{return .normal}
+ if tokens>=model.critical {return .critical}
+ if tokens>=model.near {return .near}
+ if tokens>=model.watch {return .watch}
+ return .normal
+}
 func monitoringState(record:ChatRecord,model:RiskModel,nowMs:Double)->RiskMonitoringState {
  let measurement=riskMeasurementStatus(result:record.lastCheckResult,aggregate:record.aggregate)
  if measurement == .complete,let aggregate=record.aggregate,record.lastCheckedUpdatedAt != nil,
@@ -374,6 +493,15 @@ func riskNotificationContent(level:String,chatTitle:String?=nil,showChatTitle:Bo
  let context=showChatTitle ? cleanTitle.map{"“\($0)” is approaching the conversation length limit."} ?? generic : generic
  return ("GPT Limits Tool","\(context)\nRisk: \(level)")
 }
+func partialRiskNotificationContent(level:String)->(title:String,body:String)? {
+ let body:String
+ switch level {
+ case "Near":body="This chat is at least Near limit. Full history couldn't be verified, so the actual size may be higher."
+ case "Critical":body="This chat is at least Critical. Full history couldn't be verified, so the actual size may be higher."
+ default:return nil
+ }
+ return ("GPT Limits Tool",body)
+}
 func riskNotificationRoute(conversationID:String)->String? {
  guard conversationID.range(of:"^[A-Za-z0-9-]{1,128}$",options:.regularExpression) != nil else{return nil}
  return "/c/\(conversationID)"
@@ -393,6 +521,334 @@ func userFacingRiskChatTitle(_ title:String,showTitles:Bool)->String {
  let cleaned=title.unicodeScalars.filter{!CharacterSet.controlCharacters.contains($0)}
  let value=String(String.UnicodeScalarView(cleaned)).trimmingCharacters(in:.whitespacesAndNewlines)
  return value.isEmpty ? "A recent chat":value
+}
+
+enum RenderReadinessResult:String,Codable {case success,failure}
+enum RenderReadinessRouteCategory:String,Codable {case chat,home,loginAuth="login/auth",other}
+
+func sanitizedRenderReadinessCode(_ value:String?,fallback:String)->String {
+ guard let value,value.count<=64,value.range(of:"^[A-Za-z][A-Za-z0-9_]*$",options:.regularExpression) != nil else{return fallback}
+ return value
+}
+
+func renderReadinessRouteCategory(_ url:URL?)->RenderReadinessRouteCategory {
+ guard let url else{return .other}
+ let host=url.host?.lowercased() ?? ""
+ let path=url.path.lowercased()
+ if host=="auth.openai.com" || host.hasSuffix(".auth.openai.com") || path.contains("/auth/") || path.contains("/login") {return .loginAuth}
+ if host=="chatgpt.com" {
+  if path=="/" || path.isEmpty{return .home}
+  if path.range(of:#"^/(?:c/[^/]+|g/[^/]+/c/[^/]+)(?:/.*)?$"#,options:.regularExpression) != nil{return .chat}
+ }
+ return .other
+}
+
+struct RenderReadinessDiagnostic:Codable,Equatable {
+ var phase:String
+ var result:RenderReadinessResult
+ var reason:String
+ var routeCategory:RenderReadinessRouteCategory
+ var timestamp:Date
+ init(phase:String,result:RenderReadinessResult,reason:String,routeCategory:RenderReadinessRouteCategory,timestamp:Date=Date()) {
+  self.phase=sanitizedRenderReadinessCode(phase,fallback:"unknown")
+  self.result=result
+  self.reason=sanitizedRenderReadinessCode(reason,fallback:"unclassified")
+  self.routeCategory=routeCategory
+  self.timestamp=timestamp
+ }
+}
+
+func renderReadinessDiagnosticSummary(_ diagnostic:RenderReadinessDiagnostic)->String {
+ let timestamp=ISO8601DateFormatter().string(from:diagnostic.timestamp)
+ return "phase \(diagnostic.phase) · result \(diagnostic.result.rawValue) · reason \(diagnostic.reason) · route \(diagnostic.routeCategory.rawValue) · timestamp \(timestamp)"
+}
+
+enum ChatCheckTraceStage:String,Codable,CaseIterable {
+ case checkStarted="check_started",navigationRequested="navigation_requested",navigationFinished="navigation_finished"
+ case conversationRouteObserved="conversation_route_observed",documentReady="document_ready",historyWaitStarted="history_wait_started"
+ case historyResponseObserved="history_response_observed",historyRowsObserved="history_rows_observed",terminalResult="terminal_result"
+}
+enum ChatCheckTraceResult:String,Codable {case success,failure}
+enum ChatCheckTraceReason:String,Codable {
+ case started="started",continuationStarted="continuation_started",navigationRequested="navigation_requested",navigationFinished="navigation_finished",navigationNotStarted="navigation_not_started",navigationFailed="navigation_failed",navigationNotFinished="navigation_not_finished",expectedRoute="expected_route",unexpectedRoute="unexpected_route",conversationRouteNotObserved="conversation_route_not_observed"
+ case documentComplete="document_complete",documentNotReady="document_not_ready",documentEvaluationFailed="document_evaluation_failed",documentReadyNotObserved="document_ready_not_observed",historyWaiting="history_waiting",historyWaitNotStarted="history_wait_not_started",historyResponse2xx="history_response_2xx",historyResponseError="history_response_error",historyResponseNotObserved="history_response_not_observed"
+ case historyResponse429="history_response_429",historyResponseUnknown="history_response_unknown",historyRowsObserved="history_rows_observed",historyRowsEmpty="history_rows_empty",historyRowsNotObserved="history_rows_not_observed",terminalComplete="terminal_complete",terminalPartial="terminal_partial"
+ case terminalTimeout="terminal_timeout",terminalNoProgressWaitingHistory="terminal_no_progress_waiting_history",terminalNavigationFailure="terminal_navigation_failure",terminalFailure="terminal_failure",unclassified="unclassified"
+}
+struct SanitizedChatCheckRoute:Equatable {
+ let template:String
+ let category:RenderReadinessRouteCategory
+}
+func sanitizedChatCheckRoute(_ url:URL?)->SanitizedChatCheckRoute {
+ guard let url else{return SanitizedChatCheckRoute(template:"other",category:.other)}
+ let category=renderReadinessRouteCategory(url)
+ guard url.host?.lowercased()=="chatgpt.com" else{return SanitizedChatCheckRoute(template:"other",category:category)}
+ if url.path.isEmpty || url.path=="/" {return SanitizedChatCheckRoute(template:"home",category:.home)}
+ let parts=url.path.split(separator:"/").map(String.init)
+ if parts.count==2,parts[0]=="c",parts[1].range(of:#"^[A-Za-z0-9_-]{1,128}$"#,options:.regularExpression) != nil {
+  return SanitizedChatCheckRoute(template:"/c/:id",category:.chat)
+ }
+ if parts.count==4,parts[0]=="g",parts[2]=="c",
+    parts[1].range(of:#"^[A-Za-z0-9_-]{1,128}$"#,options:.regularExpression) != nil,
+    parts[3].range(of:#"^[A-Za-z0-9_-]{1,128}$"#,options:.regularExpression) != nil {
+  return SanitizedChatCheckRoute(template:"/g/:id/c/:id",category:.chat)
+ }
+ if parts.count==1,parts[0].range(of:#"^[A-Za-z0-9_-]{1,128}$"#,options:.regularExpression) != nil {
+  return SanitizedChatCheckRoute(template:"/:id",category:.chat)
+ }
+ if parts.count==2,parts.allSatisfy({$0.range(of:#"^[A-Za-z0-9_-]{1,128}$"#,options:.regularExpression) != nil}) {
+  return SanitizedChatCheckRoute(template:"/:id/:id",category:.chat)
+ }
+ return SanitizedChatCheckRoute(template:"other",category:category)
+}
+struct ChatCheckTraceEvent:Codable,Equatable {
+ let stage:ChatCheckTraceStage
+ let result:ChatCheckTraceResult
+ let elapsedMs:Int
+ let routeTemplate:String
+ let routeCategory:RenderReadinessRouteCategory
+ let reason:ChatCheckTraceReason
+ let timestamp:Date
+}
+struct PersistedChatCheckTrace:Codable,Equatable {
+ let startedAt:Date
+ private(set) var events:[ChatCheckTraceEvent]=[]
+ mutating func append(stage:ChatCheckTraceStage,result:ChatCheckTraceResult,route:SanitizedChatCheckRoute,reason:ChatCheckTraceReason,at:Date=Date()) {
+  let elapsed=max(0,min(600000,Int(at.timeIntervalSince(startedAt)*1000)))
+  events.append(ChatCheckTraceEvent(stage:stage,result:result,elapsedMs:elapsed,routeTemplate:route.template,routeCategory:route.category,reason:reason,timestamp:at))
+  if events.count>40 {events.remove(at:events.count>1 ? 1:0)}
+ }
+ var displayText:String {
+  guard !events.isEmpty else{return "Last standard chat check trace: not recorded"}
+  let formatter=ISO8601DateFormatter();formatter.formatOptions=[.withInternetDateTime,.withFractionalSeconds]
+  let lines=events.enumerated().map{index,event in
+   "#\(index+1) \(event.stage.rawValue) \(event.result.rawValue) +\(event.elapsedMs)ms · route \(event.routeTemplate) / \(event.routeCategory.rawValue) · reason \(event.reason.rawValue) · \(formatter.string(from:event.timestamp))"
+  }
+  return "Last standard chat check trace (sanitized):\n"+lines.joined(separator:"\n")
+ }
+}
+
+struct HistoryResponseParseEntry:Codable,Equatable {
+ let sequence:Int?
+ let endpointTemplate:String
+ let transport:String
+ let status:Int
+ let contentTypeCategory:String
+ let topLevelType:String
+ let topLevelKeyNames:[String]
+ let topLevelArrayCounts:[String:Int]
+ let expectedConversationId:Bool
+ let expectedMessagesArray:Bool
+ let mappingObjectPresent:Bool
+ let pageInfoObjectPresent:Bool
+ let hasPreviousPageField:Bool
+ let parserAttempted:Bool
+ let parserAccepted:Bool
+ let rejectionReason:String
+ let pageAcceptanceReason:String
+ let extractedPageCount:Int
+ let extractedMessageCount:Int?
+ let hasPreviousPage:Bool?
+ let pageUpdateCallbackFired:Bool
+ let timestamp:Date
+
+ static func make(_ data:[String:Any],at:Date=Date())->HistoryResponseParseEntry {
+  let raw=data["responseParseDiagnostic"] as? [String:Any] ?? data
+  func safeName(_ value:Any)->String? {
+   guard let value=value as? String,value.range(of:"^[A-Za-z][A-Za-z0-9_]{0,47}$",options:.regularExpression) != nil else{return nil}
+   return value
+  }
+  let rawArrays=raw["topLevelArrayCounts"] as? [[String:Any]] ?? []
+  var arrayCounts:[String:Int]=[:]
+  for item in rawArrays.prefix(32) {guard let key=safeName(item["key"] as Any),let count=(item["count"] as? NSNumber)?.intValue,count>=0 else{continue};arrayCounts[key]=min(100000,count)}
+  let expected=raw["expectedStructure"] as? [String:Any] ?? [:]
+  let endpoint=raw["endpointTemplate"] as? String ?? ""
+  let safeEndpoint=["/backend-api/conversations/:id/messages","/backend-api/conversations/:id","/backend-api/:other","/other"].contains(endpoint) ? endpoint:"/other"
+  let rejection=raw["rejectionReason"] as? String ?? "unknown"
+  let allowedReasons=Set(["endpoint_not_recognized","top_level_shape_changed","conversation_mapping_missing","messages_array_missing","pagination_field_changed","parser_exception","parsed_but_empty","accepted","http_error","route_mismatch","not_history_payload","unknown"])
+  let keys=(raw["topLevelKeyNames"] as? [String] ?? []).prefix(32).compactMap{safeName($0)}
+  let status=(raw["status"] as? NSNumber)?.intValue ?? 0
+  let sequence=(data["sequence"] as? NSNumber)?.intValue
+  let arrayCount=(raw["extractedPageCount"] as? NSNumber)?.intValue ?? 0
+  let messageCount=(raw["extractedMessageCount"] as? NSNumber)?.intValue
+  let topType=raw["topLevelType"] as? String ?? "unknown"
+  return HistoryResponseParseEntry(sequence:sequence.flatMap{$0>=0 ? $0:nil},endpointTemplate:safeEndpoint,
+   transport:["fetch","XHR"].contains(raw["transport"] as? String ?? "") ? raw["transport"] as! String:"unknown",
+   status:min(599,max(0,status)),contentTypeCategory:["json","text","other","unknown"].contains(raw["contentTypeCategory"] as? String ?? "") ? raw["contentTypeCategory"] as! String:"unknown",
+   topLevelType:["object","array","string","number","boolean","null","unknown"].contains(topType) ? topType:"unknown",
+   topLevelKeyNames:keys,topLevelArrayCounts:arrayCounts,
+   expectedConversationId:expected["conversationId"] as? Bool == true,
+   expectedMessagesArray:expected["messagesArray"] as? Bool == true,
+   mappingObjectPresent:expected["mappingObject"] as? Bool == true,
+   pageInfoObjectPresent:expected["pageInfoObject"] as? Bool == true,
+   hasPreviousPageField:expected["hasPreviousPageBoolean"] as? Bool == true,
+   parserAttempted:raw["parserAttempted"] as? Bool == true,
+   parserAccepted:raw["parserAccepted"] as? Bool == true,
+   rejectionReason:allowedReasons.contains(rejection) ? rejection:"unknown",
+   pageAcceptanceReason:["none","route_mismatch","generation_mismatch","document_mismatch","page_handoff_missing","empty_page","no_older_items"].contains(data["pageAcceptanceReason"] as? String ?? "") ? data["pageAcceptanceReason"] as! String:"none",
+   extractedPageCount:min(1,max(0,arrayCount)),extractedMessageCount:messageCount.map{min(100000,max(0,$0))},
+   hasPreviousPage:raw["hasPreviousPage"] as? Bool,
+   pageUpdateCallbackFired:data["pageUpdateCallbackFired"] as? Bool == true,timestamp:at)
+ }
+}
+
+struct HistoryResponseParsingState:Codable,Equatable {
+ var observedHistoryResponses=0
+ var parserDiagnosticResponseCount=0
+ var parserAttemptedCount=0
+ var parserAcceptedCount=0
+ var parserRejectedCount=0
+ var pageUpdateCallbackCount=0
+ var extractedPageCount=0
+ var extractedMessageCount=0
+ var rejectionCounts:[String:Int]=[:]
+ var entries:[HistoryResponseParseEntry]=[]
+ mutating func recordObservedResponse(){observedHistoryResponses=min(100000,observedHistoryResponses+1)}
+ mutating func append(_ entry:HistoryResponseParseEntry){
+  parserDiagnosticResponseCount=min(100000,parserDiagnosticResponseCount+1)
+  if entry.parserAttempted {
+   parserAttemptedCount=min(100000,parserAttemptedCount+1)
+   if entry.parserAccepted {parserAcceptedCount=min(100000,parserAcceptedCount+1)}
+   else {parserRejectedCount=min(100000,parserRejectedCount+1)}
+  }
+  if !entry.parserAccepted && entry.rejectionReason != "accepted" {rejectionCounts[entry.rejectionReason]=min(100000,(rejectionCounts[entry.rejectionReason] ?? 0)+1)}
+  if entry.pageUpdateCallbackFired {pageUpdateCallbackCount=min(100000,pageUpdateCallbackCount+1)}
+  extractedPageCount=min(100000,extractedPageCount+entry.extractedPageCount)
+  extractedMessageCount=min(100000,extractedMessageCount+(entry.extractedMessageCount ?? 0))
+  entries.append(entry);if entries.count>20{entries.removeFirst(entries.count-20)}
+ }
+ var summary:String {
+  let top=rejectionCounts.sorted{lhs,rhs in lhs.value==rhs.value ? lhs.key<rhs.key:lhs.value>rhs.value}.first?.key ?? "none"
+  return "History response parsing: observed \(max(observedHistoryResponses,parserDiagnosticResponseCount)) · parser attempted/accepted/rejected \(parserAttemptedCount)/\(parserAcceptedCount)/\(parserRejectedCount) (last \(entries.count)) · top rejection \(top) · page callbacks \(pageUpdateCallbackCount) · rows/pages produced \(extractedMessageCount)/\(extractedPageCount)"
+ }
+}
+
+struct PerChatHistoryDiagnostic:Codable,Equatable {
+ let ordinal:Int
+ var terminalResult="in_progress"
+ var terminalReason="not_terminal"
+ var historyRequestsObserved=0
+ var historyResponsesObserved=0
+ var parserAttempted=0
+ var parserAccepted=0
+ var parserRejected=0
+ var endpointNotRecognized=0
+ var rejectionCounts:[String:Int]=[:]
+ var pagesProduced=0
+ var messagesProduced=0
+ var uniqueMessagesProduced=0
+ var pageUpdateCallbacks=0
+ var domTurnsObserved:Int?
+ var hasPreviousPage:Bool?
+ var historyCompleteProven=false
+ var paginationProgressObserved=false
+ var finalPaginationState="unknown"
+ var timeoutState="not_timed_out"
+ var timeoutReason="none"
+ var responseEntries:[HistoryResponseParseEntry]=[]
+
+ init(ordinal:Int){self.ordinal=max(1,ordinal)}
+ mutating func recordHistoryRequest(){historyRequestsObserved=min(100000,historyRequestsObserved+1)}
+ mutating func recordHistoryResponse(){historyResponsesObserved=min(100000,historyResponsesObserved+1)}
+ mutating func append(_ entry:HistoryResponseParseEntry){
+  if entry.parserAttempted {
+   parserAttempted=min(100000,parserAttempted+1)
+   if entry.parserAccepted {parserAccepted=min(100000,parserAccepted+1)} else {parserRejected=min(100000,parserRejected+1)}
+  }
+  if entry.rejectionReason=="endpoint_not_recognized" {endpointNotRecognized=min(100000,endpointNotRecognized+1)}
+  if !entry.parserAccepted && entry.rejectionReason != "accepted" {rejectionCounts[entry.rejectionReason]=min(100000,(rejectionCounts[entry.rejectionReason] ?? 0)+1)}
+  pagesProduced=min(100000,pagesProduced+entry.extractedPageCount)
+  messagesProduced=min(100000,messagesProduced+(entry.extractedMessageCount ?? 0))
+  if entry.pageUpdateCallbackFired {pageUpdateCallbacks=min(100000,pageUpdateCallbacks+1)}
+  if let value=entry.hasPreviousPage {hasPreviousPage=value}
+  responseEntries.append(entry);if responseEntries.count>20 {responseEntries.removeFirst(responseEntries.count-20)}
+ }
+ mutating func observe(telemetry:ChatCheckStageTelemetry){
+  parserAttempted=telemetry.checkProgress.parserAttempted
+  parserAccepted=telemetry.checkProgress.parserAccepted
+  parserRejected=telemetry.checkProgress.parserRejected
+  pagesProduced=telemetry.checkProgress.pagesProduced
+  messagesProduced=telemetry.checkProgress.producedMessages
+  uniqueMessagesProduced=telemetry.checkProgress.uniqueMessagesProduced
+  pageUpdateCallbacks=telemetry.checkProgress.pageUpdateCallbacks
+  domTurnsObserved=telemetry.renderedDOMTurnCount
+  if let value=telemetry.checkProgress.hasPreviousPage {hasPreviousPage=value}
+  historyCompleteProven=telemetry.checkProgress.historyCompleteProven
+  paginationProgressObserved = telemetry.checkProgress.paginationProgressObserved || telemetry.pagination.currentlyProgressing || telemetry.pagination.replayProgressObserved || telemetry.pagination.olderHistoryProgressObserved
+  if timeoutState=="timed_out" {finalPaginationState=timeoutReason}
+  else if telemetry.paginationNoProgressTriggered {finalPaginationState="pagination_no_progress"}
+  else if telemetry.pagination.currentlyProgressing {finalPaginationState="progressing"}
+  else if telemetry.hasPreviousPage==false {finalPaginationState="history_complete"}
+  else if telemetry.historyResponses>0 {finalPaginationState="history_received"}
+  else if telemetry.historyRequests>0 {finalPaginationState="waiting_history"}
+ }
+ mutating func finish(terminal:String,telemetry:ChatCheckStageTelemetry?){
+  let allowedTerminal=terminal.range(of:"^[A-Za-z0-9_ ·.-]{1,96}$",options:.regularExpression) != nil ? terminal:"unknown_terminal"
+  terminalResult=allowedTerminal
+  if allowedTerminal.hasPrefix("Complete"){terminalReason="complete"}
+  else if allowedTerminal.contains("pagination_no_progress"){terminalReason="pagination_no_progress"}
+  else if allowedTerminal.contains("no_progress") && allowedTerminal.contains("waiting_history"){terminalReason="waiting_history"}
+  else if allowedTerminal.contains("timeout_absolute_cap"){terminalReason="timeout_absolute_cap"}
+  else if allowedTerminal.contains("per_chat_timeout"){terminalReason="per_chat_timeout"}
+  else if allowedTerminal.hasPrefix("Partial"){terminalReason="partial"}
+  else if allowedTerminal.hasPrefix("Failed"){terminalReason="failed"}
+  else {terminalReason="other"}
+  if allowedTerminal.contains("per_chat_timeout") || allowedTerminal.contains("timeout_absolute_cap") {
+   timeoutState="timed_out"
+   timeoutReason=allowedTerminal.contains("timeout_absolute_cap") ? "timeout_absolute_cap":"per_chat_timeout"
+  }
+  if let telemetry {observe(telemetry:telemetry)}
+  if timeoutState=="timed_out" {finalPaginationState=timeoutReason}
+ }
+ var compactSummary:String {
+  return "Chat \(ordinal) · \(terminalResult) · reason \(terminalReason) · requests/responses \(historyRequestsObserved)/\(historyResponsesObserved) · parser attempted/accepted/rejected \(parserAttempted)/\(parserAccepted)/\(parserRejected) · endpoint_unrecognized \(endpointNotRecognized) · top reason \(topRejectionReason) · pages/messages \(pagesProduced)/\(messagesProduced) · callbacks \(pageUpdateCallbacks) · DOM turns \(domTurnsObserved.map(String.init) ?? "unknown") · hasPreviousPage \(hasPreviousPage.map{$0 ? "yes":"no"} ?? "unknown") · progress \(paginationProgressObserved ? "yes":"no") · pagination \(finalPaginationState) · timeout \(timeoutState)/\(timeoutReason)"
+ }
+ var topRejectionReason:String {rejectionCounts.sorted{a,b in a.value==b.value ? a.key<b.key:a.value>b.value}.first?.key ?? "none"}
+ var detailedResponseSummary:String {
+  guard !responseEntries.isEmpty else{return "Chat \(ordinal): no sanitized history response details"}
+  return responseEntries.enumerated().map {index,e in
+   let keys=e.topLevelKeyNames.sorted().joined(separator:",")
+   let arrays=e.topLevelArrayCounts.keys.sorted().map{"\($0)=\(e.topLevelArrayCounts[$0] ?? 0)"}.joined(separator:",")
+   return "Chat \(ordinal) response \(index+1) · \(e.endpointTemplate) · \(e.transport) HTTP \(e.status) \(e.contentTypeCategory) · shape \(e.topLevelType) keys [\(keys)] arrays [\(arrays)] · expected conversation/messages/mapping/pageInfo/hasPrevious \(e.expectedConversationId)/\(e.expectedMessagesArray)/\(e.mappingObjectPresent)/\(e.pageInfoObjectPresent)/\(e.hasPreviousPageField) · parser attempted/accepted \(e.parserAttempted)/\(e.parserAccepted) · rejection \(e.rejectionReason) · extracted \(e.extractedMessageCount.map(String.init) ?? "unknown") messages / \(e.extractedPageCount) pages · hasPreviousPage \(e.hasPreviousPage.map{$0 ? "yes":"no"} ?? "unknown") · callback \(e.pageUpdateCallbackFired ? "yes":"no")"
+  }.joined(separator:"\n")
+ }
+}
+
+struct PerChatHistoryDiagnostics:Codable,Equatable {
+ var chats:[PerChatHistoryDiagnostic]=[]
+ var activeOrdinal:Int?
+ mutating func reset(){chats=[];activeOrdinal=nil}
+ mutating func begin(ordinal:Int){
+  let safe=max(1,ordinal)
+  if chats.contains(where:{$0.ordinal==safe}) {activeOrdinal=safe;return}
+  chats.append(PerChatHistoryDiagnostic(ordinal:safe));activeOrdinal=safe
+ }
+ private mutating func updateActive(_ body:(inout PerChatHistoryDiagnostic)->Void){
+  guard let activeOrdinal,let index=chats.firstIndex(where:{$0.ordinal==activeOrdinal}) else{return}
+  body(&chats[index])
+ }
+ mutating func recordRequest(){updateActive{$0.recordHistoryRequest()}}
+ mutating func recordObservedResponse(){updateActive{$0.recordHistoryResponse()}}
+ mutating func append(_ entry:HistoryResponseParseEntry){updateActive{$0.append(entry)}}
+ mutating func finish(terminal:String,telemetry:ChatCheckStageTelemetry?){updateActive{$0.finish(terminal:terminal,telemetry:telemetry)};activeOrdinal=nil}
+ mutating func observe(telemetry:ChatCheckStageTelemetry){updateActive{$0.observe(telemetry:telemetry)}}
+ var summary:String {chats.map{$0.compactSummary}.joined(separator:"\n")}
+ var detailedResponseSummary:String {chats.map{$0.detailedResponseSummary}.joined(separator:"\n")}
+}
+func chatCheckTraceTerminalReason(_ result:String)->ChatCheckTraceReason {
+ let value=result.lowercased()
+ if value.contains("no_progress") && value.contains("waiting_history") {return .terminalNoProgressWaitingHistory}
+ if value.contains("navigation_provisional_failed") || value.contains("navigation_failed") || value.contains("navigation_not_started") {return .terminalNavigationFailure}
+ if value.hasPrefix("complete") {return .terminalComplete}
+ if value.hasPrefix("partial") {return .terminalPartial}
+ if value.hasPrefix("timed out") || value.contains("timeout") {return .terminalTimeout}
+ return .terminalFailure
+}
+func chatCheckTraceHistoryResponseReason(status:Int?)->(ChatCheckTraceResult,ChatCheckTraceReason) {
+ guard let status else{return (.failure,.historyResponseUnknown)}
+ if status==429 {return (.failure,.historyResponse429)}
+ if (200...299).contains(status) {return (.success,.historyResponse2xx)}
+ return (.failure,.historyResponseError)
 }
 
 struct CycleState: Codable {
@@ -421,6 +877,39 @@ struct CycleState: Codable {
  var lastCycleNotificationsAccepted:Int? = nil
  var lastCycleNotificationsSuppressed:Int? = nil
  var lastSuccessfulDiscoveryAt: Date? = nil
+ var lastRenderReadiness:RenderReadinessDiagnostic? = nil
+ var lastChatCheckTrace:PersistedChatCheckTrace? = nil
+ var lastHistoryResponseParsing:HistoryResponseParsingState? = nil
+ var perChatHistoryDiagnostics:PerChatHistoryDiagnostics? = nil
+ var historyProgressEventRejections:HistoryProgressEventRejectionState? = nil
+ var lastPinnedUnknownRows:[PinnedUnknownRowDiagnostic]? = nil
+ mutating func beginHistoryResponseParsing(){lastHistoryResponseParsing=HistoryResponseParsingState()}
+ mutating func beginPerChatHistoryDiagnostic(ordinal:Int){if perChatHistoryDiagnostics==nil{perChatHistoryDiagnostics=PerChatHistoryDiagnostics()};perChatHistoryDiagnostics?.begin(ordinal:ordinal)}
+ mutating func recordHistoryResponseParsing(_ data:[String:Any],at:Date=Date()) {
+  recordHistoryResponseParsing(HistoryResponseParseEntry.make(data,at:at))
+ }
+ mutating func recordHistoryResponseParsing(_ entry:HistoryResponseParseEntry) {
+  if lastHistoryResponseParsing==nil {lastHistoryResponseParsing=HistoryResponseParsingState()}
+  lastHistoryResponseParsing?.append(entry);perChatHistoryDiagnostics?.append(entry)
+ }
+ mutating func recordObservedHistoryResponse(){if lastHistoryResponseParsing==nil {lastHistoryResponseParsing=HistoryResponseParsingState()};lastHistoryResponseParsing?.recordObservedResponse();perChatHistoryDiagnostics?.recordObservedResponse()}
+ mutating func recordObservedHistoryRequest(){perChatHistoryDiagnostics?.recordRequest()}
+ mutating func observePerChatHistoryDiagnostic(_ telemetry:ChatCheckStageTelemetry){perChatHistoryDiagnostics?.observe(telemetry:telemetry)}
+ mutating func finishPerChatHistoryDiagnostic(terminal:String,telemetry:ChatCheckStageTelemetry?){perChatHistoryDiagnostics?.finish(terminal:terminal,telemetry:telemetry)}
+ mutating func recordHistoryProgressEventRejection(_ reason:String){if historyProgressEventRejections==nil{historyProgressEventRejections=HistoryProgressEventRejectionState()};historyProgressEventRejections?.record(reason)}
+ mutating func recordRenderReadiness(phase:String,result:RenderReadinessResult,reason:String,routeCategory:RenderReadinessRouteCategory,timestamp:Date=Date()) {
+  lastRenderReadiness=RenderReadinessDiagnostic(phase:phase,result:result,reason:reason,routeCategory:routeCategory,timestamp:timestamp)
+ }
+ mutating func beginChatCheckTrace(route:SanitizedChatCheckRoute,at:Date=Date()) {
+  var trace=PersistedChatCheckTrace(startedAt:at)
+  trace.append(stage:.checkStarted,result:.success,route:route,reason:.started,at:at)
+  lastChatCheckTrace=trace
+ }
+ mutating func appendChatCheckTrace(stage:ChatCheckTraceStage,result:ChatCheckTraceResult,route:SanitizedChatCheckRoute,reason:ChatCheckTraceReason,at:Date=Date()) {
+  guard var trace=lastChatCheckTrace else{return}
+  trace.append(stage:stage,result:result,route:route,reason:reason,at:at)
+  lastChatCheckTrace=trace
+ }
  mutating func merge(_ rows: [[String: Any]],source:LastSeenUpdatedAtSource,observedAt:Double=Date().timeIntervalSince1970*1000) {
   for r in rows {
    guard let id=r["conversationId"] as? String, id.range(of: "^[A-Za-z0-9-]+$",options:.regularExpression) != nil,
@@ -447,6 +936,97 @@ struct CycleState: Codable {
    return a.lastSeenUpdatedAt>b.lastSeenUpdatedAt
   }
  }
+}
+
+struct PinnedUnknownRowDiagnostic:Codable,Equatable {
+ let positionIndex:Int
+ let tag:String
+ let routeTemplate:String
+ let hasHref:Bool
+ let hasOctaneNavigationItem:Bool
+ let dataAttributeNames:[String]
+ let ariaAttributeNames:[String]
+ let visible:Bool
+ let conversationRouteClassification:String
+ let navigationRowClassification:String
+ let pinnedStarredClassification:String
+ let structuralClassification:String
+ let rejectionReason:String
+
+ static let maxRows=20
+ private static func safeName(_ value:Any?,prefix:String)->String? {
+  guard let name=value as? String,name.range(of:"^\(prefix)-[a-z0-9_-]{1,48}$",options:.regularExpression) != nil else{return nil}
+  return name
+ }
+ private static func safeToken(_ value:Any?,allowed:Set<String>,fallback:String)->String {
+  guard let value=value as? String,allowed.contains(value) else{return fallback};return value
+ }
+ static func make(_ raw:[String:Any])->PinnedUnknownRowDiagnostic? {
+  let index=max(1,min(256,(raw["positionIndex"] as? NSNumber)?.intValue ?? 1))
+  let tagRaw=(raw["tag"] as? String ?? "unknown").lowercased()
+  let tag=tagRaw.range(of:"^[a-z][a-z0-9-]{0,15}$",options:.regularExpression) != nil ? tagRaw:"unknown"
+  let templateRaw=raw["routeTemplate"] as? String ?? "/unknown"
+  let routeTemplate=templateRaw.range(of:"^/(?:[a-z0-9_-]{1,24}|:id)(?:/(?:[a-z0-9_-]{1,24}|:id)){0,3}$",options:.regularExpression) != nil ? templateRaw:"/unknown"
+  func names(_ key:String,_ prefix:String)->[String] {
+   let values=(raw[key] as? [String] ?? []).compactMap{safeName($0,prefix:prefix)}
+   return Array(Set(values)).sorted().prefix(16).map{$0}
+  }
+  let route=safeToken(raw["conversationRouteClassification"],allowed:["conversation","project","other","unknown"],fallback:"unknown")
+  let navigation=safeToken(raw["navigationRowClassification"],allowed:["conversation_row","project_navigation_row","navigation_action_row","unclassified_navigation_row"],fallback:"unclassified_navigation_row")
+  let pin=safeToken(raw["pinnedStarredClassification"],allowed:["unknown","pinned","not_pinned"],fallback:"unknown")
+  let structural=safeToken(raw["structuralClassification"],allowed:["octane_conversation_row_variant","conversation_row_variant","project_navigation_row","navigation_action_row","unclassified_sidebar_row"],fallback:"unclassified_sidebar_row")
+  let reason=safeToken(raw["rejectionReason"],allowed:["menu_trigger_missing","menu_failed_to_open","menu_items_missing","ambiguous_actions","pin_and_unpin_action_missing","snapshot_changed","unsupported_row_shape","cleanup_failed","row_missing_after_snapshot","unknown_pin_state"],fallback:"unknown_pin_state")
+  return PinnedUnknownRowDiagnostic(positionIndex:index,tag:tag,routeTemplate:routeTemplate,hasHref:raw["hasHref"] as? Bool ?? false,hasOctaneNavigationItem:raw["hasOctaneNavigationItem"] as? Bool ?? false,dataAttributeNames:names("dataAttributeNames","data"),ariaAttributeNames:names("ariaAttributeNames","aria"),visible:raw["visible"] as? Bool ?? false,conversationRouteClassification:route,navigationRowClassification:navigation,pinnedStarredClassification:pin,structuralClassification:structural,rejectionReason:reason)
+ }
+ var compactLine:String {"row \(positionIndex) · \(structuralClassification) · reason \(rejectionReason)"}
+ var detailLine:String {"\(compactLine) · tag \(tag) · route \(routeTemplate) · href \(hasHref ? "yes":"no") · octane \(hasOctaneNavigationItem ? "yes":"no") · visible \(visible ? "yes":"no") · conversation \(conversationRouteClassification) · navigation \(navigationRowClassification) · pinned/starred \(pinnedStarredClassification) · data [\(dataAttributeNames.joined(separator:", "))] · aria [\(ariaAttributeNames.joined(separator:", "))]"}
+}
+
+enum BundleIdentityMigrationStatus:String {
+ case notNeeded="not needed"
+ case migrated="migrated"
+ case cleanInstall="clean install"
+ case failed="failed"
+}
+struct BundleIdentityMigrationPlan {
+ let status:BundleIdentityMigrationStatus
+ let valuesToWrite:[String:Any]
+ let shouldSetCompletionMarker:Bool
+ let failureReason:String?
+}
+let legacyBundleIdentityDefaultsDomain="local.GPTLimitsTool.Feasibility"
+let bundleIdentityMigrationMarkerKey="bundleIdentityMigrationV1Completed"
+let bundleIdentityMigrationFailureKey="bundleIdentityMigrationV1Failure"
+let nativeCycleStateDefaultsKey="nativeCycleStateV1"
+func bundleIdentityMigrationPlan(legacy:[String:Any],current:[String:Any])->BundleIdentityMigrationPlan {
+ if current[bundleIdentityMigrationMarkerKey] as? Bool == true {
+  return BundleIdentityMigrationPlan(status:.notNeeded,valuesToWrite:[:],shouldSetCompletionMarker:false,failureReason:nil)
+ }
+ var writes=[String:Any]()
+ if current[nativeCycleStateDefaultsKey] != nil {
+  if current[showChatTitlesInNotificationsDefaultsKey] == nil,
+     let legacySetting=legacy[showChatTitlesInNotificationsDefaultsKey] as? Bool {
+   writes[showChatTitlesInNotificationsDefaultsKey]=legacySetting
+  }
+  return BundleIdentityMigrationPlan(status:.notNeeded,valuesToWrite:writes,shouldSetCompletionMarker:true,failureReason:nil)
+ }
+ if let legacyState=legacy[nativeCycleStateDefaultsKey] {
+  guard let data=legacyState as? Data,
+        (try? JSONDecoder().decode(CycleState.self,from:data)) != nil else {
+   return BundleIdentityMigrationPlan(status:.failed,valuesToWrite:[:],shouldSetCompletionMarker:false,failureReason:"legacy_state_invalid")
+  }
+  writes[nativeCycleStateDefaultsKey]=data
+  if current[showChatTitlesInNotificationsDefaultsKey] == nil,
+     let legacySetting=legacy[showChatTitlesInNotificationsDefaultsKey] as? Bool {
+   writes[showChatTitlesInNotificationsDefaultsKey]=legacySetting
+  }
+  return BundleIdentityMigrationPlan(status:.migrated,valuesToWrite:writes,shouldSetCompletionMarker:true,failureReason:nil)
+ }
+ if current[showChatTitlesInNotificationsDefaultsKey] == nil,
+    let legacySetting=legacy[showChatTitlesInNotificationsDefaultsKey] as? Bool {
+  writes[showChatTitlesInNotificationsDefaultsKey]=legacySetting
+ }
+ return BundleIdentityMigrationPlan(status:.cleanInstall,valuesToWrite:writes,shouldSetCompletionMarker:true,failureReason:nil)
 }
 
 enum DiscoveryStatus: String, Codable {case notRun="not_run",inProgress="in_progress",success,rateLimited="rate_limited",incomplete}
@@ -1480,14 +2060,20 @@ struct ChatCheckStageTelemetry {
  var cleanupOwnershipResult="pending"
  var navigationTerminalReason="none"
  var pagination=ChatPaginationProgressTracker()
+ var checkProgress=ChatCheckProgressAccumulator()
  var paginationNoProgressTriggered=false
  var historyRequests=0
  var historyResponses=0
+ var renderedDOMTurnCount:Int?
+ var renderedDOMUserTurnCount=0
+ var renderedDOMAssistantTurnCount=0
+ var renderedDOMUnknownRoleTurnCount=0
  var pagesObserved=0
  var automationPageUpdateCallbacks=0
  var firstPassIdentityProvenanceSummary="not_reported"
  var messagesAccumulated=0
  var hasPreviousPage:Bool?
+ var historyComplete=false
  var documentIdentity:String?
  var paginationFrontierTimestamp:Double?
  var olderUniqueMessageCount=0
@@ -1811,6 +2397,14 @@ struct ChatCheckStageTelemetry {
  }
 
  var timeoutSubtype:String {
+  if (stage=="route_reached" || stage=="history_wait_started" || stage=="history_response_seen"),
+     let renderedDOMTurnCount,renderedDOMTurnCount>0,historyResponses==0 {return "rendered_dom_history_without_network"}
+  if stage=="route_reached" || stage=="history_wait_started" || stage=="history_response_seen" {
+   if checkProgress.hasProvenHistoryProgress {
+    return checkProgress.paginationProgressObserved ? "pagination_progressing":"pagination"
+   }
+   if historyResponses>0 {return "history_response_received"}
+  }
   switch stage {
   case "navigation_started","navigation_committed","navigation_provisional_failed","navigation_failed","navigation_load_rejected": return "navigation"
   case "route_reached","history_wait_started","history_response_seen": return "waiting_history"
@@ -1836,7 +2430,9 @@ struct ChatCheckStageTelemetry {
   let responseEventsShownRecognized=continuationResponseEvents.filter{$0.contains(" · parser yes ·")}.count
   let responsePipelineSummary=continuationSelected ? " · first-pass boundary {\(continuationFirstPassBoundarySummary)} · request-origin first-pass/continuation/unknown \(continuationResponseOriginFirstPass)/\(continuationResponseOriginContinuation)/\(continuationResponseOriginUnknown) · continuation source-overlap totals tracked/other-origin \(continuationTrackedBaselineOverlapTotal)/\(continuationOtherOriginBaselineOverlapTotal) · continuation cursors seen/new \(continuationContinuationCursorSeenFirstPass)/\(continuationContinuationCursorNew) · exact first-pass page matches \(continuationExactFirstPassPageMatches) · baseline-known-only/new-identity pages \(continuationKnownBaselineOnlyPages)/\(continuationPagesWithNewIdentity) · baseline membership telemetry mismatches \(continuationBaselineMembershipMismatchCount) · first continuation request {\(continuationFirstContinuationRequestSummary)} · response→page pipeline \(continuationResponseSequences.count) responses · parser recognized \(responseEventsShownRecognized)/\(continuationResponseEvents.count) shown (event-level payloadRecognized yes) · total recognized \(continuationRecognizedResponseSequences.count) · page accepted \(continuationAcceptedPageCount) · page rejected \(continuationRejectedPageCount) · no-older exact reasons [\(dominantReasons.isEmpty ? "none":dominantReasons)] · unique request cursors \(continuationRequestCursorFingerprints.count) · unique response cursors \(continuationResponseCursorFingerprints.count) · unique page fingerprints \(continuationPageFingerprints.count) · duplicate pages/cursors \(continuationDuplicatePageCount)/\(continuationDuplicateCursorCount) · exact first-pass duplicate pages/cursors \(continuationDuplicateFirstPassPageCount)/\(continuationDuplicateFirstPassCursorCount) · older/not-older responses \(continuationOlderDirectionCount)/\(continuationNotOlderDirectionCount) · events [\(continuationResponseEvents.isEmpty ? "none":continuationResponseEvents.joined(separator:"; "))]":""
   let continuationTrace=continuationSelected ? " · continuation diagnostics [\(continuationStages.joined(separator:" → "))] · trigger telemetry sources [\(continuationTriggerSources.joined(separator:","))] (one logical attempt) · first-pass hook baseline \(continuationBaselineHistoryRequests)/\(continuationBaselineHistoryResponses) · continuation hook delta \(continuationHistoryRequests)/\(continuationHistoryResponses) · continuation page responses \(continuationPageResponses) · aggregate growth \(continuationAggregateGrowth) · unique older messages \(continuationOlderUniqueMessages) · first request \(continuationFirstHistoryRequestMs.map(String.init) ?? "none") ms · first response \(continuationFirstHistoryResponseMs.map(String.init) ?? "none") ms · diagnosis \(continuationDiagnosis)\(responsePipelineSummary)":""
-  return "Chat \(ordinal): \(terminal) · last stage \(stageBeforeFinish ?? stage) · stages [\(compactStages.joined(separator:" → "))] · stage \(current) ms / total \(total) ms · \(lifecycle) · navigation object/provisional \(navigationObjectReturned ? "yes":"no")/\(navigationProvisionalStarted ? "yes":"no") · navigation reason \(navigationTerminalReason) · route \(routeReached ? "yes":"no") · history requests/responses \(historyRequests)/\(historyResponses) · \(paginationSummary) · first-pass provenance {\(firstPassIdentityProvenanceSummary)} · continuation \(continuationAttempted ? continuationTerminalReason:"not_attempted") · pass 1 pages/messages \(continuationFirstPassPages)/\(continuationStartingMessages) · page update callbacks \(automationPageUpdateCallbacks) · same document \(documentIdentity == nil ? "unverified":"verified")\(continuationTrace) · timing {\(timing.report(now:now))} · page progression [\(pageDetails.isEmpty ? "none":pageDetails)] · has_previous_page \(hasPreviousPage.map{ $0 ? "yes":"no" } ?? "unknown") · HTTP [\(status.isEmpty ? "none":status)] · 429 \(rateLimitSeen ? "yes":"no") · aggregation \(aggregationStarted ? "started":"not_started")/\(aggregationCompleted ? "complete":"incomplete") · hooks \(hookHealth) · render lease \(renderLeaseActive ? "active":"inactive")"
+  let domTurns=renderedDOMTurnCount.map{String($0)} ?? "unobserved"
+  let domRoles="rendered DOM turns \(domTurns) (user/assistant/unknown \(renderedDOMUserTurnCount)/\(renderedDOMAssistantTurnCount)/\(renderedDOMUnknownRoleTurnCount))"
+  return "Chat \(ordinal): \(terminal) · last stage \(stageBeforeFinish ?? stage) · stages [\(compactStages.joined(separator:" → "))] · stage \(current) ms / total \(total) ms · \(lifecycle) · navigation object/provisional \(navigationObjectReturned ? "yes":"no")/\(navigationProvisionalStarted ? "yes":"no") · navigation reason \(navigationTerminalReason) · route \(routeReached ? "yes":"no") · history requests/responses \(historyRequests)/\(historyResponses) · \(domRoles) · \(paginationSummary) · first-pass provenance {\(firstPassIdentityProvenanceSummary)} · continuation \(continuationAttempted ? continuationTerminalReason:"not_attempted") · pass 1 pages/messages \(continuationFirstPassPages)/\(continuationStartingMessages) · page update callbacks \(automationPageUpdateCallbacks) · same document \(documentIdentity == nil ? "unverified":"verified")\(continuationTrace) · timing {\(timing.report(now:now))} · page progression [\(pageDetails.isEmpty ? "none":pageDetails)] · has_previous_page \(hasPreviousPage.map{ $0 ? "yes":"no" } ?? "unknown") · HTTP [\(status.isEmpty ? "none":status)] · 429 \(rateLimitSeen ? "yes":"no") · aggregation \(aggregationStarted ? "started":"not_started")/\(aggregationCompleted ? "complete":"incomplete") · hooks \(hookHealth) · render lease \(renderLeaseActive ? "active":"inactive")"
  }
 }
 struct ChatCheckReportSnapshot {
@@ -1856,6 +2452,7 @@ struct ChatCheckContinuationCheckpoint {
  let replayProgressObserved:Bool
  let newHistoryProgressObserved:Bool
  let hasPreviousPage:Bool
+ let historyProgress:ChatCheckProgressAccumulator
  var timing:ChatCheckTimingTelemetry
 }
 final class NativeCycleScheduler {

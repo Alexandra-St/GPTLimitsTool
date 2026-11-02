@@ -11,8 +11,8 @@ else
 fi
 main="$root/native-prototype/Main.swift"
 manifest="$root/extension/manifest.json"
-version=$(sed -n 's/^[[:space:]]*let pinnedDiagnosticVersion="\([^"]*\)".*/\1/p' "$main" | head -n 1)
-expected_version=5.106.0
+version=$(sed -n 's/^[[:space:]]*let gptLimitsAppVersion="\([^"]*\)".*/\1/p' "$main" | head -n 1)
+expected_version=6.2.2
 [ -n "$version" ] || { echo "Build failed: native runtime version marker missing." >&2; exit 1; }
 [ "$version" = "$expected_version" ] || { echo "Build failed: expected native v$expected_version, found v$version." >&2; exit 1; }
 python3 - "$manifest" <<'PY'
@@ -26,7 +26,7 @@ resources="$out/Contents/Resources"
 executable="$out/Contents/MacOS/GPTLimitsNativePrototype"
 icon="$root/native-prototype/AppIcon.icns"
 [ -f "$icon" ] || { echo "Build failed: required final app icon missing at $icon." >&2; exit 1; }
-input_files="$root/native-prototype/build.sh $main $root/native-prototype/CycleModel.swift $root/native-prototype/CycleEngine.swift $root/native-prototype/bridge.js $root/native-prototype/list-hook.js $root/native-prototype/conversation-list.js $root/native-prototype/automation-bridge.js $root/native-prototype/activity-hook.js $root/native-prototype/native-rescue-bridge.js $root/extension/rescue.js $root/extension/aggregator.js $root/extension/history-collector.js $root/extension/page-hook.js $manifest"
+input_files="$root/native-prototype/build.sh $main $root/native-prototype/CycleModel.swift $root/native-prototype/CycleEngine.swift $root/native-prototype/bridge.js $root/native-prototype/list-hook.js $root/native-prototype/conversation-list.js $root/native-prototype/automation-bridge.js $root/native-prototype/activity-hook.js $root/native-prototype/conversation-history-diagnostic.js $root/native-prototype/native-rescue-bridge.js $root/extension/rescue.js $root/extension/aggregator.js $root/extension/history-collector.js $root/extension/page-hook.js $manifest"
 input_files="$input_files $icon"
 build_id=$(shasum -a 256 $input_files | shasum -a 256 | awk '{print substr($1,1,16)}')
 
@@ -38,14 +38,14 @@ verify_bundle() {
   bundle_id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$out/Contents/Info.plist" 2>/dev/null || true)
   bundle_name=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleName' "$out/Contents/Info.plist" 2>/dev/null || true)
   display_name=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' "$out/Contents/Info.plist" 2>/dev/null || true)
-  [ "$bundle_id" = "local.GPTLimitsTool.Feasibility" ] || { echo "Freshness check failed: unexpected bundle identifier '$bundle_id'." >&2; return 1; }
+  [ "$bundle_id" = "com.alexandrast.gptlimitstool" ] || { echo "Freshness check failed: unexpected bundle identifier '$bundle_id'." >&2; return 1; }
   [ "$bundle_name" = "GPT Limits Tool" ] || { echo "Freshness check failed: bundle name is '$bundle_name'." >&2; return 1; }
   [ "$display_name" = "GPT Limits Tool" ] || { echo "Freshness check failed: display name is '$display_name'." >&2; return 1; }
   [ "$actual_version" = "$version" ] || { echo "Freshness check failed: bundle version is '$actual_version', expected '$version'." >&2; return 1; }
   [ "$actual_id" = "$build_id" ] || { echo "Freshness check failed: build ID is stale (bundle $actual_id, source $build_id)." >&2; return 1; }
-  for file in aggregator.js history-collector.js page-hook.js rescue.js bridge.js list-hook.js conversation-list.js automation-bridge.js activity-hook.js native-rescue-bridge.js; do
+  for file in aggregator.js history-collector.js page-hook.js rescue.js bridge.js list-hook.js conversation-list.js automation-bridge.js activity-hook.js conversation-history-diagnostic.js native-rescue-bridge.js; do
     source="$root/extension/$file"
-    case "$file" in bridge.js|list-hook.js|conversation-list.js|automation-bridge.js|activity-hook.js|native-rescue-bridge.js) source="$root/native-prototype/$file";; esac
+    case "$file" in bridge.js|list-hook.js|conversation-list.js|automation-bridge.js|activity-hook.js|conversation-history-diagnostic.js|native-rescue-bridge.js) source="$root/native-prototype/$file";; esac
     [ -f "$resources/$file" ] && cmp -s "$source" "$resources/$file" || { echo "Freshness check failed: bundled resource '$file' differs from source." >&2; return 1; }
   done
   [ -f "$resources/AppIcon.icns" ] && cmp -s "$icon" "$resources/AppIcon.icns" || { echo "Freshness check failed: bundled AppIcon.icns differs from source." >&2; return 1; }
@@ -75,7 +75,7 @@ SWIFT
 xcrun swiftc -module-cache-path /private/tmp/gpt-limits-swift-cache "$main" "$root/native-prototype/CycleModel.swift" "$root/native-prototype/CycleEngine.swift" "$tmp_metadata" -framework AppKit -framework WebKit -framework UserNotifications -o "$tmp_executable"
 for file in aggregator.js history-collector.js page-hook.js rescue.js; do cp "$root/extension/$file" "$resources/$file"; done
 cp "$root/native-prototype/bridge.js" "$resources/bridge.js"
-for file in list-hook.js conversation-list.js automation-bridge.js activity-hook.js native-rescue-bridge.js; do cp "$root/native-prototype/$file" "$resources/$file"; done
+for file in list-hook.js conversation-list.js automation-bridge.js activity-hook.js conversation-history-diagnostic.js native-rescue-bridge.js; do cp "$root/native-prototype/$file" "$resources/$file"; done
 cp "$icon" "$resources/AppIcon.icns"
 mv -f "$tmp_executable" "$executable"
 trap - EXIT HUP INT TERM
@@ -85,7 +85,7 @@ cat > "$out/Contents/Info.plist" <<'PLIST'
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
 <key>CFBundleExecutable</key><string>GPTLimitsNativePrototype</string>
-<key>CFBundleIdentifier</key><string>local.GPTLimitsTool.Feasibility</string>
+<key>CFBundleIdentifier</key><string>com.alexandrast.gptlimitstool</string>
 <key>CFBundleName</key><string>GPT Limits Tool</string>
 <key>CFBundleDisplayName</key><string>GPT Limits Tool</string>
 <key>CFBundlePackageType</key><string>APPL</string>

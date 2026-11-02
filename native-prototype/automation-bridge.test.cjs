@@ -99,6 +99,14 @@ test('continuation old unique messages are eligible and preserve existing accept
  x.receive(page([{id:'older-private',activityTime:90}],{liveResumeGeneration:'eligible'}),{sequence:503,requestClass:'conversation_messages',status:200,itemCount:1,payloadRecognized:true,routeMatches:true,documentIdentity:x.window.gptLiveResumeDocumentIdentity,liveResumeGeneration:'eligible'});
  const event=x.chatCheckMessages.at(-1);assert.equal(event.accepted,true);assert.equal(event.itemBreakdown.eligibleOlder,1);assert.equal(event.itemBreakdown.accepted,1);
 });
+test('first-pass parser diagnostics persist safe response shape and page callback result',()=>{
+ const x=setup();x.window.gptConfigureCheck({id:'a',token:'parse-diagnostic'});
+ const responseParseDiagnostic={endpointTemplate:'/backend-api/conversations/:id/messages',transport:'fetch',status:200,contentTypeCategory:'json',topLevelType:'object',topLevelKeyNames:['messages'],topLevelArrayCounts:[{key:'messages',count:1}],expectedStructure:{conversationId:true,messagesArray:true,mappingObject:false,pageInfoObject:true,hasPreviousPageBoolean:true},parserAttempted:true,parserAccepted:true,rejectionReason:'accepted',extractedPageCount:1,extractedMessageCount:1,hasPreviousPage:true};
+ x.receive(page(['private-message-id']),{sequence:7,requestOrigin:'first_pass',requestOrdinal:1,requestClass:'conversation_messages',transport:'fetch',status:200,payloadRecognized:true,routeMatches:true,documentIdentity:x.window.gptLiveResumeDocumentIdentity,liveResumeGeneration:'parse-diagnostic',responseParseDiagnostic});
+ const event=x.chatCheckMessages.find(message=>message.event==='history_response_parse_diagnostic');
+ assert.ok(event);assert.equal(event.sequence,7);assert.equal(event.pageUpdateCallbackFired,true);assert.equal(event.responseParseDiagnostic.parserAccepted,true);
+ assert.equal(x.sent.length,1);assert.equal(JSON.stringify(event).includes('private-message-id'),false);assert.equal(JSON.stringify(event).includes('SECRET TEXT'),false);
+});
 test('complete baseline requires actual overlap or newly observed oldest page',()=>{const x=setup();x.window.gptConfigureCheck({id:'a',token:'one'});x.receive(page(['old'],{hasPreviousPage:false,isPaginationResponse:true}));const baseline=x.sent.at(-1).state;const y=setup();y.window.gptConfigureCheck({id:'a',token:'two',baseline});y.receive(page(['new']));assert.equal(y.sent.at(-1).overlap,false);assert.equal(y.sent.at(-1).oldest,false);y.receive(page(['new','old']));assert.equal(y.sent.at(-1).overlap,true);assert.equal(y.sent.at(-1).state.messagesCollected,2);assert.equal(y.sent.at(-1).state.attachments.images,2);});
 test('new activity invalidates an old Complete until a new page overlaps the saved boundary',()=>{const x=setup();x.window.gptConfigureCheck({id:'a',token:'one'});x.receive(page(['old'],{hasPreviousPage:false,isPaginationResponse:true}));const baseline=x.sent.at(-1).state;const y=setup();y.window.gptConfigureCheck({id:'a',token:'two',baseline,requireOverlapForComplete:true});y.receive(page(['new']));assert.equal(y.sent.at(-1).state.historyComplete,false);assert.equal(y.sent.at(-1).state.hasPreviousPage,true);y.receive(page(['new','old']));assert.equal(y.sent.at(-1).state.historyComplete,true);assert.equal(y.sent.at(-1).state.hasPreviousPage,false);});
 test('sidebar scroll changes geometry without reading message text',()=>{const x=setup();assert.equal(x.window.gptScrollSidebar(),false);});
@@ -432,11 +440,12 @@ test('sidebar pagination uses scrollable ancestors and never reads DOM message c
 });
 
 function starredDocument({initial=true,noOp=false,role='button',sidebar=true}={}){
- let expanded=initial,clicks=0;const links=[{hidden:false,getAttribute:()=>null,getClientRects:()=>[{}]}];
- const list={hidden:false,getClientRects:()=>[{}],getAttribute:k=>k==='role'?'list':null,querySelectorAll:s=>s==='a[href*="/c/"]'?links:[]};
+ let expanded=initial,clicks=0;const links=[{tagName:'A',hidden:false,parentElement:null,getAttribute:k=>k==='href'?'/c/private-starred-chat':null,getClientRects:()=>[{}]}];
+ const list={hidden:false,getClientRects:()=>[{}],getAttribute:k=>k==='role'?'list':null,querySelectorAll:s=>s==='a[href*="/c/"]'||s==='a[href]'?links:[]};
+ links[0].parentElement=list;
  const nav={hidden:false,getAttribute:()=>null,getClientRects:()=>[{}],getBoundingClientRect:()=>({x:0,y:20,width:260,height:700}),
   contains:node=>node===disclosure||node===list,
-  querySelectorAll:s=>s==='a[href*="/c/"]'?links:(s.includes('button')||s.includes('[aria-expanded]'))?[disclosure]:[]};
+  querySelectorAll:s=>s==='a[href*="/c/"]'||s==='a[href]'?links:(s.includes('button')||s.includes('[aria-expanded]'))?[disclosure]:[]};
  const disclosure={tagName:'BUTTON',childNodes:[{nodeType:3,nodeValue:'Закрепленные'}],
   parentElement:{children:[]},
   getAttribute:k=>({role, 'aria-label':'Pinned','aria-expanded':String(expanded),'aria-controls':'starred-list'}[k]??null),
@@ -493,13 +502,13 @@ test('sidebar absence is reported separately from starred disclosure absence',()
 function topChatRowsDocument(menuLabels, directMarkers={},escapeCloses=true){
  let activeMenu=null,opens=0,closes=0,actionClicks=0;const rows=[];
  const nav={hidden:false,getAttribute:()=>null,getClientRects:()=>[{}],getBoundingClientRect:()=>({x:0,y:0,left:0,top:0,right:300,bottom:700,width:300,height:700}),
-  querySelectorAll:s=>s==='a[href*="/c/"]'?rows.map(row=>row.anchor):[]};
+  querySelectorAll:s=>s==='a[href*="/c/"]'||s==='a[href]'?rows.map(row=>row.anchor):[]};
  const document={body:{},getElementById:()=>null,dispatchEvent:event=>{if(escapeCloses&&event.key==='Escape'&&activeMenu){activeMenu=null;closes++;}},
-  querySelectorAll:s=>s==='nav,aside,[role="navigation"],[data-testid*="sidebar"]'?[nav]:s==='[role="menu"]'?(activeMenu?[activeMenu]:[]):s==='a[href*="/c/"]'?rows.map(row=>row.anchor):[]};
+  querySelectorAll:s=>s==='nav,aside,[role="navigation"],[data-testid*="sidebar"]'?[nav]:s==='[role="menu"]'?(activeMenu?[activeMenu]:[]):s==='a[href*="/c/"]'||s==='a[href]'?rows.map(row=>row.anchor):[]};
  menuLabels.forEach((labels,index)=>{
   const actions=labels.map(label=>({getAttribute:name=>name==='role'?'menuitem':null,innerText:label,getClientRects:()=>[{}],click(){actionClicks++;}}));
   const menu={getClientRects:()=>[{}],querySelectorAll:()=>actions};
-  const row={className:'chat-row',attributes:[],parentElement:nav,getAttribute:name=>directMarkers[index]?.[name]??null,querySelectorAll:s=>s==='a[href*="/c/"]'?[row.anchor]:s==='button,[role="button"]'?[row.trigger]:[]};
+  const row={className:'chat-row',attributes:[],parentElement:nav,getAttribute:name=>directMarkers[index]?.[name]??null,querySelectorAll:s=>s==='a[href*="/c/"]'||s==='a[href]'?[row.anchor]:s==='button,[role="button"]'?[row.trigger]:[]};
   row.anchor={parentElement:row,hidden:false,getClientRects:()=>[{}],getAttribute:name=>name==='href'?`/c/private-id-${index+1}`:null};
   row.trigger={tagName:'BUTTON',className:'row-menu',getAttribute:name=>({role:'button','aria-haspopup':'menu','aria-label':'Conversation options'}[name]??null),click(){assert.equal(activeMenu,null,'previous row menu must close before the next opens');activeMenu=menu;opens++;}};
   rows.push(row);
@@ -620,6 +629,48 @@ test('v4.8 classifies a DOM-order snapshot, skips project links, re-resolves row
  assert.deepEqual(Array.from(result.rows,row=>[row.domConversationsBeforeMenu,row.domConversationsAfterCleanup]),[[3,3],[3,3],[3,3]]);
  assert.equal(result.contiguousPinnedPrefix,'yes');assert.equal(result.pinnedStructureComplete,'complete');assert.equal(result.source.matched,true);assert.equal(result.source.updatedAtCount,2);assert.deepEqual(matched,['private-chat-1','private-chat-2']);
  const serialized=JSON.stringify(result);for(const secret of ['private-chat-','private-project','PRIVATE MENU CONTENT','/g/private-project','href','title'])assert.equal(serialized.includes(secret),false);
+});
+
+test('manual pinned rows diagnostic returns sanitized snapshot with named stage callbacks',async()=>{
+ const dom=visiblePinnedRowsDocument([['Unpin chat'],['Pin chat']]),x=setup(dom.document);x.window.innerWidth=1024;x.window.innerHeight=768;
+ const result=await x.window.gptInspectVisiblePinnedRows({maxRows:13,hardTimeoutMs:10000,sidebarDiagnosticRunID:'manual-normal'});
+ assert.ok(result.sidebarDiagnosticSummary);assert.equal(result.sidebarDiagnosticSummary.result,'success',JSON.stringify({stopReason:result.stopReason,rows:result.rows,summary:result.sidebarDiagnosticSummary}));assert.equal(result.sidebarDiagnosticSummary.pinnedRowCandidateCount,1);
+ const stages=x.diagnostics.filter(item=>item.sidebarDiagnosticRunID==='manual-normal').map(item=>item.visiblePinnedRowsStage?.stage).filter(Boolean);
+ for(const stage of ['operation_started','sidebar_lookup_started','document_ready','sidebar_found','row_scan_started','row_scan_finished','route_template_scan_started','route_template_scan_finished'])assert.ok(stages.includes(stage),`missing stage ${stage}`);
+ assert.ok(x.diagnostics.filter(item=>item.visiblePinnedRowsStage).every(item=>Number.isInteger(item.visiblePinnedRowsStage.elapsedMs)));
+ const safe=JSON.stringify(result.sidebarDiagnosticSummary);for(const secret of ['private-chat-','private-project','href','title','content'])assert.equal(safe.includes(secret),false);
+});
+
+test('manual pinned rows diagnostic returns a partial result when sidebar is absent',async()=>{
+ const dom=stagedPreflightDocument({readyState:'complete',sidebar:false,list:false}),x=setup(dom.document);const started=Date.now();
+ const result=await x.window.gptInspectVisiblePinnedRows({hardTimeoutMs:6000,sidebarDiagnosticRunID:'manual-no-sidebar'});
+ assert.equal(result.sidebarDiagnosticSummary.result,'failure');assert.equal(result.sidebarDiagnosticSummary.reason,'sidebar_root_missing');assert.ok(Date.now()-started<5500);
+ assert.ok(x.diagnostics.some(item=>item.visiblePinnedRowsStage?.stage==='sidebar_not_found'));
+});
+
+test('manual pinned rows diagnostic returns a partial result when rows never appear',async()=>{
+ const dom=stagedPreflightDocument({readyState:'complete',sidebar:true,list:false}),x=setup(dom.document);const started=Date.now();
+ const result=await x.window.gptInspectVisiblePinnedRows({hardTimeoutMs:10000,sidebarDiagnosticRunID:'manual-no-rows'});
+ assert.equal(result.sidebarDiagnosticSummary.result,'failure');assert.equal(result.sidebarDiagnosticSummary.detectedRowCount,0);assert.ok(Date.now()-started<8500);
+ assert.ok(x.diagnostics.some(item=>item.visiblePinnedRowsStage?.stage==='document_ready'));
+});
+
+test('row scan exception returns partial failure with sanitized category and route-template scan completes with no data',async()=>{
+ const dom=visiblePinnedRowsDocument([['Unpin chat'],['Pin chat']]),x=setup(dom.document);x.window.innerWidth=1024;x.window.innerHeight=768;
+ const original=x.window.webkit.messageHandlers.starredDiagnostic.postMessage;
+ x.window.webkit.messageHandlers.starredDiagnostic.postMessage=payload=>{original(payload);if(payload.visiblePinnedRowsStage?.stage==='row_scan_started')dom.nav.querySelectorAll=()=>{throw new TypeError('PRIVATE DOM DETAIL');};};
+ const result=await x.window.gptInspectVisiblePinnedRows({maxRows:13,hardTimeoutMs:10000,sidebarDiagnosticRunID:'manual-route-error'});
+ assert.equal(result.sidebarDiagnosticSummary.result,'failure');assert.equal(result.sidebarDiagnosticSummary.exceptionCategory,'TypeError');
+ const safe=JSON.stringify(result.sidebarDiagnosticSummary);assert.equal(safe.includes('PRIVATE DOM DETAIL'),false);
+ assert.ok(x.diagnostics.some(item=>item.visiblePinnedRowsStage?.stage==='row_scan_finished'&&item.visiblePinnedRowsStage.exceptionCategory==='TypeError'));
+ assert.ok(x.diagnostics.some(item=>item.visiblePinnedRowsStage?.stage==='route_template_scan_finished'));
+ assert.equal(result.sidebarDiagnosticSummary.recognizedRouteTemplateCount,0);
+});
+
+test('manual diagnostic stage wrapper bounds a never-resolving stage before external safety timeout',async()=>{
+ const dom=stagedPreflightDocument({readyState:'complete',sidebar:true,list:false}),x=setup(dom.document);const started=Date.now();
+ const outcome=await x.window.gptBoundedDiagnosticAwait('route_template_scan',()=>new Promise(()=>{}),75);
+ assert.equal(outcome.status,'timeout');assert.equal(outcome.reason,'stage_timeout:route_template_scan');assert.ok(Date.now()-started<400);
 });
 
 test('v5.7 isolated activity probe preserves the exact captured frontend route',async()=>{
@@ -1104,6 +1155,23 @@ test('pinned-prefix waits for asynchronously inserted rows before top proof and 
  const dom=conversationReadinessDocument(),x=setup(dom.document);x.window.innerWidth=1024;x.window.innerHeight=768;x.window.requestAnimationFrame=callback=>setTimeout(callback,0);
  setTimeout(()=>{dom.add();dom.document.__notifyMutation([]);},20);
  const result=await x.window.gptInspectVisiblePinnedRows({hardTimeoutMs:500});assert.equal(result.readiness.status,'snapshot_ready');assert.equal(result.readiness.rawStatus,'ready');assert.equal(result.readiness.rowsAtFirstDetection,1);assert.equal(result.sidebarTop.proof,'top_proven');assert.equal(result.rowsInspected,1);assert.equal(result.rows[0].status,'unknown');assert.equal(result.rows[0].menuOpened,false);
+});
+test('unknown pinned-prefix rows expose only bounded structural diagnostics and remain unproven',async()=>{
+ const dom=visiblePinnedRowsDocument([[]],{includeProject:false}),x=setup(dom.document,setTimeout,Date.now,()=>({display:'block',visibility:'visible',opacity:'1'}));x.window.innerWidth=1024;x.window.innerHeight=768;
+ const anchor=dom.rows[0].anchor;anchor.attributes.push({name:'data-octane-navigation-item',value:'PRIVATE-ROW-VALUE'},{name:'aria-label',value:'PRIVATE CHAT TITLE'});
+ anchor.hasAttribute=name=>name==='data-octane-navigation-item'||name==='href';
+ const result=await x.window.gptInspectVisiblePinnedRows({hardTimeoutMs:1000});
+ assert.equal(result.pinnedPrefixStatus,'pinned_prefix_unproven');assert.equal(result.unknownCount,1);
+ assert.equal(result.unknownRowDiagnostics.length,1);const row=result.unknownRowDiagnostics[0];
+ assert.deepEqual(JSON.parse(JSON.stringify(row)),{positionIndex:1,tag:'a',routeTemplate:'/c/:id',hasHref:true,hasOctaneNavigationItem:true,dataAttributeNames:['data-octane-navigation-item'],ariaAttributeNames:['aria-label'],visible:true,conversationRouteClassification:'conversation',navigationRowClassification:'conversation_row',pinnedStarredClassification:'unknown',structuralClassification:'octane_conversation_row_variant',rejectionReason:'menu_items_missing'});
+ const encoded=JSON.stringify(result);for(const secret of ['private-chat-1','PRIVATE-ROW-VALUE','PRIVATE CHAT TITLE','/c/private-chat-1'])assert.equal(encoded.includes(secret),false);
+});
+test('known conversation rows are not reported unknown and settings navigation is excluded from the proof snapshot',async()=>{
+ const dom=visiblePinnedRowsDocument([['Unpin chat'],['Pin chat']],{includeProject:false}),x=setup(dom.document,setTimeout,Date.now,()=>({display:'block',visibility:'visible',opacity:'1'}));x.window.innerWidth=1024;x.window.innerHeight=768;
+ const complete=await x.window.gptInspectVisiblePinnedRows({hardTimeoutMs:1000});assert.equal(complete.pinnedPrefixStatus,'pinned_prefix_complete');assert.deepEqual(Array.from(complete.unknownRowDiagnostics||[]),[]);
+ const nav=visiblePinnedRowsDocument([[]],{includeProject:false}),y=setup(nav.document,setTimeout,Date.now,()=>({display:'block',visibility:'visible',opacity:'1'}));y.window.innerWidth=1024;y.window.innerHeight=768;
+ nav.rows[0].anchor.getAttribute=name=>name==='href'?'/settings':null;
+ const navigationOnly=await y.window.gptInspectVisiblePinnedRows({hardTimeoutMs:1000});assert.equal(navigationOnly.rowsInspected,0);assert.deepEqual(Array.from(navigationOnly.unknownRowDiagnostics||[]),[]);
 });
 test('pinned-prefix readiness timeout leaves top unproven without opening menus',async()=>{
  const dom=conversationReadinessDocument(),x=setup(dom.document);x.window.innerWidth=1024;x.window.innerHeight=768;
@@ -1810,4 +1878,129 @@ test('baseline membership telemetry mismatch is explicit and does not alter cont
  assert.equal(event.accepted,true);
  assert.equal(event.accepted,true);
  assert.equal(JSON.stringify(event).includes('already-known-private'),false);
+});
+
+function structureNode(tag,attributes={},children=[]){
+ const node={tagName:tag.toUpperCase(),attributes:Object.entries(attributes).map(([name,value])=>({name,value:String(value)})),children,parentElement:null,textContent:'PRIVATE CHAT TEXT',title:'PRIVATE TITLE',getAttribute(name){return Object.prototype.hasOwnProperty.call(attributes,name)?String(attributes[name]):null;}};
+ for(const child of children)child.parentElement=node;
+ node.querySelectorAll=selector=>{const selectors=selector.split(',').map(x=>x.trim()),out=[];const matches=element=>selectors.some(part=>{if(part==='a[href]')return element.tagName==='A'&&element.getAttribute('href')!==null;if(part==='button')return element.tagName==='BUTTON';if(part==='section')return element.tagName==='SECTION';if(part==='li')return element.tagName==='LI';const attr=part.match(/^\[([^\]]+)\]$/);return attr?element.getAttribute(attr[1])!==null:false;});const visit=element=>{for(const child of element.children){if(matches(child))out.push(child);visit(child);}};visit(node);return out;};
+ return node;
+}
+test('sidebar structure diagnostic normalizes dynamic route IDs and removes query/hash',async()=>{
+ const link1=structureNode('a',{href:'/g/secret-project/c/chat-secret?token=private#secret'}),link2=structureNode('a',{href:'/c/private-chat?x=secret#fragment'}),link3=structureNode('a',{href:'/project/my-private-project'});
+ const nav=structureNode('nav',{},[link1,link2,link3]),x=setup({querySelectorAll:selector=>selector==='nav,aside,[role="navigation"]'?[nav]:[]});
+ const result=await x.window.gptInspectSidebarElementStructure({hardTimeoutMs:1000});
+ assert.equal(result.status,'success');assert.deepEqual(Array.from(result.routeTemplates,item=>item.template),['/c/:id','/g/:id/c/:id','/project/:id']);
+ const serialized=JSON.stringify(result);for(const secret of ['secret-project','chat-secret','private-chat','my-private-project','token=','fragment'])assert.equal(serialized.includes(secret),false);
+});
+test('sidebar structure diagnostic returns only structural fields and never user text or attribute values',async()=>{
+ const link=structureNode('a',{href:'/c/private-id?query=secret','aria-label':'PRIVATE ARIA LABEL','data-testid':'private-testid','data-pinned':'private-value'});
+ const row=structureNode('div',{role:'listitem','data-state':'expanded'},[link]),nav=structureNode('nav',{'aria-label':'PRIVATE NAV LABEL'},[row]);
+ const x=setup({querySelectorAll:selector=>selector==='nav,aside,[role="navigation"]'?[nav]:[]});const result=await x.window.gptInspectSidebarElementStructure({hardTimeoutMs:1000});const serialized=JSON.stringify(result);
+ for(const secret of ['PRIVATE CHAT TEXT','PRIVATE TITLE','PRIVATE ARIA LABEL','PRIVATE NAV LABEL','private-id','query=secret','private-testid','private-value'])assert.equal(serialized.includes(secret),false);
+ assert.deepEqual(Array.from(result.counts.ariaAttributeNames),['aria-label']);assert.equal(result.counts.ariaAttributeCount,2);assert.equal(result.counts.dataTestID,1);assert.equal(result.counts.dataState,1);
+ assert.ok(result.rowCandidates.some(item=>item.tag==='div'&&item.role==='listitem'&&item.depth===1&&item.count===1));
+ assert.deepEqual(Array.from(result.pinnedMarkerAttributeNames),['data-pinned']);
+});
+test('sidebar structure diagnostic is bounded by a fixed node cap',async()=>{
+ const children=Array.from({length:1500},(_,index)=>structureNode(index%2?'button':'div',index%2?{'data-state':'closed'}:{}));const nav=structureNode('nav',{},children);
+ const x=setup({querySelectorAll:selector=>selector==='nav,aside,[role="navigation"]'?[nav]:[]});const result=await x.window.gptInspectSidebarElementStructure({hardTimeoutMs:1000});
+ assert.equal(result.nodeCount,1200);assert.equal(result.scanTruncated,true);assert.equal(result.reason,'node_cap');assert.ok(result.elapsedMs<=1000);
+});
+test('sidebar structure diagnostic returns a bounded empty result when no sidebar exists',async()=>{
+ const x=setup({querySelectorAll:()=>[]});const result=await x.window.gptInspectSidebarElementStructure({hardTimeoutMs:1000});
+ assert.equal(result.status,'partial');assert.equal(result.reason,'sidebar_not_found');assert.equal(result.rootCount,0);assert.deepEqual(Array.from(result.routeTemplates),[]);assert.deepEqual(Array.from(result.rowCandidates),[]);assert.ok(result.elapsedMs<=1000);
+});
+
+function octaneReadinessDocument(paths){
+ const makeAnchor=(path,attrs={})=>{const values={href:path,'data-octane-navigation-item':'',...attrs};const anchor={tagName:'A',hidden:false,attributes:Object.entries(values).map(([name,value])=>({name,value:String(value)})),parentElement:null,children:[],getAttribute:name=>Object.prototype.hasOwnProperty.call(values,name)?String(values[name]):null,hasAttribute:name=>Object.prototype.hasOwnProperty.call(values,name),getClientRects:()=>[{}],getBoundingClientRect:()=>({x:8,y:25,width:270,height:30,top:25,bottom:55,left:8,right:278}),querySelectorAll:()=>[]};Object.defineProperty(anchor,'textContent',{get(){throw Error('row classification must not read chat text');}});Object.defineProperty(anchor,'title',{get(){throw Error('row classification must not read title');}});return anchor;};
+ const nav={tagName:'NAV',hidden:false,attributes:[],parentElement:null,children:[],getAttribute:()=>null,getClientRects:()=>[{}],getBoundingClientRect:()=>({x:0,y:0,width:320,height:700,top:0,bottom:700,left:0,right:320}),contains(node){return node===this||this.children.includes(node);},querySelectorAll(selector){if(selector==='a[href]'||selector==='a[data-octane-navigation-item][href]')return this.children.filter(node=>node.tagName==='A'&&node.getAttribute('href')&&(selector==='a[href]'||node.hasAttribute('data-octane-navigation-item')));if(selector.includes('[role="list"]'))return[this];return[];}};
+ const anchors=paths.map(item=>Array.isArray(item)?makeAnchor(item[0],item[1]):makeAnchor(item));for(const anchor of anchors){anchor.parentElement=nav;nav.children.push(anchor);}
+ const doc={readyState:'complete',body:{},documentElement:{clientWidth:1024,clientHeight:768},querySelectorAll(selector){if(selector==='nav,aside,[role="navigation"],[data-testid*="sidebar"]')return[nav];if(selector==='a[href]')return anchors;return[];}};
+ return {document:doc,nav,anchors};
+}
+test('current Octane sidebar conversation routes require row attribute, sidebar context and non-navigation path',()=>{
+ const dom=octaneReadinessDocument([
+  ['/opaque-chat',{ 'data-status':'active' }],
+  ['/opaque-project/opaque-chat',{ 'data-w-component':'navigation-item' }],
+  ['/another-chat',{ 'data-status':'inactive','data-w-component':'thread-item' }],
+  ['/settings',{'data-w-component':'navigation-item'}],
+  ['/actions',{'data-octane-navigation-item':'','data-w-component':'navigation-action'}]
+ ]),x=setup(dom.document);
+ const rows=x.window.gptInspectSidebarRoutes().routes;
+ assert.deepEqual(Array.from(rows.filter(row=>row.kind==='conversation'),row=>row.template),['/<id>','/<id>/<id>','/<id>']);
+ assert.ok(rows.filter(row=>row.kind==='conversation').every(row=>row.dataAttributeNames.includes('data-octane-navigation-item')));
+ assert.equal(rows[3].kind,'unknown','/settings remains excluded even when Octane-marked');
+ assert.equal(rows[4].kind,'unknown','navigation actions remain excluded');
+});
+test('Octane single and nested conversation rows satisfy readiness without title or text inspection',async()=>{
+ const dom=octaneReadinessDocument([['/octane-chat',{ 'data-status':'active' }],['/project-key/another-chat',{ 'data-w-component':'thread-item' }]]),x=setup(dom.document);
+ const result=await x.window.gptWaitForPinnedReadinessPreflight({preflightTimeoutMs:1200});
+ assert.equal(result.readiness.status,'snapshot_ready');assert.equal(result.readiness.firstPositiveCount,2);assert.equal(result.preflight.totalConversationRouteLinks,2);
+ assert.deepEqual(Array.from(result.readiness.rows,anchor=>anchor.getAttribute('href')),['/octane-chat','/project-key/another-chat']);
+});
+test('Octane navigation actions and anchors outside sidebar do not satisfy row readiness',async()=>{
+ const dom=octaneReadinessDocument([['/settings',{ 'data-w-component':'navigation-item' }],['/actions',{ 'data-status':'active' }]]),x=setup(dom.document);
+ const result=await x.window.gptWaitForPinnedReadinessPreflight({preflightTimeoutMs:80});
+ assert.equal(result.readiness.status,'rows_never_appeared');assert.equal(result.preflight.totalConversationRouteLinks,0);
+});
+test('DOM fallback accepts only visible Octane conversation rows, excludes navigation, and deduplicates identities',()=>{
+ const dom=octaneReadinessDocument([
+  ['/chat-one',{ 'data-status':'active' }],
+  ['/project-key/chat-two',{ 'data-w-component':'thread-item' }],
+  ['/chat-one',{ 'data-status':'duplicate' }],
+  ['/settings',{ 'data-w-component':'navigation-item' }],
+  ['/actions',{ 'data-w-component':'navigation-action' }]
+ ]),x=setup(dom.document);
+ x.location.pathname='/';x.location.href='https://chatgpt.com/';
+ const result=x.window.gptCollectVisibleSidebarDOMFallback();
+ assert.equal(result.status,'ok');assert.equal(result.candidateCount,5);assert.equal(result.acceptedConversationRowCount,2);
+ assert.equal(result.rejectedNavigationRowCount,2);assert.equal(result.duplicateRowCount,1);
+ assert.deepEqual(Array.from(result.conversationIds).sort(),['chat-one','chat-two']);
+ assert.ok(!JSON.stringify(result).includes('textContent')&&!JSON.stringify(result).includes('title'));
+});
+test('DOM fallback returns bounded empty result outside home or without a sidebar',()=>{
+ const noSidebar=setup({querySelectorAll:()=>[]});noSidebar.location.pathname='/';
+ assert.equal(noSidebar.window.gptCollectVisibleSidebarDOMFallback().status,'sidebar_unavailable');
+ const wrongRoute=setup({querySelectorAll:()=>[]});
+ assert.equal(wrongRoute.window.gptCollectVisibleSidebarDOMFallback().status,'wrong_route');
+});
+
+function messageTurnDocument(turns, outside=[]) {
+ const matchSelector=(node,selector)=>selector.split(',').some(raw=>{const item=raw.trim();if(item==='*')return true;const attr=item.match(/^\[([^\]]+)\]$/);if(attr)return node.attributes?.some(value=>value.name===attr[1])===true;const role=item.match(/^\[role="([^"]+)"\]$/);if(role)return node.getAttribute('role')===role[1];return String(node.tagName||'').toLowerCase()===item.toLowerCase();});
+ const make=(tag,attrs={},children=[])=>{const node={tagName:tag.toUpperCase(),attributes:Object.entries(attrs).map(([name,value])=>({name,value})),children,parentElement:null,isConnected:true,clientHeight:500,clientWidth:600,scrollHeight:500,scrollWidth:600,scrollTop:0,getAttribute(name){return Object.hasOwn(attrs,name)?attrs[name]:null;},matches(selector){return matchSelector(node,selector);},contains(other){for(let item=other;item;item=item.parentElement)if(item===node)return true;return false;},querySelectorAll(selector){const result=[];const visit=parent=>{for(const child of parent.children||[]){if(matchSelector(child,selector))result.push(child);visit(child);}};visit(node);return result;},querySelector(selector){return node.querySelectorAll(selector)[0]||null;}};for(const child of children)child.parentElement=node;return node;};
+ const build=spec=>make(spec.tag,spec.attrs||{},(spec.children||[]).map(build));
+ const root=make('main',{role:'main'},turns.map(build));root.scrollHeight=1600;root.clientHeight=600;const body=make('body',{},[root,...outside.map(build)]);
+ const document={body,scrollingElement:null,querySelectorAll(selector){if(selector==="main, [role='main']")return [root];if(selector==='main, [role="main"]')return [root];return body.querySelectorAll(selector);},querySelector(selector){if(selector==="main, [role='main']"||selector==="main,[role='main']")return root;return null;}};
+ const attach=node=>{for(const child of node.children||[]){child.parentElement=node;attach(child);}};attach(body);
+ return {document,root,make};
+}
+
+test('current data-turn-key DOM is scoped, nested markers deduplicate, and roles use structural markers only',()=>{
+ const groups=[];
+ for(let i=0;i<5;i++){
+  const markers=i===0?[{tag:'DIV',attrs:{'data-user-message-bubble':'user-private'}}]:i===1?[{tag:'SPAN',attrs:{'data-chatgpt-agent-turn-start':'assistant-private'}}]:[];
+  const children=markers.map(marker=>({tag:marker.tag,attrs:marker.attrs,children:[]}));
+  if(i===0)children.push({tag:'DIV',attrs:{'data-turn-key':'nested-private-turn'},children:[]});
+  groups.push({tag:'DIV',attrs:{'data-turn-key':`private-turn-${i}`,'data-content-search-turn-key':`private-search-${i}`,'data-talvt-turn-state':'private-state'},children});
+ }
+ const outside=[{tag:'DIV',attrs:{'data-turn-key':'outside-private'},children:[]}];
+ // Convert lightweight specs into nodes using the fixture's element builder.
+ const built=groups.map(group=>{
+  const children=group.children.map(child=>({tag:child.tag,attrs:child.attrs,children:[]}));
+  return {tag:group.tag,attrs:group.attrs,children};
+ });
+ const external=outside.map(item=>({tag:item.tag,attrs:item.attrs,children:[]}));
+ const dom=messageTurnDocument(built,external),x=setup(dom.document);
+ assert.equal(dom.document.querySelector("main, [role='main']"),dom.root);
+ assert.equal(dom.root.querySelectorAll('[data-turn-key]').length,6);
+ const result=x.window.gptConversationTurnReadiness();
+ assert.deepEqual(JSON.parse(JSON.stringify(result)),{routeCategory:'chat',turnCount:5,userTurnCount:1,assistantTurnCount:1,unknownRoleTurnCount:3,source:'data-turn-key'});
+ const encoded=JSON.stringify(result);for(const privateValue of ['private-turn-','private-search-','private-state','user-private','assistant-private','outside-private','PRIVATE TEXT','/g/project/c/a'])assert.equal(encoded.includes(privateValue),false);
+});
+
+test('legacy message selectors remain a contextual fallback and ambiguous role stays unknown',()=>{
+ const dom=messageTurnDocument([{tag:'ARTICLE',attrs:{role:'article','data-testid':'private-testid'},children:[{tag:'DIV',attrs:{'data-user-message-bubble':'u'},children:[]}]},{tag:'DIV',attrs:{'data-conversation-role':'private-role'},children:[{tag:'DIV',attrs:{'data-user-message-bubble':'u' ,'data-chatgpt-agent-turn-start':'a'},children:[]}]}]);
+ const x=setup(dom.document),result=x.window.gptConversationTurnReadiness();
+ assert.equal(result.source,'legacy');assert.equal(result.turnCount,2);assert.equal(result.userTurnCount,1);assert.equal(result.assistantTurnCount,0);assert.equal(result.unknownRoleTurnCount,1);
 });

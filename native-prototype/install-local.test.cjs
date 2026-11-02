@@ -7,7 +7,7 @@ const { spawnSync } = require('node:child_process');
 
 const root = path.resolve(__dirname, '..');
 const installer = path.join(__dirname, 'install-local.sh');
-const stableBundle = path.join(__dirname, 'build', 'GPTLimitsNativePrototype.app');
+const stableBundle = process.env.GPT_LIMITS_TEST_APP || path.join(__dirname, 'build', 'GPTLimitsNativePrototype.app');
 const tempRoot = () => fs.mkdtempSync(path.join('/private/tmp', 'gpt-limits-install-test-'));
 const installAt = (dir, build = stableBundle) => spawnSync('sh', [installer, '--test-root', dir, '--build-app', build], { encoding: 'utf8' });
 const plist = (bundle, key) => spawnSync('/usr/libexec/PlistBuddy', ['-c', `Print :${key}`, path.join(bundle, 'Contents', 'Info.plist')], { encoding: 'utf8' }).stdout.trim();
@@ -20,7 +20,7 @@ const plist = (bundle, key) => spawnSync('/usr/libexec/PlistBuddy', ['-c', `Prin
     const installed = path.join(dir, 'GPT Limits Tool.app');
     assert.equal(plist(installed, 'CFBundleName'), 'GPT Limits Tool');
     assert.equal(plist(installed, 'CFBundleDisplayName'), 'GPT Limits Tool');
-    assert.equal(plist(installed, 'CFBundleIdentifier'), 'local.GPTLimitsTool.Feasibility');
+    assert.equal(plist(installed, 'CFBundleIdentifier'), 'com.alexandrast.gptlimitstool');
     assert.equal(plist(installed, 'CFBundleIconFile'), 'AppIcon.icns');
     assert.equal(fs.readFileSync(path.join(installed, 'Contents', 'Resources', 'AppIcon.icns')).compare(fs.readFileSync(path.join(stableBundle, 'Contents', 'Resources', 'AppIcon.icns'))), 0);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
@@ -33,7 +33,7 @@ test('installer replaces an older app while preserving external WebKit and prefe
     fs.mkdirSync(path.join(installed, 'Contents'), { recursive: true });
     fs.writeFileSync(path.join(installed, 'old-install-marker'), 'old version');
     const webkitData = path.join(dir, 'Library', 'WebKit', 'WebsiteData', 'session-preservation-fixture');
-    const preferences = path.join(dir, 'Library', 'Preferences', 'local.GPTLimitsTool.Feasibility.plist');
+    const preferences = path.join(dir, 'Library', 'Preferences', 'legacy-preferences.plist');
     fs.mkdirSync(path.dirname(webkitData), { recursive: true });
     fs.mkdirSync(path.dirname(preferences), { recursive: true });
     fs.writeFileSync(webkitData, 'preserve');
@@ -43,7 +43,7 @@ test('installer replaces an older app while preserving external WebKit and prefe
     assert.equal(fs.existsSync(path.join(installed, 'old-install-marker')), false);
     assert.equal(fs.readFileSync(webkitData, 'utf8'), 'preserve');
     assert.equal(fs.readFileSync(preferences, 'utf8'), 'preserve');
-assert.equal(plist(installed, 'GPTLimitsBuildVersion'), '5.106.0');
+    assert.equal(plist(installed, 'GPTLimitsBuildVersion'), '6.2.2');
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 

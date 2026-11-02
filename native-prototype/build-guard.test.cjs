@@ -7,7 +7,7 @@ const { spawnSync } = require('node:child_process');
 
 const root = path.resolve(__dirname, '..');
 const buildScript = path.join(root, 'native-prototype', 'build.sh');
-const stableBundle = path.join(root, 'native-prototype', 'build', 'GPTLimitsNativePrototype.app');
+const stableBundle = process.env.GPT_LIMITS_TEST_APP || path.join(root, 'native-prototype', 'build', 'GPTLimitsNativePrototype.app');
 
 function verify(bundle) {
   return spawnSync('sh', [buildScript, '--verify', bundle], { encoding: 'utf8' });
@@ -16,7 +16,7 @@ function verify(bundle) {
 test('stable bundle freshness verifier accepts the current built app', () => {
   const result = verify(stableBundle);
   assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
-assert.match(result.stdout, /Freshness check passed: v5\.106\.0/);
+  assert.match(result.stdout, /Freshness check passed: v6\.2\.2/);
 });
 
 test('freshness verifier rejects a stale bundled resource', () => {

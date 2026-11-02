@@ -158,3 +158,74 @@ test('truncated full aggregate identity telemetry is explicitly not comparable',
   assert.equal(continuation.allItemsAlreadyKnownBaseline, null);
   assert.equal(JSON.stringify([boundary, continuation]).includes('late-baseline-message'), false);
 });
+
+test('history response parsing telemetry records accepted legacy shape with sanitized schema only', async () => {
+  const f = fixture(url => Promise.resolve(response(payload('message-private'), url)));
+  f.window.gptLiveResumeFirstPassGeneration = 'generation-private';
+  f.window.gptLiveResumeCaptureGeneration = 'generation-private';
+  await f.window.fetch('https://chatgpt.com/backend-api/conversations/chat-secret/messages?cursor=private-query');
+  await drain();
+  const diagnostic = f.messages.find(item => item.responsePipeline)?.responsePipeline.responseParseDiagnostic;
+  assert.equal(diagnostic.endpointTemplate, '/backend-api/conversations/:id/messages');
+  assert.equal(diagnostic.transport, 'fetch');
+  assert.equal(diagnostic.status, 200);
+  assert.equal(diagnostic.contentTypeCategory, 'json');
+  assert.equal(diagnostic.topLevelType, 'object');
+  assert.deepEqual(Array.from(diagnostic.topLevelKeyNames), ['conversation_id', 'title', 'page_info', 'messages']);
+  assert.equal(diagnostic.expectedStructure.messagesArray, true);
+  assert.equal(diagnostic.parserAttempted, true);
+  assert.equal(diagnostic.parserAccepted, true);
+  assert.equal(diagnostic.rejectionReason, 'accepted');
+  assert.equal(diagnostic.extractedPageCount, 1);
+  assert.equal(diagnostic.extractedMessageCount, 1);
+  const serialized = JSON.stringify(diagnostic);
+  for (const secret of ['chat-secret', 'message-private', 'private-query', 'private title', 'private body', 'https://', 'generation-private']) assert.equal(serialized.includes(secret), false);
+});
+
+test('history response diagnostics distinguish changed shape and an unrecognized endpoint safely', async () => {
+  const f = fixture(url => Promise.resolve(response({ conversation_id: 'chat-secret', mapping: { private: true } }, url)));
+  f.window.gptLiveResumeFirstPassGeneration = 'generation';
+  f.window.gptLiveResumeCaptureGeneration = 'generation';
+  await f.window.fetch('https://chatgpt.com/backend-api/conversations/chat-secret/messages');
+  await drain();
+  const changed = f.messages.find(item => item.responsePipeline)?.responsePipeline.responseParseDiagnostic;
+  assert.equal(changed.parserAttempted, true);
+  assert.equal(changed.parserAccepted, false);
+  assert.equal(changed.rejectionReason, 'conversation_mapping_missing');
+  const unknown = f.window.gptSanitizeHistoryResponseDiagnostic('https://chatgpt.com/backend-api/private-route/private-id?token=secret', 'XHR', 200, 'application/json', { private: ['value'] }, { parserAttempted: true });
+  assert.equal(unknown.endpointTemplate, '/backend-api/:other');
+  assert.equal(unknown.rejectionReason, 'endpoint_not_recognized');
+  const encoded = JSON.stringify([changed, unknown]);
+  for (const secret of ['chat-secret', 'private-id', 'token=secret', 'value', 'https://']) assert.equal(encoded.includes(secret), false);
+});
+
+test('history-like endpoint outside the current parser contract is observed without invoking the parser', async () => {
+  const f = fixture(url => Promise.resolve(response({ conversations: [{ title: 'private title', id: 'private-id' }] }, url)));
+  await f.window.fetch('https://chatgpt.com/backend-api/conversation-history/private-id?cursor=secret');
+  await drain();
+  const diagnostic = f.messages.find(item => item.responsePipeline)?.responsePipeline.responseParseDiagnostic;
+  assert.equal(diagnostic.endpointTemplate, '/backend-api/:other');
+  assert.equal(diagnostic.status, 200);
+  assert.equal(diagnostic.topLevelType, 'object');
+  assert.deepEqual(Array.from(diagnostic.topLevelKeyNames), ['conversations']);
+  assert.equal(diagnostic.topLevelArrayCounts[0].count, 1);
+  assert.equal(diagnostic.parserAttempted, false);
+  assert.equal(diagnostic.parserAccepted, false);
+  assert.equal(diagnostic.rejectionReason, 'endpoint_not_recognized');
+  const serialized = JSON.stringify(diagnostic);
+  for (const secret of ['private-id', 'private title', 'cursor=secret', 'https://']) assert.equal(serialized.includes(secret), false);
+});
+
+test('history response parser exceptions are sanitized', async () => {
+  const f = fixture(url => Promise.resolve({ ok: true, status: 200, url, headers: { get: () => 'application/json' }, clone: () => ({ json: async () => { throw new Error('PRIVATE BODY AND URL'); } }) }));
+  f.window.gptLiveResumeFirstPassGeneration = 'generation';
+  f.window.gptLiveResumeCaptureGeneration = 'generation';
+  await f.window.fetch('https://chatgpt.com/backend-api/conversations/chat-secret/messages?token=private');
+  await drain();
+  const diagnostic = f.messages.find(item => item.responsePipeline)?.responsePipeline.responseParseDiagnostic;
+  assert.equal(diagnostic.parserAttempted, true);
+  assert.equal(diagnostic.parserAccepted, false);
+  assert.equal(diagnostic.rejectionReason, 'parser_exception');
+  assert.equal(diagnostic.topLevelType, 'null');
+  assert.equal(JSON.stringify(diagnostic).includes('PRIVATE'), false);
+});

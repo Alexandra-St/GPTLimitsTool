@@ -69,7 +69,8 @@
   const values={};for(const key of keys){const value=details.queryValues?.[key];if(['offset','limit'].includes(key)&&Number.isSafeInteger(value)&&value>=0)values[key]=value;else if(['is_starred','is_archived'].includes(key)&&typeof value==='boolean')values[key]=value;else if(key==='cursor')values[key]=value===null?false:true;}
   starredNetworkWindow.push({event,method:/^(GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD)$/i.test(details.method||'')?String(details.method).toUpperCase():'UNKNOWN',pathname:path,
    queryKeys:keys,queryValues:values,status:Number.isSafeInteger(details.status)?details.status:null,transport:String(details.transport||details.initiatorType||'unknown').slice(0,24),timestamp:Number.isFinite(details.timestamp)?details.timestamp:Date.now(),
-   ...(event==='shape'&&details.safeShape?{safeShape:details.safeShape}:{})});
+   ...(event==='shape'&&details.safeShape?{safeShape:details.safeShape,recognized:typeof details.recognized==='boolean'?details.recognized:null,
+    parserRejectionReason:typeof details.parserRejectionReason==='string'&&/^[a-z0-9_]{1,48}$/.test(details.parserRejectionReason)?details.parserRejectionReason:'not_evaluated'}:{})});
   if(starredNetworkWindow.length>50)starredNetworkWindow.shift();
  };
  const safeResponseShape=payload=>{
@@ -83,6 +84,26 @@
   }
   return {topLevelKeys,arrays};
  };
+ const listParserDiagnostic=(raw,payload,method)=>{
+  const info=targetInfo(raw,method);
+  if(!info)return {recognized:false,parserRejectionReason:'endpoint_not_registered'};
+  if(!payload||typeof payload!=='object'||Array.isArray(payload))return {recognized:false,parserRejectionReason:'payload_not_object'};
+  if(!Array.isArray(payload.items))return {recognized:false,parserRejectionReason:'items_not_array'};
+  return {recognized:true,parserRejectionReason:'none'};
+ };
+ const sanitizedTrafficSnapshot=events=>(Array.isArray(events)?events.slice(-50):[]).flatMap(event=>{
+  const pathname=typeof event?.pathname==='string'&&/^\/backend-api\/[A-Za-z0-9_:/.-]{1,180}$/.test(event.pathname)?event.pathname:null;
+  if(!pathname)return [];
+  const safeShape=event.safeShape&&typeof event.safeShape==='object'?event.safeShape:{};
+  const topLevelKeys=Array.isArray(safeShape.topLevelKeys)?safeShape.topLevelKeys.filter(key=>typeof key==='string'&&/^[A-Za-z0-9_]{1,64}$/.test(key)).slice(0,40):[];
+  const arrayCounts=Array.isArray(safeShape.arrays)?safeShape.arrays.flatMap(item=>typeof item?.key==='string'&&/^[A-Za-z0-9_]{1,64}$/.test(item.key)&&Number.isSafeInteger(item.count)&&item.count>=0?[{key:item.key,count:item.count}]:[]).slice(0,8):[];
+  const transport=['fetch','XHR','resource'].includes(event.transport)?event.transport:'unknown';
+  const kind=['request','response','failure','shape','resource'].includes(event.event)?event.event:'unknown';
+  const status=Number.isInteger(event.status)&&event.status>=100&&event.status<=599?event.status:null;
+  const recognized=typeof event.recognized==='boolean'?event.recognized:null;
+  const parserRejectionReason=typeof event.parserRejectionReason==='string'&&/^[a-z0-9_]{1,48}$/.test(event.parserRejectionReason)?event.parserRejectionReason:'not_evaluated';
+  return [{event:kind,pathname,transport,status,topLevelKeys,arrayCounts,recognized,parserRejectionReason}];
+ });
  const post=(event,details={})=>{
   const {rateContext:capturedRateContext,...safeDetails}=details;
   if(event==='response'&&details.status===429)recordRateLimit(details.pathname,details.status,capturedRateContext);
@@ -259,7 +280,7 @@
    hasPinned:query.hasFilter};
  };
  const responseShape=payload=>({
-  topLevelKeys:payload&&typeof payload==='object'&&!Array.isArray(payload)?Object.keys(payload).filter(x=>typeof x==='string').slice(0,40):[],
+  topLevelKeys:payload&&typeof payload==='object'&&!Array.isArray(payload)?Object.keys(payload).filter(x=>typeof x==='string'&&/^[A-Za-z0-9_]{1,64}$/.test(x)).slice(0,40):[],
   itemsType:Array.isArray(payload?.items)?'array':payload&&typeof payload==='object'?typeof payload.items:typeof payload,
   itemCount:Array.isArray(payload?.items)?payload.items.length:null,
   fieldTypes:{offset:typeof payload?.offset,limit:typeof payload?.limit,total:typeof payload?.total,cursor:typeof payload?.cursor,
@@ -271,6 +292,8 @@
   const info=targetInfo(raw,meta?.method);if(!info?.isConversationList)return;
   const path=info.pathname;
   const records=GptConversationList.sanitizeList(payload),shape=responseShape(payload);
+  const parserRejectionReason=records!==null?'none':(!payload||typeof payload!=='object'||Array.isArray(payload)?'payload_not_object':'items_not_array');
+  recordStarredNetwork('shape',{...meta,pathname:path,status:meta?.status,safeShape:safeResponseShape(payload),recognized:records!==null,parserRejectionReason});
   post('parsed',{...meta,pathname:path,recognized:records!==null,...shape});
   if(records===null)return Promise.resolve();
   const pageTimes=payload.items.map(item=>typeof item?.update_time==='string'&&/^\d{4}-\d{2}-\d{2}T/.test(item.update_time)?Date.parse(item.update_time):NaN);
@@ -521,6 +544,7 @@
  try{if(typeof PerformanceObserver==='function'){const observer=new PerformanceObserver(list=>list.getEntries().forEach(observeResource));observer.observe({type:'resource',buffered:true});}}catch{}
  window.gptMaskDiagnosticPath=maskPath;
  window.gptListDiagnosticSnapshot=snapshot;
+ window.gptEndRecentListTrafficCapture=()=>{window.gptRecentListTrafficCaptureArmed=false;return sanitizedTrafficSnapshot(window.gptEndStarredNetworkWindow?.()||[]);};
  const wrapFetch=original=>{
   if(typeof original!=='function'||original.__gptListDiagnosticWrapper)return original;
   const wrapped=function(...args){
@@ -534,7 +558,7 @@
    recordStarredNetwork('request',diagnostic);let pending;try{pending=original.apply(this,args);}catch(error){recordStarredNetwork('failure',diagnostic);throw error;}
    return pending.then(response=>{const meta={...diagnostic,status:Number.isFinite(response.status)?response.status:null};recordRootTraffic('response',raw,'fetch',meta.status);if(response.status===429)recordRateLimit(raw,429,requestRateContext);recordStarredNetwork('response',meta);
     observePassiveBackendResponse(raw,response);
-    if(likelyListDiagnosticPath(raw))try{response.clone().json().then(payload=>{finishRootDiscoveryObservation(rootObservation,meta.status,payload);recordStarredNetwork('shape',{...meta,safeShape:safeResponseShape(payload)});}).catch(()=>finishRootDiscoveryObservation(rootObservation,meta.status));}catch{finishRootDiscoveryObservation(rootObservation,meta.status);}else finishRootDiscoveryObservation(rootObservation,meta.status);return response;},error=>{recordRootTraffic('failure',raw,'fetch');finishRootDiscoveryObservation(rootObservation,null);recordStarredNetwork('failure',diagnostic);throw error;});}
+    if(likelyListDiagnosticPath(raw))try{response.clone().json().then(payload=>{finishRootDiscoveryObservation(rootObservation,meta.status,payload);recordStarredNetwork('shape',{...meta,safeShape:safeResponseShape(payload),...listParserDiagnostic(raw,payload,method)});}).catch(()=>finishRootDiscoveryObservation(rootObservation,meta.status));}catch{finishRootDiscoveryObservation(rootObservation,meta.status);}else finishRootDiscoveryObservation(rootObservation,meta.status);return response;},error=>{recordRootTraffic('failure',raw,'fetch');finishRootDiscoveryObservation(rootObservation,null);recordStarredNetwork('failure',diagnostic);throw error;});}
   const requestId=++requestSequence,meta={requestId,...info,transport:'fetch',rateContext:rateContext()};
   post('request',meta);
   observePartitionRequest(raw,meta);
@@ -580,7 +604,7 @@
   if(!info&&(!starredNetworkWindow&&!backendTrafficContext||!diagnostic)){if(!info&&isChatGPTBackendPath(raw)){this.addEventListener('load',()=>{recordRootTraffic('response',raw,'XHR',this.status);observePassiveBackendResponse(raw,this,rootObservation);},{once:true});for(const event of ['error','timeout','abort'])this.addEventListener(event,()=>{recordRootTraffic('failure',raw,'XHR');finishRootDiscoveryObservation(rootObservation,null);},{once:true});}else if(rootObservation){this.addEventListener('load',()=>{let response=this;try{if(this.responseType==='json')response={status:this.status,clone:()=>({json:async()=>this.response})};else response={status:this.status,clone:()=>({json:async()=>JSON.parse(this.responseText)})};}catch{response={status:this.status,clone:()=>({json:()=>Promise.reject(Error('invalid_json'))})};}observeSameOriginListResponse(raw,response,rootObservation);},{once:true});for(const event of ['error','timeout','abort'])this.addEventListener(event,()=>finishRootDiscoveryObservation(rootObservation,null),{once:true});}return send.apply(this,args);}
   if(!info){const requestRateContext=rateContext();recordStarredNetwork('request',diagnostic);this.addEventListener('load',()=>{const meta={...diagnostic,status:Number.isFinite(this.status)?this.status:null};recordRootTraffic('response',raw,'XHR',meta.status);if(this.status===429)recordRateLimit(raw,429,requestRateContext);recordStarredNetwork('response',meta);
     try{const payload=this.responseType==='json'?this.response:JSON.parse(this.responseText);window.gptObserveBackendResponse?.(raw,payload,this.status);}catch{window.gptObserveBackendResponse?.(raw,null,this.status);}
-    if(likelyListDiagnosticPath(raw))try{const payload=this.responseType==='json'?this.response:JSON.parse(this.responseText);finishRootDiscoveryObservation(rootObservation,meta.status,payload);recordStarredNetwork('shape',{...meta,safeShape:safeResponseShape(payload)});}catch{finishRootDiscoveryObservation(rootObservation,meta.status);}else finishRootDiscoveryObservation(rootObservation,meta.status);},{once:true});for(const event of ['error','timeout','abort'])this.addEventListener(event,()=>{recordRootTraffic('failure',raw,'XHR');finishRootDiscoveryObservation(rootObservation,null);recordStarredNetwork('failure',diagnostic);},{once:true});return send.apply(this,args);}
+    if(likelyListDiagnosticPath(raw))try{const payload=this.responseType==='json'?this.response:JSON.parse(this.responseText);finishRootDiscoveryObservation(rootObservation,meta.status,payload);recordStarredNetwork('shape',{...meta,safeShape:safeResponseShape(payload),...listParserDiagnostic(raw,payload,method)});}catch{finishRootDiscoveryObservation(rootObservation,meta.status);}else finishRootDiscoveryObservation(rootObservation,meta.status);},{once:true});for(const event of ['error','timeout','abort'])this.addEventListener(event,()=>{recordRootTraffic('failure',raw,'XHR');finishRootDiscoveryObservation(rootObservation,null);recordStarredNetwork('failure',diagnostic);},{once:true});return send.apply(this,args);}
   const requestId=++requestSequence,meta={requestId,...info,transport:'XHR',rateContext:rateContext()};post('request',meta);
   observePartitionRequest(raw,meta);
   this.addEventListener('load',()=>{
@@ -596,6 +620,7 @@
  };
  installAccessor(XMLHttpRequest.prototype,'open',wrapOpen,()=>{xhrOpenAssignments++;});
  installAccessor(XMLHttpRequest.prototype,'send',wrapSend,()=>{xhrSendAssignments++;});
+ try{if(sessionStorage.getItem('gpt-limits-inspect-recent-list-traffic')==='1'){sessionStorage.removeItem('gpt-limits-inspect-recent-list-traffic');window.gptRecentListTrafficCaptureArmed=true;window.gptBeginStarredNetworkWindow?.();}}catch{}
  try{if(typeof window.gptListCycleConfig?.token==='string')post('root_hook_health',rootDiscoveryState(window.gptListCycleConfig.token));}catch{}
  try{setTimeout(snapshot,15000);}catch{}
 })();

@@ -2,9 +2,47 @@ import AppKit
 import WebKit
 import UserNotifications
 extension Prototype {
- func saveCycle() { if let data=try? JSONEncoder().encode(cycleState) {UserDefaults.standard.set(data,forKey:"nativeCycleStateV1")} }
+ func migrateBundleIdentityDefaultsAtStartup()->String {
+  let defaults=UserDefaults.standard
+  guard let currentDomainName=Bundle.main.bundleIdentifier,!currentDomainName.isEmpty else {
+   return "failed · current_bundle_id_unavailable"
+  }
+  let current=defaults.persistentDomain(forName:currentDomainName) ?? [:]
+  let legacy=defaults.persistentDomain(forName:legacyBundleIdentityDefaultsDomain) ?? [:]
+  let plan=bundleIdentityMigrationPlan(legacy:legacy,current:current)
+  if let failure=plan.failureReason {
+   defaults.set(failure,forKey:bundleIdentityMigrationFailureKey)
+   _=defaults.synchronize()
+   return "failed · \(failure)"
+  }
+  for (key,value) in plan.valuesToWrite {defaults.set(value,forKey:key)}
+  _=defaults.synchronize()
+  let saved=defaults.persistentDomain(forName:currentDomainName) ?? [:]
+  let writesVerified=plan.valuesToWrite.allSatisfy {key,value in
+   guard let persisted=saved[key] else{return false}
+   if let expected=value as? Data,let actual=persisted as? Data {return expected==actual}
+   return (persisted as? NSObject)?.isEqual(value) ?? false
+  }
+  guard writesVerified else {
+   let failure="destination_write_verification_failed"
+   defaults.set(failure,forKey:bundleIdentityMigrationFailureKey);_=defaults.synchronize()
+   return "failed · \(failure)"
+  }
+  defaults.removeObject(forKey:bundleIdentityMigrationFailureKey)
+  if plan.shouldSetCompletionMarker {
+   defaults.set(true,forKey:bundleIdentityMigrationMarkerKey)
+   _=defaults.synchronize()
+   guard defaults.persistentDomain(forName:currentDomainName)?[bundleIdentityMigrationMarkerKey] as? Bool == true else {
+    let failure="completion_marker_write_failed"
+    defaults.set(failure,forKey:bundleIdentityMigrationFailureKey);_=defaults.synchronize()
+    return "failed · \(failure)"
+   }
+  }
+  return plan.status.rawValue
+ }
+ func saveCycle() { if let data=try? JSONEncoder().encode(cycleState) {UserDefaults.standard.set(data,forKey:nativeCycleStateDefaultsKey)} }
  func restoreCycle() {
-  if let data=UserDefaults.standard.data(forKey:"nativeCycleStateV1"),let saved=try? JSONDecoder().decode(CycleState.self,from:data){cycleState=saved}
+  if let data=UserDefaults.standard.data(forKey:nativeCycleStateDefaultsKey),let saved=try? JSONDecoder().decode(CycleState.self,from:data){cycleState=saved}
   let nowMs=Date().timeIntervalSince1970*1000
   _=reconcilePersistentUncertainState(nowMs:nowMs)
   let previousCoverageComplete=cycleState.lastCoverageStatus == .completeAccount || cycleState.lastCoverageStatus == .completeNonArchived
@@ -77,6 +115,8 @@ extension Prototype {
   let discoveryLine="Discovery: \(visibleDiscoveryLabel)\nLast successful discovery: \(successfulDiscovery)\nHTTP 429 stops this cycle; the next normal tick performs fresh discovery"
   let activeCheck=cycleRunning ? chatCheckTelemetry?.report(ordinal:cycleCurrentChatCheckOrdinal,terminal:"in_progress") : nil
   let checkDetails=(activeCheck.map{"\nActive per-chat check:\n"+$0} ?? "")+(chatCheckReports.isEmpty ? "" : "\nPer-chat checks:\n"+chatCheckReports.joined(separator:"\n"))
+  lastChatCheckTraceOutput.stringValue=cycleState.lastChatCheckTrace?.displayText ?? "Last standard chat check trace: not recorded"
+  updateCurrentCycleSummary()
   cycleOutput.stringValue="Automatic checks: \(cycleState.enabled ? "On":"Off") · Interval: 30 min\n\(cycleRunning ? "Cycle running… \(cyclePhase)":cycleState.lastStatus)\n\(discoveryLine)\nNext cycle: \(nextLabel)\n"+cycleCoverageReport+checkDetails
   updateRuntimeIdentity()
   renderUserUI()
@@ -191,6 +231,29 @@ extension Prototype {
    "ageMinMinutes":ages.min().map{Int($0.rounded())} as Any? ?? NSNull(),
    "ageMaxMinutes":ages.max().map{Int($0.rounded())} as Any? ?? NSNull(),
    "source":"ChatRecord.lastSeenUpdatedAt","sourceProvenanceAvailable":true]
+ }
+ func collectVisibleSidebarDOMFallbackIfNeeded() async -> Bool {
+  guard cycleValidListResponses==0,!cycleRootResponseReceived,!discoveryRateLimited(Array(cycleRootStatuses)),
+        cycleRootPostflight["routeTemplate"] as? String == "/",
+        backgroundRenderLeaseReadiness["ready"] as? Bool == true,
+        ((backgroundRenderLeaseReadiness["firstPositiveCount"] as? NSNumber)?.intValue ?? 0) > 0,
+        ((backgroundRenderLeaseReadiness["finalStableCount"] as? NSNumber)?.intValue ?? 0) > 0,
+        backgroundRenderLeaseReadiness["sidebarRegionFound"] as? Bool == true else {return false}
+  guard let raw=try? await evaluateForCycle("window.gptCollectVisibleSidebarDOMFallback?.()||null"),
+        let result=raw as? [String:Any],result["status"] as? String == "ok" else {return false}
+  func count(_ key:String)->Int {max(0,min(10_000,(result[key] as? NSNumber)?.intValue ?? 0))}
+  let rawIDs=result["conversationIds"] as? [String] ?? []
+  let ids=Array(Set(rawIDs.filter{$0.range(of:"^[A-Za-z0-9-]{1,128}$",options:.regularExpression) != nil})).sorted().prefix(200)
+  cycleDOMCandidateCount=count("candidateCount")
+  cycleDOMAcceptedRowCount=ids.count
+  cycleDOMRejectedNavigationRowCount=count("rejectedNavigationRowCount")
+  cycleDOMDuplicateRowCount=count("duplicateRowCount")
+  guard !ids.isEmpty else{return false}
+  cycleDOMFallbackIds=Set(ids)
+  cycleDiscoverySource="dom_fallback"
+  cycleIds.formUnion(ids)
+  cycleRootStallDetail="dom_fallback_visible_sidebar_rows_only"
+  return true
  }
  func rootSidebarMetadataLine()->String {
   let metadata=cycleRootPostflight["sidebarMetadata"] as? [String:Any] ?? [:]
@@ -391,6 +454,7 @@ extension Prototype {
   lines.append(rootDiscoveryProvenanceLine())
   lines.append(rootDocumentTelemetryLine())
   lines.append(rootSidebarMetadataLine())
+  lines.append("Discovery source: \(cycleDiscoverySource) · DOM candidates \(cycleDOMCandidateCount) · accepted conversation rows \(cycleDOMAcceptedRowCount) · rejected navigation rows \(cycleDOMRejectedNavigationRowCount) · duplicate rows \(cycleDOMDuplicateRowCount) · coverage reason \(cycleRootStallDetail ?? "network_coverage")")
   lines.append("Root diagnostics: requests \(cycleRootRequests) · responses \(cycleRootResponses) · recognized \(cycleRootRecognized) · valid root pages before rate limit \(validRootPages) · resource timing \(cycleRootResources) · HTTP [\(cycleRootStatuses.sorted().map(String.init).joined(separator:","))]")
   lines.append(rootPaginationStallLine())
   for (index,observation) in observations.enumerated() {
@@ -439,11 +503,47 @@ extension Prototype {
   cyclePhase="Chat \(cycleCurrentChatCheckOrdinal): \(stage)"
   renderCycle()
  }
+ func recordPersistedChatCheckTrace(stage:ChatCheckTraceStage,result:ChatCheckTraceResult,reason:ChatCheckTraceReason,generation:String?=nil,url:URL?=nil,at:Date=Date()) {
+  if let generation,chatCheckTraceGeneration != generation {return}
+  cycleState.appendChatCheckTrace(stage:stage,result:result,route:sanitizedChatCheckRoute(url ?? web.url),reason:reason,at:at)
+  saveCycle();lastChatCheckTraceOutput.stringValue=cycleState.lastChatCheckTrace?.displayText ?? "Last standard chat check trace: not recorded"
+ }
+ func finishPersistedChatCheckTrace(terminalResult:String,expectedConversationID:String,generation:String) {
+  guard chatCheckTraceGeneration==generation else{return}
+  let trace=cycleState.lastChatCheckTrace
+  let stages=Set(trace?.events.map{$0.stage} ?? [])
+  let now=Date(),route=sanitizedChatCheckRoute(web.url)
+  if !stages.contains(.navigationFinished) {
+   recordPersistedChatCheckTrace(stage:.navigationFinished,result:.failure,reason:.navigationNotFinished,generation:generation,at:now)
+  }
+  if !stages.contains(.conversationRouteObserved) {
+   let matched=conversationID(in:web.url)==expectedConversationID
+   recordPersistedChatCheckTrace(stage:.conversationRouteObserved,result:matched ? .success:.failure,
+    reason:matched ? .expectedRoute:(route.template=="home" ? .unexpectedRoute:.conversationRouteNotObserved),generation:generation,at:now)
+  }
+  if !stages.contains(.documentReady) {
+   recordPersistedChatCheckTrace(stage:.documentReady,result:.failure,reason:.documentReadyNotObserved,generation:generation,at:now)
+  }
+  if !stages.contains(.historyWaitStarted) {
+   recordPersistedChatCheckTrace(stage:.historyWaitStarted,result:.failure,reason:.historyWaitNotStarted,generation:generation,at:now)
+  }
+  if !stages.contains(.historyResponseObserved) {
+   recordPersistedChatCheckTrace(stage:.historyResponseObserved,result:.failure,reason:.historyResponseNotObserved,generation:generation,at:now)
+  }
+  if !stages.contains(.historyRowsObserved) {
+   recordPersistedChatCheckTrace(stage:.historyRowsObserved,result:.failure,reason:.historyRowsNotObserved,generation:generation,at:now)
+  }
+  recordPersistedChatCheckTrace(stage:.terminalResult,
+   result:chatCheckTraceTerminalReason(terminalResult) == .terminalComplete || chatCheckTraceTerminalReason(terminalResult) == .terminalPartial ? .success:.failure,
+   reason:chatCheckTraceTerminalReason(terminalResult),generation:generation,at:Date())
+  chatCheckTraceGeneration=nil
+ }
  func recordChatCheckHistoryRequest(_ data:[String:Any]) {
   guard var telemetry=chatCheckTelemetry,
         data["generation"] as? String == automationToken,
         data["owner"] as? String == "scheduler_conversation_check" else{return}
   telemetry.historyRequests += 1
+  cycleState.recordObservedHistoryRequest()
   telemetry.timing.recordHistoryRequest(at:Date())
   if telemetry.continuationSelected {
    telemetry.continuationHistoryRequests += 1
@@ -454,7 +554,21 @@ extension Prototype {
   }
   if telemetry.historyRequests==1 {telemetry.pagination.begin()}
   chatCheckTelemetry=telemetry
+  cycleState.observePerChatHistoryDiagnostic(telemetry)
+  saveCycle()
   renderCycle()
+ }
+ func recordChatCheckDOMTurnEvidence(_ data:[String:Any]) {
+  guard var telemetry=chatCheckTelemetry,data["routeCategory"] as? String=="chat",
+        telemetry.operationGeneration==automationToken else{return}
+  func safeCount(_ key:String)->Int {max(0,min(5000,(data[key] as? NSNumber)?.intValue ?? 0))}
+  let turns=safeCount("turnCount"),users=safeCount("userTurnCount"),assistants=safeCount("assistantTurnCount"),unknown=safeCount("unknownRoleTurnCount")
+  guard users+assistants+unknown<=turns else{return}
+  let changed=telemetry.renderedDOMTurnCount != turns || telemetry.renderedDOMUserTurnCount != users || telemetry.renderedDOMAssistantTurnCount != assistants || telemetry.renderedDOMUnknownRoleTurnCount != unknown
+  telemetry.renderedDOMTurnCount=turns;telemetry.renderedDOMUserTurnCount=users;telemetry.renderedDOMAssistantTurnCount=assistants;telemetry.renderedDOMUnknownRoleTurnCount=unknown
+  chatCheckTelemetry=telemetry
+  cycleState.observePerChatHistoryDiagnostic(telemetry)
+  if changed {renderCycle()}
  }
  func recordChatCheckContinuationResponse(_ data:[String:Any]) {
   guard var telemetry=chatCheckTelemetry,telemetry.continuationSelected,
@@ -520,6 +634,8 @@ extension Prototype {
                                         knownPageMessageCount:update.pageKnownMessageCount ?? 0,
                                         olderHistoryProgressObserved:update.newHistoryProgress==true,
                                         pageFingerprint:update.pageFingerprint,pageReplay:update.pageReplay,now:now)
+  recordPersistedChatCheckTrace(stage:.historyRowsObserved,result:update.state.messagesCollected>0 ? .success:.failure,
+   reason:update.state.messagesCollected>0 ? .historyRowsObserved:.historyRowsEmpty,generation:update.token,at:now)
   if telemetry.continuationSelected {
    telemetry.timing.recordContinuationAggregateProgress(olderUniqueMessages:update.olderUniqueMessageCount ?? 0,at:now)
   } else {
@@ -533,6 +649,7 @@ extension Prototype {
   telemetry.recordAcceptedPageUpdate(update.received)
   telemetry.messagesAccumulated=update.state.messagesCollected
   telemetry.hasPreviousPage=update.state.hasPreviousPage
+  telemetry.historyComplete=update.state.historyComplete
   telemetry.documentIdentity=update.documentIdentity ?? telemetry.documentIdentity
   telemetry.paginationFrontierTimestamp=update.paginationFrontierTimestamp ?? telemetry.paginationFrontierTimestamp
   telemetry.olderUniqueMessageCount=max(telemetry.olderUniqueMessageCount,update.olderUniqueMessageCount ?? 0)
@@ -548,7 +665,11 @@ extension Prototype {
    }
   }
   telemetry.paginationNoProgressTriggered=telemetry.pagination.shouldStopForNoProgress
+  telemetry.checkProgress.observeNativePage(newlyAddedMessages:page.newlyAddedMessages,
+   hasPreviousPage:update.state.hasPreviousPage,
+   paginationProgressObserved:telemetry.pagination.currentlyProgressing || page.replayProgressObserved || page.olderHistoryProgressObserved)
   chatCheckTelemetry=telemetry
+  cycleState.observePerChatHistoryDiagnostic(telemetry)
   if cycleRunning,let id=chatCheckExpectedConversationID,id==update.state.conversationId,
      update.state.hasPreviousPage==true,
      update.state.messagesCollected > (cycleState.records[id]?.aggregate?.messagesCollected ?? 0),
@@ -580,6 +701,9 @@ extension Prototype {
         let family=data["endpointFamily"] as? String,
         ["conversation_messages","conversation_detail"].contains(family) else{return}
   telemetry.historyResponses += 1
+  cycleState.recordObservedHistoryResponse()
+  let traceResponse=chatCheckTraceHistoryResponseReason(status:(data["httpStatus"] as? NSNumber)?.intValue)
+  recordPersistedChatCheckTrace(stage:.historyResponseObserved,result:traceResponse.0,reason:traceResponse.1,generation:automationToken)
   telemetry.timing.recordHistoryResponse(at:Date())
   if telemetry.continuationSelected {
    telemetry.continuationHistoryResponses += 1
@@ -593,7 +717,26 @@ extension Prototype {
   if status>0 {telemetry.httpStatuses.insert(status)}
   if status==429 {telemetry.rateLimitSeen=true}
   chatCheckTelemetry=telemetry
+  cycleState.observePerChatHistoryDiagnostic(telemetry)
+  saveCycle()
   renderCycle()
+ }
+ func recordChatCheckHistoryResponseParsing(_ data:[String:Any]) {
+  let eventGeneration=data["generation"] as? String
+  let telemetryGeneration=chatCheckTelemetry?.operationGeneration
+  if let rejection=historyProgressEventRejectionReason(eventGeneration:eventGeneration,activeGeneration:automationToken,telemetryGeneration:telemetryGeneration) {
+   cycleState.recordHistoryProgressEventRejection(rejection)
+   saveCycle();updateCurrentCycleSummary()
+   return
+  }
+  guard var telemetry=chatCheckTelemetry else{return}
+  let entry=HistoryResponseParseEntry.make(data)
+  telemetry.checkProgress.observeParsedResponse(entry)
+  if let hasPreviousPage=entry.hasPreviousPage {telemetry.hasPreviousPage=hasPreviousPage}
+  chatCheckTelemetry=telemetry
+  cycleState.recordHistoryResponseParsing(entry)
+  cycleState.observePerChatHistoryDiagnostic(telemetry)
+  saveCycle();updateCurrentCycleSummary()
  }
  func cycleProvenanceSummary(now:Double=Date().timeIntervalSince1970*1000)->String {
   let records=Array(cycleState.records.values),summary=cachedActivityProvenanceSummary(records,now:now)
@@ -663,6 +806,9 @@ extension Prototype {
   beginBackgroundFocusObservation()
   cycleRiskNotificationsGenerated=0;cycleRiskNotificationsSuppressed=0
   chatCheckReports=[];chatCheckReportSnapshots=[:];cycleChatTerminalResults=[];chatCheckTelemetry=nil;cycleFreshRiskCounts=["Normal":0,"Watch":0,"Near":0,"Critical":0,"Unknown":0]
+  cycleState.perChatHistoryDiagnostics=PerChatHistoryDiagnostics()
+  cycleState.lastPinnedUnknownRows=[]
+  cycleState.historyProgressEventRejections=HistoryProgressEventRejectionState()
   cycleProvenanceBefore=cycleProvenanceSummary()
   cycleToken=UUID().uuidString;cycleScriptSecret=UUID().uuidString+UUID().uuidString
   cycleState.lastCycleGeneration=cycleToken;cycleState.lastCycleNotificationsAccepted=0;cycleState.lastCycleNotificationsSuppressed=0
@@ -697,6 +843,7 @@ extension Prototype {
    do {
     cycleState.discoveryStatus = .inProgress
     cycleDiscovering=true;cycleIds=[];cycleListVersion=0;cycleValidListResponses=0;cycleRootResponseReceived=false
+    cycleDiscoverySource="network";cycleDOMCandidateCount=0;cycleDOMAcceptedRowCount=0;cycleDOMRejectedNavigationRowCount=0;cycleDOMDuplicateRowCount=0;cycleDOMFallbackIds=[]
     cycleRootStallDetail=nil;cycleRootLastPageRelativeMs=nil;cycleRootLastPageOffset=nil;cycleRootLastPageNewIdentities=0;cycleRootAcceptedPageEvents=[]
     cycleRootLastIdentityProgressRelativeMs=nil;cycleRootLastIdentityProgressOffset=nil
     cycleRootRequests=0;cycleRootResponses=0;cycleRootRecognized=0;cycleRootResources=0;cycleRootResourceResponses=0;cycleRootStatuses=[];cycleRootResourceStatuses=[]
@@ -780,6 +927,9 @@ extension Prototype {
      } catch {cycleRootPostflight=["postflightError":"evaluation_failed"]}
     } else {cycleRootPostflight=["postflightError":"snapshot_script_unavailable"]}
     await enrichNativeRootSidebarCacheSummary()
+    if await collectVisibleSidebarDOMFallbackIfNeeded() {
+     stallDetail="dom_fallback_visible_sidebar_rows_only"
+    }
     refreshCycleRootNavigationSnapshot()
     cycleRootTerminalReason=cycleRootTerminalReasonForCurrentState()
     updatePartitionReport()
@@ -858,7 +1008,14 @@ extension Prototype {
      let content=riskNotificationContent(level:level,chatTitle:record.title,showChatTitle:showChatTitlesInNotifications(storedValue:UserDefaults.standard.object(forKey:showChatTitlesInNotificationsDefaultsKey) as? Bool))
      submitMonitoredNotification(kind:"risk",level:level,body:content.body,conversationID:record.conversationId)
     }
-    let queue=cycleState.queue(recent);var checked=0;var continuationUsed=false,cycleBudgetSkipped=0
+    var checkCandidatesByID=Dictionary(uniqueKeysWithValues:recent.map{($0.conversationId,$0)})
+    for id in cycleDOMFallbackIds {
+     if checkCandidatesByID[id]==nil {
+      checkCandidatesByID[id]=cycleState.records[id] ?? ChatRecord(conversationId:id,title:"Chat",lastSeenUpdatedAt:0,lastSeenUpdatedAtSource:.legacyUnknown)
+     }
+    }
+    let checkCandidates=Array(checkCandidatesByID.values)
+    let queue=cycleState.queue(checkCandidates);var checked=0;var continuationUsed=false,cycleBudgetSkipped=0
     for record in queue {
      try Task.checkCancellation()
      if Date()>=cycleHardDeadline {cycleBudgetSkipped=queue.count-checked;break}
@@ -909,7 +1066,7 @@ extension Prototype {
        aggregate:saved.aggregate ?? firstProgress.state,firstPassPages:firstTelemetry.pagesObserved,firstPassPageUpdateCallbacks:firstTelemetry.automationPageUpdateCallbacks,firstPassMessages:firstProgress.state.messagesCollected,
        firstPassHistoryRequests:firstTelemetry.historyRequests,firstPassHistoryResponses:firstTelemetry.historyResponses,
        replayProgressObserved:firstTelemetry.pagination.replayProgressObserved,newHistoryProgressObserved:firstTelemetry.pagination.olderHistoryProgressObserved,
-       hasPreviousPage:firstProgress.state.hasPreviousPage==true,timing:timing)
+       hasPreviousPage:firstProgress.state.hasPreviousPage==true,historyProgress:firstTelemetry.checkProgress,timing:timing)
       let initialGeneration=firstTelemetry.operationGeneration ?? ""
       _=clearChatCheckState(ownerGeneration:initialGeneration,caller:"continuation handoff")
       var workerStopped=initialGeneration.isEmpty
@@ -988,24 +1145,36 @@ extension Prototype {
         } else if inferredPriorRank != nil {cycleRiskNotificationsSuppressed+=1}
         if let old=inferredPriorRank,let rank=assessment.rank,rank<old {saved.lastNotifiedRiskRank=nil}
         saved.lastRiskRank=assessment.rank
-       } else if measurement == .partial {cycleRiskNotificationsSuppressed+=1}
+       }
       } else {cycleFreshRiskCounts["Unknown",default:0] += 1}
      case .failure(let error):
       if error is IsolatedCheckError {
        let subtype=chatCheckTelemetry?.timeoutSubtype ?? "unknown_stage"
        let budgetTimeout=checkBudget.snapshot().finalTimeoutType
-       saved.lastCheckResult="Timed out · per_chat_timeout · \(subtype) · \(budgetTimeout)"
-       if let progress=automationUpdate,progress.token==chatCheckTelemetry?.operationGeneration,
-          progress.state.messagesCollected >= (saved.aggregate?.messagesCollected ?? 0) {
-        saved.aggregate=progress.state
+       let telemetry=chatCheckTelemetry
+       let latestUpdate=(chatCheckTerminalUpdate ?? automationUpdate).flatMap{$0.token==telemetry?.operationGeneration ? $0:nil}
+       let partialAggregate=timeoutProgressPartialAggregate(existing:saved.aggregate,candidate:latestUpdate?.state,
+        hasPreviousPage:telemetry?.checkProgress.hasPreviousPage,
+        acceptedPages:telemetry?.checkProgress.acceptedParsedPages ?? 0,pageUpdateCallbacks:telemetry?.checkProgress.pageUpdateCallbacks ?? 0,
+        producedMessages:max(telemetry?.checkProgress.producedMessages ?? 0,telemetry?.checkProgress.uniqueMessagesProduced ?? 0),
+        paginationProgressObserved:telemetry?.checkProgress.paginationProgressObserved ?? false,
+        completionProven:telemetry?.checkProgress.historyCompleteProven ?? false)
+       let terminal:String
+       if let partialAggregate {
+        saved.aggregate=partialAggregate
         saved.partialObservedActivityAt=record.lastSeenUpdatedAt
-        saved.paginationBoundaryMessageCount=progress.state.messagesCollected
+        saved.paginationBoundaryMessageCount=partialAggregate.messagesCollected
+        terminal="Partial · pagination_progressing · per_chat_timeout · \(budgetTimeout)"
+        saved.lastCheckResult=terminal
+       } else {
+        terminal="Timed out · per_chat_timeout · \(subtype) · \(budgetTimeout)"
+        saved.lastCheckResult=terminal
        }
        saved.consecutiveIncompleteChecks+=1
        // Detach this generation before the next chat starts; late worker cleanup
        // will be rejected by the same generation check.
        _=clearChatCheckState(ownerGeneration:chatCheckTelemetry?.operationGeneration ?? "",caller:"timeout handler")
-       finishChatCheckReport(terminal:"per_chat_timeout · \(subtype) · \(budgetTimeout)",ordinal:checked)
+       finishChatCheckReport(terminal:terminal,ordinal:checked)
        cycleFreshRiskCounts["Unknown",default:0] += 1
       }
       else {
@@ -1013,6 +1182,14 @@ extension Prototype {
        saved.consecutiveIncompleteChecks+=1
        finishChatCheckReport(terminal:"Failed · check_error",ordinal:checked)
       }
+     }
+     let finalMeasurement=riskMeasurementStatus(result:saved.lastCheckResult,aggregate:saved.aggregate)
+     if let aggregate=saved.aggregate,finalMeasurement != .complete {
+      let model=buildRiskModel(samples:personalRiskSamples(replacing:saved))
+      if let level=incompleteRiskNotificationNeeded(measurement:finalMeasurement,lastAcceptedRank:saved.lastNotifiedRiskRank,lowerBoundTokens:aggregate.estimatedTextTokens,model:model),
+         let content=partialRiskNotificationContent(level:level) {
+       submitMonitoredNotification(kind:"risk",level:level,body:content.body,conversationID:saved.conversationId)
+      } else {cycleRiskNotificationsSuppressed+=1}
      }
      let warningNow=Date().timeIntervalSince1970*1000
      let warningModel=buildRiskModel(samples:personalRiskSamples(replacing:saved))
@@ -1023,7 +1200,10 @@ extension Prototype {
       if saved.uncertainSince == nil {saved.uncertainSince=saved.lastCheckAt ?? warningNow}
       if let acknowledged=saved.uncertainAcknowledgedAt,saved.lastSeenUpdatedAt>acknowledged {saved.uncertainAcknowledgedAt=nil}
      }
-     cycleState.records[record.conversationId]=saved;saveCycle();chatCheckBudgetController=nil
+     let terminal=saved.lastCheckResult ?? "Failed · check_error"
+     cycleState.finishPerChatHistoryDiagnostic(terminal:terminal,telemetry:chatCheckTelemetry)
+     finishPersistedChatCheckTrace(terminalResult:terminal,expectedConversationID:record.conversationId,generation:chatCheckTraceGeneration ?? "")
+     cycleState.records[record.conversationId]=saved;saveCycle();updateCurrentCycleSummary();chatCheckBudgetController=nil
     }
     cycleState.lastCoverageStatus=composite.status;cycleState.lastCoverageDetail=composite.detail
     cycleState.lastCoverageCutoff=cycleCutoffTimestamp
@@ -1033,7 +1213,7 @@ extension Prototype {
     let freshRisk=cycleFreshRiskCounts.map{"\($0.key) \($0.value)"}.sorted().joined(separator:", ")
     let summary=CycleChatOutcomeCounts(finalPerChatResults:cycleChatTerminalResults,freshRiskCounts:cycleFreshRiskCounts)
     let riskModel=currentRiskModel().source.rawValue
-    cycleState.lastStatus="Last cycle: \(Date().formatted(date:.omitted,time:.shortened))\nCoverage: \(coverageDisplayLabel(composite)) · \(composite.detail)\nCoverage scope: \(composite.scope)\nCombined unique: \(cycleIds.count) · recent: \(recent.count)\nChecked: \(summary.checked) · Complete: \(summary.complete) · Failed: \(summary.failed) · Partial: \(summary.partial) · Skipped unchanged: \(recent.count-queue.count) · Skipped cycle budget: \(cycleBudgetSkipped)\nFresh risk (current cycle, \(riskModel)): \(freshRisk)\nNotifications generated/suppressed: \(cycleRiskNotificationsGenerated)/\(cycleRiskNotificationsSuppressed)\nProvenance before: \(cycleProvenanceBefore)\nProvenance after: \(cycleProvenanceSummary())\nRender lease cleanup: \(renderLeaseCleanupSummary)"
+    cycleState.lastStatus="Last cycle: \(Date().formatted(date:.omitted,time:.shortened))\nCoverage: \(coverageDisplayLabel(composite)) · \(composite.detail)\nCoverage scope: \(composite.scope)\nDiscovery source: \(cycleDiscoverySource) · DOM candidates \(cycleDOMCandidateCount) · accepted conversation rows \(cycleDOMAcceptedRowCount) · rejected navigation rows \(cycleDOMRejectedNavigationRowCount) · coverage reason \(composite.detail)\nCombined unique: \(cycleIds.count) · recent: \(recent.count)\nChecked: \(summary.checked) · Complete: \(summary.complete) · Failed: \(summary.failed) · Partial: \(summary.partial) · Skipped unchanged: \(max(0,checkCandidates.count-queue.count)) · Skipped cycle budget: \(cycleBudgetSkipped)\nFresh risk (current cycle, \(riskModel)): \(freshRisk)\nNotifications generated/suppressed: \(cycleRiskNotificationsGenerated)/\(cycleRiskNotificationsSuppressed)\nProvenance before: \(cycleProvenanceBefore)\nProvenance after: \(cycleProvenanceSummary())\nRender lease cleanup: \(renderLeaseCleanupSummary)"
    } catch {
     cycleState.discoveryStatus = .incomplete
     cycleState.lastCoverageStatus = .incompleteStall
@@ -1063,6 +1243,7 @@ extension Prototype {
   let result:[String:Any]=cyclePinnedResult ?? ["stopReason":"pinned_prefix_result_timeout","pinnedPrefixReason":"pinned_prefix_result_timeout","readiness":["status":"timeout","terminalReason":"pinned_prefix_result_timeout"],"traversalTerminal":["stage":"native_result_wait","internalReason":"pinned_prefix_result_timeout","rowIndex":NSNull(),"processedCount":0,"semanticSnapshotValid":NSNull(),"scrollAttempted":false,"menuCleanupResult":"not_run","leaseValid":backgroundRenderLeaseOwner==renderLeaseOwner,"timeout":true,"cancelled":false]],top=result["sidebarTop"] as? [String:Any] ?? [:]
   let readiness=result["readiness"] as? [String:Any] ?? [:],preflight=result["preflight"] as? [String:Any] ?? [:]
   let rows=result["rows"] as? [[String:Any]] ?? [],statuses=rows.compactMap{$0["status"] as? String}
+  cycleState.lastPinnedUnknownRows=Array((result["unknownRowDiagnostics"] as? [[String:Any]] ?? []).prefix(PinnedUnknownRowDiagnostic.maxRows)).compactMap(PinnedUnknownRowDiagnostic.make)
   let records=result["pinnedRecords"] as? [[String:Any]] ?? []
   var resolved=0,recent=0,sources=[String](),activityFailures=[String]()
   let pinnedCount=result["pinnedCount"] as? Int ?? 0
@@ -1140,6 +1321,7 @@ extension Prototype {
   let snapshotStageText=snapshotStages.map{stage in "\(stage["stage"] ?? "unknown") rows \(stage["rowCount"] ?? "?") identities \(stage["identityCount"] ?? "?") set \(stage["setFingerprint"] ?? "?") order \(stage["orderFingerprint"] ?? "?")"}.joined(separator:" → ")
   let snapshotChangeText=firstSnapshotChange.isEmpty ? "none" : "\(firstSnapshotChange["stage"] ?? "unknown") · before \(firstSnapshotChange["previousRowCount"] ?? "?") rows/\(firstSnapshotChange["previousIdentityCount"] ?? "?") identities · after \(firstSnapshotChange["currentRowCount"] ?? "?") rows/\(firstSnapshotChange["currentIdentityCount"] ?? "?") identities · set changed \(firstSnapshotChange["setChanged"] as? Bool == true ? "yes":"no") · order changed \(firstSnapshotChange["orderChanged"] as? Bool == true ? "yes":"no") · added \(firstSnapshotChange["addedCount"] ?? "?") · removed \(firstSnapshotChange["removedCount"] ?? "?") · reordered \(firstSnapshotChange["reordered"] as? Bool == true ? "yes":"no") · preceding action \(firstSnapshotChange["precedingAction"] ?? "unknown")"
   cyclePinnedReport="Production pinned-prefix telemetry: render lease acquired \(leaseAcquired ? "yes":"no") · render surface active \(renderSurfaceActive ? "yes":"no") · lease held through result \(leaseActiveAfter ? "yes":"no")\nSidebar candidates \(sidebarCandidates) · active candidate \(activeSidebarOrdinal.map(String.init) ?? "none") · inactive candidates \(inactiveSidebarCandidates) · duplicate conversation rows across candidates \(duplicateRows) · list-region candidates \(listCandidates)\nActive list context \(activeContext) · rows outside active context \(rowsOutsideContext) · first conversation links \(firstRows) · stable conversation links \(stableRows)\nReadiness \(readinessLabel) · reason \(readinessReason) · Phase A \(readiness["phaseABudgetMs"] as? Int ?? 4000)ms · grace \(readiness["stabilizationGraceMs"] as? Int ?? 1200)ms · absolute cap \(readiness["absoluteReadinessCapMs"] as? Int ?? 6000)ms · stable samples \(readiness["stableCount"] as? Int ?? 0)/4 · stable duration \(readiness["timeToStableMs"] as? Int ?? 0)/320ms · grace activated \(readiness["extensionActivated"] as? Bool == true ? "yes":"no")\nTop proof \(topLabel) · reason \(topReason) · scroll container \(top["scrollableAncestorFound"] as? Bool == true ? "yes":"no") · scrollTop \(scrollTopText) · viewport \(viewportTopText)…\(viewportBottomText)\nActive context rows total/visible \(totalTopRows)/\(visibleTopRows) · rows before first visible \(rowsBefore) · rows inspected \(rows.count)\nPreceding rows: fully above \(geometryCount("fullyAboveViewport")) · intersects viewport \(geometryCount("intersectsViewport")) · display:none \(geometryCount("displayNone")) · visibility:hidden \(geometryCount("visibilityHidden")) · aria-hidden \(geometryCount("ariaHidden")) · zero-size \(geometryCount("zeroSize")) · same scroll container \(geometryCount("sameScrollContainer")) · in active sidebar \(geometryCount("activeSidebarCandidate")) · max above delta \(geometryCount("maxAboveViewportDeltaPx")) px\nVirtualization evidence: transformOffset \(transformEvidence ? "yes":"no") · spacerBefore \(spacerEvidence ? "yes":"no") · positiveRowIndex \(indexEvidence ? "yes":"no")\nPrefix \(prefixResult) · reason \(prefixReason)\nPinned top proof: \(topLabel)\nRows inspected: \(rows.count) · \(statuses.joined(separator:" → "))\nPinned total \(pinnedTotalLabel) · unknown rows \(statuses.filter{$0=="unknown"}.count) · activity resolved \(activityResolutionLabel) · activity unknown \(pinnedUnknownLabel) · recent pinned \(proof.prefixComplete ? String(recent):"unknown")\nActivity sources: \(sources.joined(separator:", ")) · activity errors: \(activityFailures.isEmpty ? "none":activityFailures.joined(separator:", ")) · pinned proof \(proof.complete ? "complete":"unproven")"
+  if !cycleState.lastPinnedUnknownRows!.isEmpty {cyclePinnedReport += "\nPinned proof unknown rows: \(cycleState.lastPinnedUnknownRows!.count)\n"+cycleState.lastPinnedUnknownRows!.map(\.detailLine).joined(separator:"\n")}
   cyclePinnedReport += "\nSemantic snapshot baseline: \(snapshotBaselineText)\nSemantic snapshot stages: \(snapshotStageText.isEmpty ? "none":snapshotStageText)\nFirst semantic change: \(snapshotChangeText)"
   cyclePinnedReport += "\nTraversal terminal: last successful stage \(terminalLastCompleted) · failure stage \(terminalStage) · low-level reason \(terminalReason) · row \(terminalRow) · processed \(terminalProcessed) · semantic snapshot valid \(terminalSnapshotValid) · scroll attempted \(terminalScroll) · menu cleanup \(terminalMenu) · render lease valid \(terminalLease) · timeout/cancel \(terminalTimeout)/\(terminalCancelled) · canonical fallback reason \(proof.complete ? "none":proofFailureReason)"
   cyclePinnedReport += "\nTraversal capacity: snapshot rows \(capacityNumber("snapshotRows")) · required rows \(capacityNumber("requiredTraversalRows")) · selected budget \(capacityNumber("selectedBudget")) · absolute cap \(capacityNumber("absoluteCap")) · budget sufficient \(capacitySufficient) · processed rows \(capacityNumber("processedRows"))"
@@ -1212,6 +1394,11 @@ extension Prototype {
  }
  func checkRecord(_ record: ChatRecord,continuation:ChatCheckContinuationCheckpoint?=nil,budget:ChatCheckBudgetController) async throws -> (SafeAggregate?,String) {
   let token=UUID().uuidString;automationToken=token;automationUpdate=nil;chatCheckTerminalUpdate=nil;navigationFinished=false
+  chatCheckTraceGeneration=token
+  cycleState.beginPerChatHistoryDiagnostic(ordinal:cycleCurrentChatCheckOrdinal)
+  cycleState.beginHistoryResponseParsing()
+  cycleState.beginChatCheckTrace(route:sanitizedChatCheckRoute(web.url))
+  saveCycle();lastChatCheckTraceOutput.stringValue=cycleState.lastChatCheckTrace?.displayText ?? "Last standard chat check trace: not recorded"
   activeChatCheckWorkers.insert(token)
   chatCheckLastCheckpointAt=nil
   chatCheckExpectedConversationID=record.conversationId
@@ -1222,6 +1409,9 @@ extension Prototype {
     telemetry.timing=continuation.timing
     telemetry.timing.continuationBaselineMessages=continuation.firstPassMessages
     if telemetry.timing.continuationStartedAt==nil {telemetry.timing.beginContinuation(at:Date())}
+        telemetry.checkProgress=continuation.historyProgress
+        telemetry.hasPreviousPage=continuation.historyProgress.hasPreviousPage ?? continuation.aggregate.hasPreviousPage
+        telemetry.historyComplete=continuation.historyProgress.historyCompleteProven
    } else {
     telemetry.timing.initialAggregateMessages=record.aggregate?.messagesCollected ?? 0
    }
@@ -1268,7 +1458,10 @@ extension Prototype {
    if var telemetry=chatCheckTelemetry {telemetry.routeReached=true;telemetry.documentIdentity=continuation.documentIdentity;telemetry.paginationFrontierTimestamp=continuation.frontierTimestamp;chatCheckTelemetry=telemetry}
    recordChatCheckStage("continuation_same_document")
   } else {
-   guard let navigation=web.load(URLRequest(url:URL(string:"https://chatgpt.com/c/"+record.conversationId)!)) else {
+   let navigation=web.load(URLRequest(url:URL(string:"https://chatgpt.com/c/"+record.conversationId)!))
+   recordPersistedChatCheckTrace(stage:.navigationRequested,result:navigation != nil ? .success:.failure,
+    reason:navigation != nil ? .navigationRequested:.navigationNotStarted,generation:token)
+   guard let navigation else {
     recordChatCheckStage("navigation_load_rejected")
     activeChatCheckWorkers.remove(token)
     return(nil,"Failed · navigation_not_started")
@@ -1280,7 +1473,7 @@ extension Prototype {
     chatCheckTelemetry=telemetry
    }
   }
-  let start=Date();var configured=false;var lastVersion=0;var progress=Date()
+  let start=Date();var configured=false;var lastVersion=0;var progress=Date();var lastDOMTurnEvidenceSample=Date.distantPast
   while Date().timeIntervalSince(start)<180 {
    try await pauseCycle(3)
    if !navigationFinished,let reason=chatCheckTelemetry?.navigationTerminalReason,
@@ -1315,6 +1508,7 @@ extension Prototype {
     if continuation != nil,var telemetry=chatCheckTelemetry {telemetry.continuationBridgeCallbackResult=configureResult == nil ? "missing":(configured ? "accepted":"rejected");telemetry.recordContinuationStage("bridge_command_result",routeUnchanged:true,documentSame:true,bridgeResult:configured ? "accepted":(configureResult == nil ? "no_result":"rejected"),source:"native");chatCheckTelemetry=telemetry}
     try Task.checkCancellation()
     if configured {
+     recordPersistedChatCheckTrace(stage:.historyWaitStarted,result:.success,reason:.historyWaiting,generation:token)
      if continuation != nil,var telemetry=chatCheckTelemetry {telemetry.recordContinuationStage("history_wait_started",routeUnchanged:true,documentSame:true,bridgeResult:telemetry.continuationBridgeSuccess,source:"native");chatCheckTelemetry=telemetry}
      recordChatCheckStage("history_wait_started")
     }
@@ -1326,12 +1520,16 @@ extension Prototype {
       t.pagesObserved=max(t.pagesObserved,update.received)
       t.messagesAccumulated=update.state.messagesCollected
       t.hasPreviousPage=update.state.hasPreviousPage
+      t.historyComplete=update.state.historyComplete
       chatCheckTelemetry=t
      }
      renderCycle()
     }
     if update.state.historyComplete {
-     if record.aggregate?.historyComplete != true || update.overlap || update.oldest {recordChatCheckStage("chat_check_finished");return(update.state,"Complete")}
+     if record.aggregate?.historyComplete != true || update.overlap || update.oldest {
+      if var telemetry=chatCheckTelemetry {telemetry.checkProgress.recordCompletionProof();chatCheckTelemetry=telemetry}
+      recordChatCheckStage("chat_check_finished");return(update.state,"Complete")
+     }
      if update.state.hasPreviousPage==true {recordChatCheckStage("pagination_started")} else {recordChatCheckStage("history_wait_started")}
     }
    }
@@ -1340,12 +1538,28 @@ extension Prototype {
     recordChatCheckStage("pagination_no_progress")
     return(update.state,"Partial · pagination_no_progress")
    }
+   if configured,Date().timeIntervalSince(lastDOMTurnEvidenceSample)>=3 {
+    lastDOMTurnEvidenceSample=Date()
+    if let evidence=try? await evaluateForCycle("window.gptConversationTurnReadiness?.()") as? [String:Any] {
+     recordChatCheckDOMTurnEvidence(evidence)
+    }
+   }
    if Date().timeIntervalSince(progress)>45 {
     let subtype=chatCheckTelemetry?.timeoutSubtype ?? "unknown_stage"
     if subtype=="navigation" {if var telemetry=chatCheckTelemetry {telemetry.navigationTerminalReason="navigation_no_progress";chatCheckTelemetry=telemetry}}
     recordChatCheckStage("chat_check_no_progress")
-    if let update=automationUpdate,update.token==token {return(update.state,"Partial · no_progress · \(subtype)")}
-    return(nil,"Failed · no_progress · \(subtype)")
+    let matchingUpdate=automationUpdate.flatMap{$0.token==token ? $0:nil}
+    let telemetry=chatCheckTelemetry
+    let progressState=telemetry?.checkProgress ?? ChatCheckProgressAccumulator()
+    let decision=noProgressTerminalDecision(existing:record.aggregate,candidate:matchingUpdate?.state,
+     hasProvenHistoryProgress:progressState.hasProvenHistoryProgress,
+     hasPreviousPage:progressState.hasPreviousPage,
+     completionProven:progressState.historyCompleteProven,subtype:subtype)
+    if decision.terminal.hasPrefix("Partial") {return(decision.aggregate,decision.terminal)}
+    if (chatCheckTelemetry?.renderedDOMTurnCount ?? 0)>0,chatCheckTelemetry?.historyResponses==0 {
+     return(record.aggregate,"Partial · rendered_history_without_network")
+    }
+    return(nil,decision.terminal)
    }
    if configured {
     let identityArgument=continuation.map { value -> String in

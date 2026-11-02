@@ -9,6 +9,175 @@ final class TestLockedCounter:@unchecked Sendable {
  var value:Int {lock.lock();defer{lock.unlock()};return stored}
 }
 @main struct ModelTests {
+ static func chatCheckTraceTests() throws {
+  let started=Date(timeIntervalSince1970:1_800_000_000)
+  let privateURL=URL(string:"https://chatgpt.com/c/private-chat-id?token=private-query")!
+  let route=sanitizedChatCheckRoute(privateURL)
+  assert(route.template=="/c/:id" && route.category == .chat)
+  assert(sanitizedChatCheckRoute(URL(string:"https://chatgpt.com/project-id/chat-id?secret=private")!).template=="/:id/:id")
+  assert(sanitizedChatCheckRoute(URL(string:"https://chatgpt.com/")!).template=="home")
+
+  // Successful navigation followed by ready document and a history response/page.
+  var state=CycleState();state.beginChatCheckTrace(route:sanitizedChatCheckRoute(URL(string:"https://chatgpt.com/")!),at:started)
+  state.appendChatCheckTrace(stage:.navigationRequested,result:.success,route:route,reason:.navigationRequested,at:started.addingTimeInterval(0.1))
+  state.appendChatCheckTrace(stage:.navigationFinished,result:.success,route:route,reason:.navigationFinished,at:started.addingTimeInterval(0.2))
+  state.appendChatCheckTrace(stage:.conversationRouteObserved,result:.success,route:route,reason:.expectedRoute,at:started.addingTimeInterval(0.2))
+  state.appendChatCheckTrace(stage:.documentReady,result:.success,route:route,reason:.documentComplete,at:started.addingTimeInterval(0.3))
+  state.appendChatCheckTrace(stage:.historyWaitStarted,result:.success,route:route,reason:.historyWaiting,at:started.addingTimeInterval(0.4))
+  state.appendChatCheckTrace(stage:.historyResponseObserved,result:.success,route:route,reason:.historyResponse2xx,at:started.addingTimeInterval(0.5))
+  state.appendChatCheckTrace(stage:.historyRowsObserved,result:.success,route:route,reason:.historyRowsObserved,at:started.addingTimeInterval(0.6))
+  state.appendChatCheckTrace(stage:.terminalResult,result:.success,route:route,reason:.terminalComplete,at:started.addingTimeInterval(0.7))
+  assert(state.lastChatCheckTrace?.events.map{$0.stage}.contains(.terminalResult)==true)
+
+  // Home remains after navigation: retain the observed Home route, then a waiting_history terminal.
+  var home=CycleState();home.beginChatCheckTrace(route:sanitizedChatCheckRoute(URL(string:"https://chatgpt.com/")!),at:started)
+  home.appendChatCheckTrace(stage:.navigationRequested,result:.success,route:sanitizedChatCheckRoute(URL(string:"https://chatgpt.com/")!),reason:.navigationRequested,at:started.addingTimeInterval(0.1))
+  home.appendChatCheckTrace(stage:.navigationFinished,result:.success,route:sanitizedChatCheckRoute(URL(string:"https://chatgpt.com/")!),reason:.navigationFinished,at:started.addingTimeInterval(0.2))
+  home.appendChatCheckTrace(stage:.conversationRouteObserved,result:.failure,route:sanitizedChatCheckRoute(URL(string:"https://chatgpt.com/")!),reason:.unexpectedRoute,at:started.addingTimeInterval(0.2))
+  home.appendChatCheckTrace(stage:.terminalResult,result:.failure,route:sanitizedChatCheckRoute(URL(string:"https://chatgpt.com/")!),reason:.terminalNoProgressWaitingHistory,at:started.addingTimeInterval(1))
+
+  // Navigation failure and document-ready/no-response or response/no-rows paths are represented explicitly.
+  var failed=CycleState();failed.beginChatCheckTrace(route:sanitizedChatCheckRoute(nil),at:started)
+  failed.appendChatCheckTrace(stage:.navigationRequested,result:.success,route:route,reason:.navigationRequested,at:started.addingTimeInterval(0.1))
+  failed.appendChatCheckTrace(stage:.navigationFinished,result:.failure,route:route,reason:.navigationFailed,at:started.addingTimeInterval(0.2))
+  failed.appendChatCheckTrace(stage:.terminalResult,result:.failure,route:route,reason:.terminalNavigationFailure,at:started.addingTimeInterval(0.3))
+  var noResponse=CycleState();noResponse.beginChatCheckTrace(route:route,at:started)
+  noResponse.appendChatCheckTrace(stage:.documentReady,result:.success,route:route,reason:.documentComplete,at:started.addingTimeInterval(0.2))
+  noResponse.appendChatCheckTrace(stage:.historyWaitStarted,result:.success,route:route,reason:.historyWaiting,at:started.addingTimeInterval(0.3))
+  noResponse.appendChatCheckTrace(stage:.historyResponseObserved,result:.failure,route:route,reason:.historyResponseNotObserved,at:started.addingTimeInterval(2))
+  noResponse.appendChatCheckTrace(stage:.historyRowsObserved,result:.failure,route:route,reason:.historyRowsNotObserved,at:started.addingTimeInterval(2))
+  var noRows=CycleState();noRows.beginChatCheckTrace(route:route,at:started)
+  noRows.appendChatCheckTrace(stage:.historyResponseObserved,result:.success,route:route,reason:.historyResponse2xx,at:started.addingTimeInterval(0.5))
+  noRows.appendChatCheckTrace(stage:.historyRowsObserved,result:.failure,route:route,reason:.historyRowsEmpty,at:started.addingTimeInterval(1))
+
+  // The latest trace and its terminal failure survive CycleState persistence/reload.
+  let persisted=try JSONDecoder().decode(CycleState.self,from:JSONEncoder().encode(home))
+  assert(persisted.lastChatCheckTrace?.events.last?.reason == .terminalNoProgressWaitingHistory)
+  let encoded=String(data:try JSONEncoder().encode(state),encoding:.utf8)!
+  for secret in ["private-chat-id","private-query","secret=private","conversation title","raw URL"] {assert(!encoded.contains(secret))}
+  assert(state.lastChatCheckTrace?.events.allSatisfy{$0.elapsedMs>=0 && $0.elapsedMs<=600000}==true)
+  assert(state.lastChatCheckTrace?.events.last?.routeTemplate=="/c/:id")
+  assert(chatCheckTraceHistoryResponseReason(status:200).0 == .success)
+  assert(chatCheckTraceHistoryResponseReason(status:429).1 == .historyResponse429)
+  assert(chatCheckTraceHistoryResponseReason(status:nil).1 == .historyResponseUnknown)
+  var parsing=CycleState();parsing.beginHistoryResponseParsing();parsing.beginChatCheckTrace(route:route,at:started);parsing.recordObservedHistoryResponse()
+  let responseDiagnostic:[String:Any]=["generation":"safe-generation","sequence":7,"pageAcceptanceReason":"none","pageUpdateCallbackFired":true,
+   "responseParseDiagnostic":["endpointTemplate":"/backend-api/conversations/:id/messages","transport":"fetch","status":200,"contentTypeCategory":"json","topLevelType":"object",
+    "topLevelKeyNames":["conversation_id","messages","page_info"],"topLevelArrayCounts":[["key":"messages","count":2]],
+    "expectedStructure":["conversationId":true,"messagesArray":true,"mappingObject":false,"pageInfoObject":true,"hasPreviousPageBoolean":true],
+    "parserAttempted":true,"parserAccepted":true,"rejectionReason":"accepted","extractedPageCount":1,"extractedMessageCount":2,"hasPreviousPage":true]]
+  parsing.recordHistoryResponseParsing(responseDiagnostic,at:started.addingTimeInterval(0.8))
+  parsing.appendChatCheckTrace(stage:.terminalResult,result:.failure,route:route,reason:.terminalNoProgressWaitingHistory,at:started.addingTimeInterval(1))
+  assert(parsing.lastHistoryResponseParsing?.summary.contains("observed 1 · parser attempted/accepted/rejected 1/1/0") == true)
+  assert(parsing.lastHistoryResponseParsing?.entries.first?.pageUpdateCallbackFired == true)
+  let unsafeDiagnostic:[String:Any]=["sequence":8,"responseParseDiagnostic":["endpointTemplate":"/backend-api/conversations/private-id/messages?token=secret","transport":"fetch","status":200,"topLevelType":"object","topLevelKeyNames":["messages","private title"],"topLevelArrayCounts":[["key":"messages","count":3],["key":"private title","count":4]],"parserAttempted":true,"parserAccepted":false,"rejectionReason":"unexpected raw private value","extractedMessageCount":3]]
+  parsing.recordHistoryResponseParsing(unsafeDiagnostic)
+  for index in 0..<25 {var extra=unsafeDiagnostic;extra["sequence"]=100+index;parsing.recordHistoryResponseParsing(extra)}
+  assert(parsing.lastHistoryResponseParsing?.entries.count == 20)
+  let parsingRoundTrip=try JSONDecoder().decode(CycleState.self,from:JSONEncoder().encode(parsing))
+  let parsingJSON=String(data:try JSONEncoder().encode(parsingRoundTrip),encoding:.utf8)!
+  assert(parsingRoundTrip.lastHistoryResponseParsing?.observedHistoryResponses == 1)
+  assert(parsingRoundTrip.lastHistoryResponseParsing?.summary.contains("top rejection unknown") == true)
+  assert(parsingRoundTrip.lastChatCheckTrace?.events.last?.reason == .terminalNoProgressWaitingHistory)
+  for secret in ["private-id","token=secret","private title","unexpected raw private value","safe-generation"] {assert(!parsingJSON.contains(secret))}
+  _=failed;_=noResponse;_=noRows
+ }
+ static func perChatHistoryDiagnosticsTests() throws {
+  var state=CycleState()
+  state.beginPerChatHistoryDiagnostic(ordinal:1)
+  state.recordObservedHistoryRequest();state.recordObservedHistoryResponse()
+  let accepted:[String:Any]=[
+   "sequence":1,"pageUpdateCallbackFired":true,
+   "responseParseDiagnostic":["endpointTemplate":"/backend-api/conversations/:id/messages","transport":"fetch","status":200,"contentTypeCategory":"json","topLevelType":"object","topLevelKeyNames":["messages","page_info"],"topLevelArrayCounts":[["key":"messages","count":2]],"expectedStructure":["messagesArray":true,"pageInfoObject":true,"hasPreviousPageBoolean":true],"parserAttempted":true,"parserAccepted":true,"rejectionReason":"accepted","extractedPageCount":1,"extractedMessageCount":2,"hasPreviousPage":true]
+  ]
+  state.recordHistoryResponseParsing(accepted)
+  var completeTelemetry=ChatCheckStageTelemetry(now:Date(timeIntervalSince1970:1))
+  completeTelemetry.checkProgress.observeParsedResponse(HistoryResponseParseEntry.make(accepted))
+  completeTelemetry.renderedDOMTurnCount=2;completeTelemetry.hasPreviousPage=false
+  _=completeTelemetry.pagination.observe(messageIDs:["one","two"],messageCount:2,pageNumber:1,hasPreviousPage:true)
+  state.finishPerChatHistoryDiagnostic(terminal:"Complete",telemetry:completeTelemetry)
+
+  state.beginPerChatHistoryDiagnostic(ordinal:2)
+  assert(state.perChatHistoryDiagnostics?.chats.count==2 && state.perChatHistoryDiagnostics?.chats.first?.parserAccepted==1)
+  state.recordObservedHistoryRequest();state.recordObservedHistoryResponse();state.recordHistoryResponseParsing(accepted)
+  // A continuation for the same checked chat must append to Chat 2, not create Chat 3.
+  state.beginPerChatHistoryDiagnostic(ordinal:2);assert(state.perChatHistoryDiagnostics?.chats.count==2);state.recordObservedHistoryRequest();state.recordObservedHistoryResponse();state.recordHistoryResponseParsing(accepted)
+  state.finishPerChatHistoryDiagnostic(terminal:"Partial · pagination_no_progress",telemetry:nil)
+
+  state.beginPerChatHistoryDiagnostic(ordinal:3)
+  state.recordObservedHistoryRequest();state.recordObservedHistoryResponse()
+  var failedEvent=accepted;failedEvent["pageUpdateCallbackFired"]=false
+  var rejectedShape=accepted["responseParseDiagnostic"] as! [String:Any]
+  rejectedShape["parserAccepted"]=false;rejectedShape["rejectionReason"]="messages_array_missing"
+  rejectedShape["topLevelKeyNames"]=["mapping"]
+  failedEvent["responseParseDiagnostic"]=rejectedShape
+  state.recordHistoryResponseParsing(failedEvent)
+  var unrecognizedEvent=accepted
+  var unrecognizedShape=accepted["responseParseDiagnostic"] as! [String:Any]
+  unrecognizedShape["endpointTemplate"]="/backend-api/:other";unrecognizedShape["parserAttempted"]=false;unrecognizedShape["parserAccepted"]=false;unrecognizedShape["rejectionReason"]="endpoint_not_recognized"
+  unrecognizedEvent["responseParseDiagnostic"]=unrecognizedShape
+  state.recordHistoryResponseParsing(unrecognizedEvent)
+  state.finishPerChatHistoryDiagnostic(terminal:"Failed · no_progress · waiting_history",telemetry:nil)
+
+  state.beginPerChatHistoryDiagnostic(ordinal:4)
+  state.recordObservedHistoryRequest();state.recordObservedHistoryResponse()
+  state.recordHistoryResponseParsing(accepted)
+  var timeoutTelemetry=ChatCheckStageTelemetry(now:Date(timeIntervalSince1970:2))
+  timeoutTelemetry.hasPreviousPage=true
+  _=timeoutTelemetry.pagination.observe(messageIDs:["older"],messageCount:1,pageNumber:1,hasPreviousPage:true)
+  state.finishPerChatHistoryDiagnostic(terminal:"Timed out · per_chat_timeout · pagination_progressing · timeout_absolute_cap",telemetry:timeoutTelemetry)
+
+  let diagnostics=state.perChatHistoryDiagnostics!
+  assert(diagnostics.chats.count==4)
+  let chats=diagnostics.chats
+  assert(chats[0].ordinal==1 && chats[0].terminalReason=="complete" && chats[0].parserAccepted==1 && chats[0].pageUpdateCallbacks==1)
+  assert(chats[1].ordinal==2 && chats[1].historyRequestsObserved==2 && chats[1].parserAccepted==2)
+  assert(chats[2].terminalReason=="waiting_history" && chats[2].parserRejected==1 && chats[2].endpointNotRecognized==1 && chats[2].topRejectionReason=="endpoint_not_recognized")
+  assert(chats[3].timeoutState=="timed_out" && chats[3].timeoutReason=="timeout_absolute_cap" && chats[3].paginationProgressObserved)
+  assert(diagnostics.summary.contains("Chat 4") && diagnostics.summary.contains("callbacks 1"))
+  let persistedFour=try JSONDecoder().decode(CycleState.self,from:JSONEncoder().encode(state))
+  assert(persistedFour.perChatHistoryDiagnostics?.chats.count==4)
+  assert(persistedFour.perChatHistoryDiagnostics?.chats[2].terminalReason=="waiting_history")
+  assert(persistedFour.perChatHistoryDiagnostics?.chats[3].timeoutReason=="timeout_absolute_cap")
+
+  state.beginPerChatHistoryDiagnostic(ordinal:5)
+  for index in 0..<24 {var event=accepted;event["sequence"]=index;state.recordHistoryResponseParsing(event)}
+  assert(state.perChatHistoryDiagnostics?.chats.last?.parserAccepted==24)
+  assert(state.perChatHistoryDiagnostics?.chats.last?.responseEntries.count==20)
+
+  var privateEvent=accepted;privateEvent["rawURL"]="https://chatgpt.com/c/private-id?token=secret";privateEvent["title"]="private title";privateEvent["body"]="private message text"
+  var unsafeShape=privateEvent["responseParseDiagnostic"] as! [String:Any]
+  unsafeShape["topLevelKeyNames"]=["messages","private title","private-id"]
+  privateEvent["responseParseDiagnostic"]=unsafeShape
+  state.recordHistoryResponseParsing(privateEvent)
+  let encoded=String(decoding:try JSONEncoder().encode(state),as:UTF8.self)
+  for value in ["private-id","private title","private message text","https://chatgpt.com","token=secret","conversationId","rawURL","responseBody"] {assert(!encoded.contains(value))}
+  state.perChatHistoryDiagnostics?.reset()
+  assert(state.perChatHistoryDiagnostics?.chats.isEmpty == true && state.perChatHistoryDiagnostics?.activeOrdinal==nil)
+  let roundTrip=try JSONDecoder().decode(CycleState.self,from:JSONEncoder().encode(state))
+  assert(roundTrip.perChatHistoryDiagnostics?.chats.isEmpty == true)
+ }
+ static func pinnedUnknownRowDiagnosticTests() throws {
+  var state=CycleState()
+  let raw:[String:Any]=["positionIndex":27,"tag":"A","routeTemplate":"/g/:id/c/:id","hasHref":true,"hasOctaneNavigationItem":true,
+   "dataAttributeNames":["data-octane-navigation-item","data-status","data-secret-private-value"],"ariaAttributeNames":["aria-label","aria-current"],"visible":true,
+   "conversationRouteClassification":"conversation","navigationRowClassification":"conversation_row","pinnedStarredClassification":"unknown",
+   "structuralClassification":"octane_conversation_row_variant","rejectionReason":"menu_items_missing",
+   "title":"PRIVATE CHAT TITLE","conversationId":"PRIVATE-CHAT-ID","rawHref":"/g/PRIVATE-PROJECT/c/PRIVATE-CHAT?token=PRIVATE-TOKEN","ariaLabel":"PRIVATE ARIA"]
+  let diagnostic=PinnedUnknownRowDiagnostic.make(raw)!
+  assert(diagnostic.positionIndex==27 && diagnostic.routeTemplate=="/g/:id/c/:id")
+  assert(diagnostic.dataAttributeNames==["data-octane-navigation-item","data-secret-private-value","data-status"])
+  state.lastPinnedUnknownRows=[diagnostic]
+  let encoded=try JSONEncoder().encode(state),json=String(data:encoded,encoding:.utf8)!
+  for secret in ["PRIVATE CHAT TITLE","PRIVATE-CHAT-ID","PRIVATE-PROJECT","PRIVATE-TOKEN","PRIVATE ARIA"] {assert(!json.contains(secret))}
+  let restored=try JSONDecoder().decode(CycleState.self,from:encoded)
+  assert(restored.lastPinnedUnknownRows==[diagnostic])
+  assert(diagnostic.compactLine=="row 27 · octane_conversation_row_variant · reason menu_items_missing")
+  let malicious=PinnedUnknownRowDiagnostic.make(["positionIndex":999,"tag":"<script>","routeTemplate":"/c/private-id?token=secret","conversationRouteClassification":"private text","rejectionReason":"secret title"])!
+  assert(malicious.positionIndex==256 && malicious.tag=="unknown" && malicious.routeTemplate=="/unknown")
+  assert(malicious.conversationRouteClassification=="unknown" && malicious.rejectionReason=="unknown_pin_state")
+  assert(PinnedUnknownRowDiagnostic.make(["dataAttributeNames":Array(repeating:"data-x",count:40)] )!.dataAttributeNames==["data-x"])
+ }
  static func diagnosticGenerationGateTests() {
   var gate=DiagnosticOperationGenerationGate()
   let pinnedRows=gate.tryBegin()!
@@ -100,6 +269,31 @@ final class TestLockedCounter:@unchecked Sendable {
   assert(riskNotificationNeeded(previousObservedRank:1,lastAcceptedRank:1,next:near)=="Near")
   assert(riskNotificationNeeded(previousObservedRank:2,lastAcceptedRank:2,next:critical)=="Critical")
   assert(riskNotificationNeeded(previousObservedRank:0,lastAcceptedRank:1,next:watch)=="Watch") // re-cross after a real decline
+  assert(partialRiskNotificationNeeded(lastAcceptedRank:nil,lowerBoundTokens:beta.watch-1,model:beta)==nil)
+  assert(partialRiskNotificationNeeded(lastAcceptedRank:nil,lowerBoundTokens:beta.watch,model:beta)==nil)
+  assert(partialRiskNotificationNeeded(lastAcceptedRank:nil,lowerBoundTokens:beta.near,model:beta)=="Near")
+  assert(partialRiskNotificationNeeded(lastAcceptedRank:nil,lowerBoundTokens:beta.critical,model:beta)=="Critical")
+  assert(partialRiskNotificationNeeded(lastAcceptedRank:2,lowerBoundTokens:beta.near,model:beta)==nil) // no repeat at the accepted level
+  assert(partialRiskNotificationNeeded(lastAcceptedRank:2,lowerBoundTokens:beta.critical,model:beta)=="Critical") // upward confirmed minimum-risk change
+  assert(incompleteRiskNotificationNeeded(measurement:.partial,lastAcceptedRank:nil,lowerBoundTokens:beta.near,model:beta)=="Near")
+  assert(incompleteRiskNotificationNeeded(measurement:.partial,lastAcceptedRank:nil,lowerBoundTokens:beta.critical,model:beta)=="Critical")
+  assert(incompleteRiskNotificationNeeded(measurement:.partial,lastAcceptedRank:nil,lowerBoundTokens:483_894,model:beta)=="Critical")
+  assert(incompleteRiskNotificationNeeded(measurement:.unknown,lastAcceptedRank:nil,lowerBoundTokens:483_894,model:beta)=="Critical")
+  assert(riskRank("Critical")==3) // accepted runtime-case notification persists the Critical dedupe rank
+  assert(incompleteRiskNotificationNeeded(measurement:.unknown,lastAcceptedRank:nil,lowerBoundTokens:beta.near,model:beta)=="Near")
+  assert(incompleteRiskNotificationNeeded(measurement:.unknown,lastAcceptedRank:nil,lowerBoundTokens:beta.watch,model:beta)==nil)
+  assert(incompleteRiskNotificationNeeded(measurement:.unknown,lastAcceptedRank:nil,lowerBoundTokens:beta.watch-1,model:beta)==nil)
+  assert(incompleteRiskNotificationNeeded(measurement:.unknown,lastAcceptedRank:nil,lowerBoundTokens:nil,model:beta)==nil)
+  assert(incompleteRiskNotificationNeeded(measurement:.partial,lastAcceptedRank:3,lowerBoundTokens:beta.critical,model:beta)==nil)
+  assert(incompleteRiskNotificationNeeded(measurement:.unknown,lastAcceptedRank:2,lowerBoundTokens:beta.critical,model:beta)=="Critical")
+  assert(incompleteRiskNotificationNeeded(measurement:.complete,lastAcceptedRank:nil,lowerBoundTokens:beta.critical,model:beta)==nil)
+  let terminalBeforeNotification="Timed out · per_chat_timeout"
+  _=incompleteRiskNotificationNeeded(measurement:.unknown,lastAcceptedRank:nil,lowerBoundTokens:483_894,model:beta)
+  assert(terminalBeforeNotification=="Timed out · per_chat_timeout") // classification does not rewrite terminal state
+  assert(partialRiskNotificationContent(level:"Near")?.body=="This chat is at least Near limit. Full history couldn't be verified, so the actual size may be higher.")
+  assert(partialRiskNotificationContent(level:"Critical")?.body=="This chat is at least Critical. Full history couldn't be verified, so the actual size may be higher.")
+  assert(partialRiskNotificationContent(level:"Watch")==nil)
+  assert(riskNotificationNeeded(previousObservedRank:1,lastAcceptedRank:1,next:near)=="Near") // complete path unchanged
   assert(shouldDispatchSystemRiskNotification(kind:"risk",level:"Watch"))
   assert(shouldDispatchSystemRiskNotification(kind:"risk",level:"Near"))
   assert(shouldDispatchSystemRiskNotification(kind:"risk",level:"Critical"))
@@ -117,7 +311,7 @@ final class TestLockedCounter:@unchecked Sendable {
   assert(monitoringDiscoveryDegraded(baseDiscoveryComplete:false,rootResponseReceived:false,stallDetail:"no_list_response",rateLimited:false,safetyLimitExceeded:false))
   assert(monitoringDiscoveryDegraded(baseDiscoveryComplete:true,rootResponseReceived:true,stallDetail:nil,rateLimited:true,safetyLimitExceeded:false)) // root_http_429
   assert(!monitoringDiscoveryDegraded(baseDiscoveryComplete:true,rootResponseReceived:true,stallDetail:nil,rateLimited:false,safetyLimitExceeded:false))
-  assert(isMonitoringDiscoveryFailure("no_list_response") && isMonitoringDiscoveryFailure("root_http_429"))
+  assert(isMonitoringDiscoveryFailure("no_list_response") && isMonitoringDiscoveryFailure("dom_fallback_visible_sidebar_rows_only") && isMonitoringDiscoveryFailure("root_http_429"))
   assert(isMonitoringDiscoveryFailure("root_request_without_response") && !isMonitoringDiscoveryFailure("incomplete_partitions"))
   assert(riskUpwardCrossing(previousRank:2,next:watch)==nil) // decline updates local rank; later upward crossing is allowed
   assert(riskUpwardCrossing(previousRank:1,next:near)=="Near")
@@ -152,6 +346,12 @@ final class TestLockedCounter:@unchecked Sendable {
   assert(riskMeasurementStatus(result:"Complete",aggregate:aggregate) == .complete)
   assert(riskMeasurementStatus(result:"Partial",aggregate:aggregate) == .partial)
   assert(riskMeasurementStatus(result:"Failed",aggregate:aggregate) == .unknown)
+  assert(confirmedRiskFromLowerBound(200_000,model:beta) == .normal)
+  assert(confirmedRiskFromLowerBound(330_000,model:beta) == .watch)
+  assert(confirmedRiskFromLowerBound(420_000,model:beta) == .near)
+  assert(confirmedRiskFromLowerBound(480_000,model:beta) == .critical)
+  assert(confirmedRiskFromLowerBound(471_797,model:beta) == .near)
+  assert(confirmedRiskFromLowerBound(nil,model:beta) == .normal)
   let persisted=ChatRecord(conversationId:"private-id",title:"private-title",lastSeenUpdatedAt:1,lastCheckedUpdatedAt:1,lastCheckAt:1,lastCheckResult:"Complete",aggregate:aggregate,calibrationLabel:"normal",lastRiskRank:2)
   let roundTrip=try! JSONDecoder().decode(ChatRecord.self,from:JSONEncoder().encode(persisted))
   assert(roundTrip.calibrationLabel=="normal" && roundTrip.lastRiskRank==2)
@@ -163,6 +363,23 @@ final class TestLockedCounter:@unchecked Sendable {
   var active=ChatRecord(conversationId:"private-id",title:"private-title",lastSeenUpdatedAt:1000,lastCheckResult:"Partial · pagination_no_progress",aggregate:aggregate)
   active.aggregate?.historyComplete=false;active.aggregate?.hasPreviousPage=true
   assert(monitoringState(record:active,model:beta,nowMs:2000) == .uncertain)
+  assert(confirmedRiskFromLowerBound(active.aggregate?.estimatedTextTokens,model:beta) == .watch)
+  assert(monitoringState(record:active,model:beta,nowMs:2000) == .uncertain) // confirmed Watch minimum does not imply complete history
+  active.aggregate?.estimatedTextTokens=471_797
+  assert(monitoringState(record:active,model:beta,nowMs:2000) == .uncertain)
+  assert(confirmedRiskFromLowerBound(active.aggregate?.estimatedTextTokens,model:beta) == .near)
+  active.aggregate?.estimatedTextTokens=480_000
+  assert(monitoringState(record:active,model:beta,nowMs:2000) == .uncertain)
+  assert(confirmedRiskFromLowerBound(active.aggregate?.estimatedTextTokens,model:beta) == .critical)
+  active.aggregate?.estimatedTextTokens=beta.watch-1
+  assert(confirmedRiskFromLowerBound(active.aggregate?.estimatedTextTokens,model:beta) == .normal)
+  assert(monitoringState(record:active,model:beta,nowMs:2000) == .uncertain)
+  active.aggregate?.estimatedTextTokens=beta.near
+  active.uncertainAcknowledgedAt=2000
+  assert(!warningBadgeVisible(record:active,model:beta,nowMs:2000))
+  assert(monitoringState(record:active,model:beta,nowMs:2000) == .uncertain)
+  assert(confirmedRiskFromLowerBound(active.aggregate?.estimatedTextTokens,model:beta) == .near)
+  active.uncertainAcknowledgedAt=nil;active.aggregate?.estimatedTextTokens=beta.watch
   assert(monitoringState(record:active,model:beta,nowMs:1000+7*60*60*1000) == .uncertain) // unresolved warning survives six-hour activity window
   active.uncertainSince=1001
   active.uncertainAcknowledgedAt=1500
@@ -434,10 +651,94 @@ final class TestLockedCounter:@unchecked Sendable {
   for secret in ["origin#",tokenA,tokenB,"includeOrigin","excludeOrigin"] {assert(!stored.contains(secret))}
   print("Partition model: complement, selectors, completeness, starred, ordering, dedup and ephemeral privacy passed")
  }
+ static func bundleIdentityMigrationTests() throws {
+  var prior=CycleState();prior.enabled=true;prior.lastStatus="Partial · preserved";prior.lastCycleNotificationsAccepted=2
+  var near=ChatRecord(conversationId:"near-chat",title:"Near",lastSeenUpdatedAt:10)
+  near.lastNotifiedRiskRank=2;near.lastRiskRank=2;near.uncertainAcknowledgedAt=9
+  near.aggregate=SafeAggregate(conversationId:"near-chat",title:"Near",processedMessageIds:["known"],messagesCollected:4,userMessages:2,assistantMessages:2,otherMessages:0,estimatedTextTokens:420000,attachments:.init(images:0,audio:0,video:0,files:0),historyComplete:false,hasPreviousPage:true,responsesCaptured:4)
+  var critical=ChatRecord(conversationId:"critical-chat",title:"Critical",lastSeenUpdatedAt:11);critical.lastNotifiedRiskRank=3
+  prior.records[near.conversationId]=near;prior.records[critical.conversationId]=critical
+  let priorData=try JSONEncoder().encode(prior)
+  let legacy:[String:Any]=[nativeCycleStateDefaultsKey:priorData,showChatTitlesInNotificationsDefaultsKey:false]
+  let migrated=bundleIdentityMigrationPlan(legacy:legacy,current:[:])
+  assert(migrated.status == .migrated && migrated.shouldSetCompletionMarker && migrated.failureReason == nil)
+  assert((migrated.valuesToWrite[nativeCycleStateDefaultsKey] as? Data)==priorData)
+  assert(migrated.valuesToWrite[showChatTitlesInNotificationsDefaultsKey] as? Bool == false)
+  let migratedData=migrated.valuesToWrite[nativeCycleStateDefaultsKey] as! Data
+  let decoded=try JSONDecoder().decode(CycleState.self,from:migratedData)
+  assert(decoded.enabled && decoded.lastStatus==prior.lastStatus && decoded.lastCycleNotificationsAccepted==2)
+  assert(decoded.records["near-chat"]?.aggregate?.estimatedTextTokens==420000)
+  assert(decoded.records["near-chat"]?.uncertainAcknowledgedAt==9)
+  assert(decoded.records["near-chat"]?.lastNotifiedRiskRank==2 && decoded.records["critical-chat"]?.lastNotifiedRiskRank==3)
+  assert(incompleteRiskNotificationNeeded(measurement:.partial,lastAcceptedRank:decoded.records["near-chat"]?.lastNotifiedRiskRank,lowerBoundTokens:420000,model:.beta)==nil)
+  assert(incompleteRiskNotificationNeeded(measurement:.partial,lastAcceptedRank:decoded.records["critical-chat"]?.lastNotifiedRiskRank,lowerBoundTokens:480000,model:.beta)==nil)
+
+  var nextDomain=migrated.valuesToWrite;nextDomain[bundleIdentityMigrationMarkerKey]=true
+  let secondLaunch=bundleIdentityMigrationPlan(legacy:legacy,current:nextDomain)
+  assert(secondLaunch.status == .notNeeded && secondLaunch.valuesToWrite.isEmpty && !secondLaunch.shouldSetCompletionMarker)
+
+  let existingState=try JSONEncoder().encode(CycleState())
+  let existing=bundleIdentityMigrationPlan(legacy:legacy,current:[nativeCycleStateDefaultsKey:existingState])
+  assert(existing.status == .notNeeded && existing.shouldSetCompletionMarker)
+  assert(existing.valuesToWrite[nativeCycleStateDefaultsKey] as? Data == nil)
+  assert(existing.valuesToWrite[showChatTitlesInNotificationsDefaultsKey] as? Bool == false)
+
+  let clean=bundleIdentityMigrationPlan(legacy:[showChatTitlesInNotificationsDefaultsKey:true],current:[:])
+  assert(clean.status == .cleanInstall && clean.shouldSetCompletionMarker)
+  assert(clean.valuesToWrite[showChatTitlesInNotificationsDefaultsKey] as? Bool == true)
+
+  let corrupt=Data("not-json".utf8)
+  let corruptLegacy:[String:Any]=[nativeCycleStateDefaultsKey:corrupt,showChatTitlesInNotificationsDefaultsKey:false]
+  let failed=bundleIdentityMigrationPlan(legacy:corruptLegacy,current:[:])
+  assert(failed.status == .failed && !failed.shouldSetCompletionMarker && failed.failureReason=="legacy_state_invalid")
+  assert(failed.valuesToWrite.isEmpty && corrupt==corruptLegacy[nativeCycleStateDefaultsKey] as? Data)
+ }
+ static func renderReadinessPersistenceTests() throws {
+  let reasons=["wrong_route_or_context","document_not_ready","sidebar_root_missing","rows_never_appeared","rows_appeared_but_never_stabilized","timeout","navigation_failed","bridge_result_missing"]
+  var state=CycleState()
+  for reason in reasons {
+   state.recordRenderReadiness(phase:"preflight",result:.failure,reason:reason,routeCategory:.home,timestamp:Date(timeIntervalSince1970:1_800_000_000))
+   assert(state.lastRenderReadiness?.reason==reason,"readiness reason must persist exactly: \(reason)")
+  }
+  state.recordRenderReadiness(phase:"rows",result:.failure,reason:"rows_never_appeared",routeCategory:.chat,timestamp:Date(timeIntervalSince1970:1_800_000_001))
+  state.recordRenderReadiness(phase:"rows",result:.success,reason:"snapshot_ready",routeCategory:.chat,timestamp:Date(timeIntervalSince1970:1_800_000_002))
+  assert(state.lastRenderReadiness?.result == .success && state.lastRenderReadiness?.reason=="snapshot_ready")
+  let saved=try JSONEncoder().encode(state)
+  let restored=try JSONDecoder().decode(CycleState.self,from:saved)
+  assert(restored.lastRenderReadiness==state.lastRenderReadiness,"readiness diagnostic must survive persisted-state reload")
+  let legacy=try JSONDecoder().decode(CycleState.self,from:JSONEncoder().encode(CycleState()))
+  assert(legacy.lastRenderReadiness==nil,"older cycle state without the field remains readable")
+
+  var safety=CycleState()
+  var record=ChatRecord(conversationId:"opaque-test-record",title:"test",lastSeenUpdatedAt:1)
+  record.lastRiskRank=2;record.lastNotifiedRiskRank=1;record.paginationBoundaryMessageCount=42
+  record.aggregate=SafeAggregate(conversationId:"opaque-test-record",title:"test",processedMessageIds:["private-message-id"],messagesCollected:42,userMessages:20,assistantMessages:22,otherMessages:0,estimatedTextTokens:12345,attachments:.init(images:0,audio:0,video:0,files:0),historyComplete:false,hasPreviousPage:true,hasNextPage:false,responsesCaptured:3,updatedAt:1)
+  safety.records[record.conversationId]=record
+  safety.recordRenderReadiness(phase:"readiness",result:.failure,reason:"sidebar_root_missing",routeCategory:.home)
+  assert(safety.records[record.conversationId]?.paginationBoundaryMessageCount==42)
+  assert(safety.records[record.conversationId]?.aggregate?.estimatedTextTokens==12345)
+  assert(safety.records[record.conversationId]?.lastRiskRank==2 && safety.records[record.conversationId]?.lastNotifiedRiskRank==1)
+
+  assert(renderReadinessRouteCategory(URL(string:"https://chatgpt.com/")!) == .home)
+  assert(renderReadinessRouteCategory(URL(string:"https://auth.openai.com/log-in")!) == .loginAuth)
+  assert(renderReadinessRouteCategory(URL(string:"https://example.invalid/private")!) == .other)
+  let privateURL=URL(string:"https://chatgpt.com/c/private-chat-id?token=private-token")!
+  var privacy=CycleState()
+  privacy.recordRenderReadiness(phase:"rows",result:.failure,reason:"sidebar_root_missing?chat_id=private-chat-id",routeCategory:renderReadinessRouteCategory(privateURL),timestamp:Date(timeIntervalSince1970:1_800_000_003))
+  let encoded=String(decoding:try JSONEncoder().encode(privacy),as:UTF8.self)
+  assert(!encoded.contains("private-chat-id") && !encoded.contains("private-token"))
+  assert(privacy.lastRenderReadiness?.routeCategory == .chat)
+  assert(privacy.lastRenderReadiness?.reason == "unclassified")
+  assert(renderReadinessDiagnosticSummary(privacy.lastRenderReadiness!).contains("route chat"))
+ }
  static func main() async throws {
+  try renderReadinessPersistenceTests()
+  try perChatHistoryDiagnosticsTests()
+  try pinnedUnknownRowDiagnosticTests()
   diagnosticGenerationGateTests()
   rescueGenerationGateTests()
   nativeRescueStatusTests()
+  try bundleIdentityMigrationTests()
   assert(rootDiscoveryTerminalReason(RootDiscoveryEvidence())=="root_trigger_not_started")
   var rootEvidence=RootDiscoveryEvidence();rootEvidence.triggerStarted=true;rootEvidence.loadReturnedNavigation=true
   assert(rootDiscoveryTerminalReason(rootEvidence)=="root_navigation_not_observed")
@@ -463,6 +764,7 @@ final class TestLockedCounter:@unchecked Sendable {
   assert(rootDiscoveryTerminalReason(rootEvidence)=="root_list_hook_detached")
   activityObservationWindowTests()
   riskModelTests()
+  try chatCheckTraceTests()
   let activityEvent:[String:Any]=["conversationId":"internal-id","timestamp":1700000000000.0,"timestampSource":"conversation_update_time","endpointFamily":"conversation_messages","httpStatus":200,"operationOwner":"isolated_timestamp_fallback","operationGeneration":"operation-1"]
   assert(pinnedActivityEventMatches(activityEvent,expectedConversationID:"internal-id",expectedOwner:"isolated_timestamp_fallback",expectedGeneration:"operation-1"))
   assert(!pinnedActivityEventMatches(activityEvent,expectedConversationID:"other-id",expectedOwner:"isolated_timestamp_fallback",expectedGeneration:"operation-1"))
@@ -695,10 +997,134 @@ final class TestLockedCounter:@unchecked Sendable {
   var chatStages=ChatCheckStageTelemetry(now:Date(timeIntervalSince1970:100),renderLeaseActive:true)
   chatStages.enter("navigation_started",now:Date(timeIntervalSince1970:101));assert(chatStages.timeoutSubtype=="navigation")
   chatStages.enter("route_reached",now:Date(timeIntervalSince1970:102));chatStages.enter("history_wait_started",now:Date(timeIntervalSince1970:103));assert(chatStages.timeoutSubtype=="waiting_history")
+  assert(chatStages.historyResponses==0 && chatStages.pagesObserved==0 && chatStages.automationPageUpdateCallbacks==0 && chatStages.messagesAccumulated==0)
+  chatStages.historyResponses=64;chatStages.pagesObserved=19;chatStages.automationPageUpdateCallbacks=19;chatStages.messagesAccumulated=371
+  chatStages.hasPreviousPage=true
+  assert(chatStages.timeoutSubtype=="history_response_received") // response counters alone are not progress proof
+  chatStages.checkProgress.observeNativePage(newlyAddedMessages:371,hasPreviousPage:true,paginationProgressObserved:true)
+  assert(chatStages.timeoutSubtype=="pagination_progressing")
+  assert(!(chatStages.timeoutSubtype=="waiting_history" && (chatStages.pagesObserved>0 || chatStages.automationPageUpdateCallbacks>0 || chatStages.messagesAccumulated>0)))
+  var responseOnly=ChatCheckStageTelemetry(now:Date(timeIntervalSince1970:100));responseOnly.enter("history_wait_started",now:Date(timeIntervalSince1970:101));responseOnly.historyResponses=1
+  assert(responseOnly.timeoutSubtype=="history_response_received")
   chatStages.enter("pagination_started",now:Date(timeIntervalSince1970:104));assert(chatStages.timeoutSubtype=="pagination")
   chatStages.enter("aggregation_started",now:Date(timeIntervalSince1970:105));assert(chatStages.timeoutSubtype=="aggregation")
   let timeoutReport=chatStages.report(ordinal:1,terminal:"per_chat_timeout",now:Date(timeIntervalSince1970:106))
   assert(timeoutReport.contains("render lease active") && timeoutReport.contains("stage 1000 ms") && !timeoutReport.contains("conversationId") && !timeoutReport.contains("title"))
+  func aggregateFixture(messages:Int,tokens:Int,complete:Bool,previous:Bool?)->SafeAggregate {
+   SafeAggregate(conversationId:"private-id",title:"private-title",processedMessageIds:[],messagesCollected:messages,userMessages:messages,assistantMessages:0,otherMessages:0,estimatedTextTokens:tokens,attachments:.init(images:0,audio:0,video:0,files:0),historyComplete:complete,hasPreviousPage:previous,hasNextPage:nil,responsesCaptured:1,updatedAt:100)
+  }
+  let savedReplay=aggregateFixture(messages:150,tokens:40000,complete:false,previous:true)
+  let replayTimeoutCandidate=aggregateFixture(messages:150,tokens:40000,complete:false,previous:true)
+  let replayPartial=timeoutProgressPartialAggregate(existing:savedReplay,candidate:replayTimeoutCandidate,hasPreviousPage:true,acceptedPages:9,pageUpdateCallbacks:9,producedMessages:150)
+  assert(replayPartial?.estimatedTextTokens==40000 && replayPartial?.messagesCollected==150)
+  assert(replayPartial?.historyComplete==false && replayPartial?.hasPreviousPage==true)
+  assert(timeoutProgressPartialAggregate(existing:savedReplay,candidate:aggregateFixture(messages:149,tokens:39999,complete:false,previous:true),hasPreviousPage:true,acceptedPages:1,pageUpdateCallbacks:1,producedMessages:149)?.estimatedTextTokens==40000)
+  assert(timeoutProgressPartialAggregate(existing:savedReplay,candidate:replayTimeoutCandidate,hasPreviousPage:true,acceptedPages:0,pageUpdateCallbacks:0,producedMessages:0)==nil)
+  let completeAggregate=timeoutProgressPartialAggregate(existing:nil,candidate:aggregateFixture(messages:10,tokens:100,complete:true,previous:false),hasPreviousPage:false,acceptedPages:1,pageUpdateCallbacks:1,producedMessages:10)
+  assert(completeAggregate==nil) // no timeout partial when the history is proven complete
+  assert(isHistoryProgressProven(acceptedPages:1,pageUpdateCallbacks:0,producedMessages:0,paginationProgressObserved:false))
+  let matchingUpdateDecision=noProgressTerminalDecision(existing:savedReplay,candidate:replayTimeoutCandidate,hasProvenHistoryProgress:true,hasPreviousPage:true,completionProven:false,subtype:"pagination")
+  assert(matchingUpdateDecision.terminal.hasPrefix("Partial") && matchingUpdateDecision.aggregate?.estimatedTextTokens==40000)
+  assert(matchingUpdateDecision.aggregate?.historyComplete==false && matchingUpdateDecision.aggregate?.hasPreviousPage==true)
+  let missingUpdatePages=noProgressTerminalDecision(existing:savedReplay,candidate:nil,hasProvenHistoryProgress:isHistoryProgressProven(acceptedPages:10,pageUpdateCallbacks:0,producedMessages:0,paginationProgressObserved:false),hasPreviousPage:true,completionProven:false,subtype:"history_response_received")
+  assert(missingUpdatePages.terminal.hasPrefix("Partial") && missingUpdatePages.aggregate?.estimatedTextTokens==40000)
+  let missingUpdateCallbacks=noProgressTerminalDecision(existing:savedReplay,candidate:nil,hasProvenHistoryProgress:isHistoryProgressProven(acceptedPages:0,pageUpdateCallbacks:2,producedMessages:192,paginationProgressObserved:false),hasPreviousPage:true,completionProven:false,subtype:"history_response_received")
+  assert(missingUpdateCallbacks.terminal.hasPrefix("Partial") && missingUpdateCallbacks.aggregate?.estimatedTextTokens==40000)
+  assert(missingUpdateCallbacks.aggregate?.historyComplete==false && missingUpdateCallbacks.aggregate?.hasPreviousPage==true)
+  let responseOnlyProgress=isHistoryProgressProven(acceptedPages:0,pageUpdateCallbacks:0,producedMessages:0,paginationProgressObserved:false)
+  assert(!responseOnlyProgress) // HTTP/history responses alone are not accepted page progress
+  let responseOnlyDecision=noProgressTerminalDecision(existing:savedReplay,candidate:nil,hasProvenHistoryProgress:responseOnlyProgress,hasPreviousPage:true,completionProven:false,subtype:"history_response_received")
+  assert(responseOnlyDecision.terminal.hasPrefix("Failed"))
+  let zeroProgressDecision=noProgressTerminalDecision(existing:nil,candidate:nil,hasProvenHistoryProgress:false,hasPreviousPage:nil,completionProven:false,subtype:"waiting_history")
+  assert(zeroProgressDecision.terminal=="Failed · no_progress · waiting_history")
+
+  func parserEntry(accepted:Bool,pages:Int=0,messages:Int?=nil,callback:Bool=false,previous:Bool?=nil)->HistoryResponseParseEntry {
+   let payload:[String:Any]=["generation":"safe-generation","pageUpdateCallbackFired":callback,
+    "responseParseDiagnostic":["endpointTemplate":"/backend-api/conversations/:id/messages","transport":"fetch","status":200,"contentTypeCategory":"json","topLevelType":"object","topLevelKeyNames":["messages","page_info"],"topLevelArrayCounts":[["key":"messages","count":messages ?? 0]],"expectedStructure":["messagesArray":accepted,"pageInfoObject":true,"hasPreviousPageBoolean":previous != nil],"parserAttempted":true,"parserAccepted":accepted,"rejectionReason":accepted ? "accepted":"parsed_but_empty","extractedPageCount":pages,"extractedMessageCount":messages as Any? ?? NSNull(),"hasPreviousPage":previous as Any? ?? NSNull()]]
+   return HistoryResponseParseEntry.make(payload)
+  }
+  // Runtime-shaped regression: 40 observed responses, of which 10 parsed pages
+  // produced 191 messages and callbacks. No matching live automationUpdate exists.
+  var runtimeProgress=ChatCheckProgressAccumulator()
+  for index in 0..<40 {
+   let accepted=index<10
+   let messageCount=accepted ? (index==9 ? 20:19):nil
+   runtimeProgress.observeParsedResponse(parserEntry(accepted:accepted,pages:accepted ? 1:0,messages:messageCount,callback:accepted,previous:true))
+  }
+  assert(runtimeProgress.parserAttempted==40 && runtimeProgress.parserAccepted==10)
+  assert(runtimeProgress.acceptedParsedPages==10 && runtimeProgress.producedMessages==191)
+  assert(runtimeProgress.pageUpdateCallbacks==10 && runtimeProgress.hasPreviousPage==true)
+  assert(runtimeProgress.hasProvenHistoryProgress)
+  let runtimeFailure=noProgressTerminalDecision(existing:aggregateFixture(messages:1135,tokens:307138,complete:false,previous:true),candidate:nil,
+   hasProvenHistoryProgress:runtimeProgress.hasProvenHistoryProgress,hasPreviousPage:runtimeProgress.hasPreviousPage,
+   completionProven:runtimeProgress.historyCompleteProven,subtype:"history_response_received")
+  assert(runtimeFailure.terminal.hasPrefix("Partial") && runtimeFailure.aggregate?.messagesCollected==1135)
+  assert(runtimeFailure.aggregate?.estimatedTextTokens==307138 && runtimeFailure.aggregate?.historyComplete==false)
+  assert(runtimeFailure.aggregate?.hasPreviousPage==true)
+  // Any canonical progress signal is sufficient even if a live update is absent.
+  var acceptedPageOnly=ChatCheckProgressAccumulator();acceptedPageOnly.observeParsedResponse(parserEntry(accepted:true,pages:1,messages:0,previous:true))
+  assert(noProgressTerminalDecision(existing:savedReplay,candidate:nil,hasProvenHistoryProgress:acceptedPageOnly.hasProvenHistoryProgress,hasPreviousPage:acceptedPageOnly.hasPreviousPage,completionProven:false,subtype:"pagination").terminal.hasPrefix("Partial"))
+  var callbackOnly=ChatCheckProgressAccumulator();callbackOnly.observeParsedResponse(parserEntry(accepted:false,callback:true,previous:true))
+  assert(callbackOnly.hasProvenHistoryProgress)
+  assert(noProgressTerminalDecision(existing:savedReplay,candidate:nil,hasProvenHistoryProgress:callbackOnly.hasProvenHistoryProgress,hasPreviousPage:callbackOnly.hasPreviousPage,completionProven:false,subtype:"pagination").terminal.hasPrefix("Partial"))
+  var uniqueMessagesOnly=ChatCheckProgressAccumulator();uniqueMessagesOnly.uniqueMessagesProduced=3;uniqueMessagesOnly.hasPreviousPage=true
+  assert(uniqueMessagesOnly.hasProvenHistoryProgress)
+  assert(noProgressTerminalDecision(existing:savedReplay,candidate:nil,hasProvenHistoryProgress:uniqueMessagesOnly.hasProvenHistoryProgress,hasPreviousPage:uniqueMessagesOnly.hasPreviousPage,completionProven:false,subtype:"pagination").terminal.hasPrefix("Partial"))
+  assert(isHistoryProgressProven(acceptedPages:0,pageUpdateCallbacks:0,producedMessages:3,paginationProgressObserved:false))
+  var responseOnlyAccumulator=ChatCheckProgressAccumulator()
+  for _ in 0..<40 {responseOnlyAccumulator.observeParsedResponse(parserEntry(accepted:false,previous:true))}
+  assert(!responseOnlyAccumulator.hasProvenHistoryProgress)
+  let responseOnlyCanonical=noProgressTerminalDecision(existing:savedReplay,candidate:nil,hasProvenHistoryProgress:responseOnlyAccumulator.hasProvenHistoryProgress,hasPreviousPage:responseOnlyAccumulator.hasPreviousPage,completionProven:false,subtype:"history_response_received")
+  assert(responseOnlyCanonical.terminal.hasPrefix("Failed"))
+  var completedProgress=runtimeProgress;completedProgress.recordCompletionProof()
+  let provenComplete=aggregateFixture(messages:120,tokens:41000,complete:true,previous:false)
+  let completionProofDecision=noProgressTerminalDecision(existing:savedReplay,candidate:provenComplete,hasProvenHistoryProgress:completedProgress.hasProvenHistoryProgress,hasPreviousPage:false,completionProven:completedProgress.historyCompleteProven,subtype:"pagination")
+  assert(completionProofDecision.terminal=="Complete" && completionProofDecision.aggregate?.historyComplete==true)
+  // The diagnostic view is a snapshot of the production accumulator.
+  var summaryTelemetry=ChatCheckStageTelemetry(now:Date(timeIntervalSince1970:100))
+  summaryTelemetry.checkProgress=runtimeProgress
+  var summaryState=CycleState();summaryState.beginPerChatHistoryDiagnostic(ordinal:1);summaryState.observePerChatHistoryDiagnostic(summaryTelemetry)
+  let canonicalSummary=summaryState.perChatHistoryDiagnostics?.chats.first
+  assert(canonicalSummary?.parserAttempted==40 && canonicalSummary?.parserAccepted==10 && canonicalSummary?.pagesProduced==10)
+  assert(canonicalSummary?.messagesProduced==191 && canonicalSummary?.pageUpdateCallbacks==10 && canonicalSummary?.hasPreviousPage==true)
+
+  // Same-document continuation must inherit the first attempt's canonical progress.
+  // The response entries remain attached to the same Chat ordinal across both attempts.
+  var firstAttemptProgress=ChatCheckProgressAccumulator()
+  var continuationCycleState=CycleState()
+  continuationCycleState.beginPerChatHistoryDiagnostic(ordinal:2)
+  for index in 0..<11 {
+   let messages=index==10 ? 20:16
+   let entry=parserEntry(accepted:true,pages:1,messages:messages,callback:true,previous:true)
+   firstAttemptProgress.observeParsedResponse(entry)
+   continuationCycleState.recordHistoryResponseParsing(entry)
+  }
+  assert(firstAttemptProgress.acceptedParsedPages==11 && firstAttemptProgress.producedMessages==180)
+  assert(firstAttemptProgress.pageUpdateCallbacks==11 && firstAttemptProgress.hasPreviousPage==true)
+  var continuedAttemptTelemetry=ChatCheckStageTelemetry(now:Date(timeIntervalSince1970:110))
+  continuedAttemptTelemetry.checkProgress=firstAttemptProgress
+  continuedAttemptTelemetry.hasPreviousPage=firstAttemptProgress.hasPreviousPage
+  continuedAttemptTelemetry.historyComplete=firstAttemptProgress.historyCompleteProven
+  continuationCycleState.observePerChatHistoryDiagnostic(continuedAttemptTelemetry)
+  let continuationSummary=continuationCycleState.perChatHistoryDiagnostics?.chats.first
+  assert(continuationSummary?.ordinal==2 && continuationSummary?.parserAccepted==11)
+  assert(continuationSummary?.pagesProduced==11 && continuationSummary?.messagesProduced==180)
+  assert(continuationSummary?.pageUpdateCallbacks==11 && continuationSummary?.hasPreviousPage==true)
+  let continuationTerminal=noProgressTerminalDecision(existing:aggregateFixture(messages:200,tokens:42000,complete:false,previous:true),candidate:nil,
+   hasProvenHistoryProgress:continuedAttemptTelemetry.checkProgress.hasProvenHistoryProgress,
+   hasPreviousPage:continuedAttemptTelemetry.checkProgress.hasPreviousPage,
+   completionProven:continuedAttemptTelemetry.checkProgress.historyCompleteProven,subtype:"history_response_received")
+  assert(continuationTerminal.terminal.hasPrefix("Partial"))
+  assert(continuationTerminal.aggregate?.messagesCollected==200 && continuationTerminal.aggregate?.estimatedTextTokens==42000)
+  assert(continuationTerminal.aggregate?.historyComplete==false && continuationTerminal.aggregate?.hasPreviousPage==true)
+
+  let staleGenerationReason=historyProgressEventRejectionReason(eventGeneration:"old-generation",activeGeneration:"new-generation",telemetryGeneration:"new-generation")
+  assert(staleGenerationReason=="stale_generation")
+  assert(historyProgressEventRejectionReason(eventGeneration:"new-generation",activeGeneration:"new-generation",telemetryGeneration:"new-generation")==nil)
+  var rejectedEventState=HistoryProgressEventRejectionState();rejectedEventState.record(staleGenerationReason!)
+  assert(rejectedEventState.counts==["stale_generation":1] && rejectedEventState.summary.contains("stale_generation"))
+  assert(continuationCycleState.perChatHistoryDiagnostics?.chats.count==1) // stale event rejection does not create a new Chat ordinal
+  assert(riskMeasurementStatus(result:"Complete",aggregate:aggregateFixture(messages:10,tokens:100,complete:true,previous:false)) == .complete)
   var continuationTrace=ChatCheckStageTelemetry(now:Date(timeIntervalSince1970:1000))
   continuationTrace.continuationSelected=true;continuationTrace.continuationStartedAt=Date(timeIntervalSince1970:1000)
   continuationTrace.continuationFrontierPresent=true;continuationTrace.continuationHasPreviousPage=true
