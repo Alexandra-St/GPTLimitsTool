@@ -17,3 +17,16 @@ test('bridge aggregates pages and sends only allowlisted totals to native',()=>{
  assert.equal(sent.at(-1).messages,1);assert.equal(sent.at(-1).images,2);assert.equal(sent.at(-1).tokens,5);assert.equal(sent.at(-1).history,'Complete');assert.equal(sent.at(-1).endpoint,'/backend-api/conversations/<id>');
  const text=JSON.stringify(sent); for(const forbidden of ['private-message-id','secret','asset_pointer','conversationId','processedMessageIds','private','example?token']) assert.ok(!text.includes(forbidden));
 });
+
+test('accepted terminal detail response proves complete history without a small-chat heuristic',()=>{
+ const context=vm.createContext({});
+ vm.runInContext(fs.readFileSync(path.join(__dirname,'../extension/aggregator.js'),'utf8'),context);
+ const item=(id)=>({id,role:'user',textTokens:5,attachments:{images:0}});
+ const state=context.GptLimitsAggregator.mergePage(null,{conversationId:'example',items:[item('u'),item('a')],hasPreviousPage:false,isPaginationResponse:false});
+ assert.equal(state.messagesCollected,2);
+ assert.equal(state.hasPreviousPage,false);
+ assert.equal(state.historyComplete,true);
+ const unknown=context.GptLimitsAggregator.mergePage(null,{conversationId:'another',items:[item('only')],isPaginationResponse:false});
+ assert.equal(unknown.historyComplete,false,'message count alone is never completion proof');
+ assert.equal(unknown.hasPreviousPage,null);
+});

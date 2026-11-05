@@ -1,6 +1,25 @@
 import AppKit
 import WebKit
 import UserNotifications
+
+func formatMaintenanceDiagnostics(lastStatus:String,chatCheckReports:[String])->(counters:String,admission:String) {
+ let counters:String
+ if let line=lastStatus.components(separatedBy:"\n").first(where:{$0.hasPrefix("Stale incomplete maintenance:")}) {
+  func value(_ label:String)->String {
+   let boundary = label == "eligible" ? "^Stale incomplete maintenance: " : "(?:^| · )"
+   let pattern=boundary+NSRegularExpression.escapedPattern(for:label)+" ([0-9]+)(?= · |$)"
+   guard let regex=try? NSRegularExpression(pattern:pattern),let match=regex.firstMatch(in:line,range:NSRange(line.startIndex...,in:line)),let range=Range(match.range(at:1),in:line) else{return "unavailable"}
+   return String(line[range])
+  }
+  let eligible=value("eligible"),admitted=value("admitted"),deferred=value("deferred by cap")
+  counters="Stale incomplete eligible: \(eligible) · admitted: \(admitted) · deferred by cap: \(deferred)"
+ } else { counters="Stale incomplete eligible: unavailable · admitted: unavailable · deferred by cap: unavailable" }
+ let admission=chatCheckReports.isEmpty ? "Per-chat admission provenance: unavailable" : "Per-chat admission provenance:\n"+chatCheckReports.map{report in
+  if let range=report.range(of:"eligibility reason ([^ ·]+)",options:.regularExpression){return String(report[range].dropFirst("eligibility reason ".count))}
+  return "admission provenance: unavailable"
+ }.joined(separator:"\n")
+ return(counters,admission)
+}
 import UniformTypeIdentifiers
 import CoreGraphics
 
@@ -103,6 +122,7 @@ final class Prototype: NSObject, NSApplicationDelegate, WKScriptMessageHandler, 
     let currentCycleSummaryOutput=NSTextField(wrappingLabelWithString:"Cycle summary: not checked")
     let perChatHistoryRawOutput=NSTextField(wrappingLabelWithString:"Per-chat history response details: not recorded")
     let conversationHistoryDiagnosticOutput=NSTextField(wrappingLabelWithString:"Current chat history source: not inspected")
+    let persistedChatRecordDiagnosticOutput=NSTextField(wrappingLabelWithString:"Current chat persisted record: not inspected")
     let messageDOMStructureDiagnosticOutput=NSTextField(wrappingLabelWithString:"Current message DOM structure: not inspected")
     var rawDiagnosticsStack:NSStackView?
     var rawDiagnosticsToggleButton:NSButton?
@@ -527,7 +547,7 @@ final class Prototype: NSObject, NSApplicationDelegate, WKScriptMessageHandler, 
     var renderLeaseReadinessContinuation:CheckedContinuation<[String:Any],Error>?
     var renderLeaseReadinessTimeout:DispatchWorkItem?
     // App version and injected diagnostic compatibility version are tracked separately.
-let gptLimitsAppVersion="6.2.2"
+let gptLimitsAppVersion="6.2.3"
 let pinnedDiagnosticVersion="6.1.0"
     let runtimeIdentityOutput=NSTextField(wrappingLabelWithString: "Runtime identity unavailable")
     let mainWindowLifecycleOutput=NSTextField(wrappingLabelWithString:"Main window lifecycle A/B/C: not sampled")
@@ -720,7 +740,7 @@ let pinnedDiagnosticVersion="6.1.0"
         let rawStack=DiagnosticsStackView();rawStack.orientation = .vertical;rawStack.alignment = .leading;rawStack.spacing=18
         rawStack.translatesAutoresizingMaskIntoConstraints=false
         rawStack.addArrangedSubview(uiLabel("Raw diagnostics",size:15,bold:true))
-        rawStack.addArrangedSubview(group("Session and chat checks",[route,button("Open ChatGPT session",#selector(showSession)),button("Check chat (hidden WebView)",#selector(check)),button("Hide session",#selector(hideSession)),output,nativeRescueOutput,perChatHistoryRawOutput]))
+        rawStack.addArrangedSubview(group("Session and chat checks",[route,button("Inspect current chat persisted record",#selector(inspectCurrentChatPersistedRecord)),persistedChatRecordDiagnosticOutput,button("Open ChatGPT session",#selector(showSession)),button("Check chat (hidden WebView)",#selector(check)),button("Hide session",#selector(hideSession)),output,nativeRescueOutput,perChatHistoryRawOutput]))
         rawStack.addArrangedSubview(group("Notifications and identity",[button("Send test notification",#selector(testNotification)),riskNotificationTitlesCheckbox,notificationOutput,notificationIdentityOutput]))
         rawStack.addArrangedSubview(group("Recent chats",[button("Refresh recent chats",#selector(refreshRecent)),button("Check first recent chat",#selector(checkFirstRecent)),listOutput]))
         rawStack.addArrangedSubview(group("Discovery diagnostics",[button("Diagnose visible home",#selector(diagnoseVisibleHome)),button("Diagnose hidden home",#selector(diagnoseHiddenHome)),button("Inspect sidebar route templates",#selector(diagnoseSidebarRoutes)),button("Inspect sidebar top position",#selector(diagnoseSidebarTopPosition)),button("Inspect sidebar scroll mechanics",#selector(inspectSidebarScrollMechanics)),button("Diagnose root sidebar scrolling",#selector(diagnoseRootSidebarScroll)),button("Inspect pinned rows at sidebar top",#selector(diagnoseVisiblePinnedRows)),lastSidebarDiagnosticOutput]))
@@ -781,6 +801,7 @@ let pinnedDiagnosticVersion="6.1.0"
             cycleState.lastStatus.components(separatedBy:"\n").first(where:{$0.hasPrefix(prefix)}) ?? "\(prefix) not recorded"
         }
         let checkedLine=line("Checked:")
+        let maintenancePresentation=formatMaintenanceDiagnostics(lastStatus:cycleState.lastStatus,chatCheckReports:chatCheckReports)
         let latest=cycleState.records.values.filter{$0.lastCheckAt != nil}.max{($0.lastCheckAt ?? 0)<($1.lastCheckAt ?? 0)}
         let result=latest?.lastCheckResult ?? "Not checked"
         let readiness=cycleState.lastRenderReadiness.map(renderReadinessDiagnosticSummary) ?? "not recorded"
@@ -794,7 +815,7 @@ let pinnedDiagnosticVersion="6.1.0"
         pinnedUnknownRowsRawOutput.stringValue=pinnedUnknownRows.isEmpty ? "Pinned proof unknown rows: none" : "Pinned proof unknown rows: \(pinnedUnknownRows.count)\n"+pinnedUnknownRows.map(\.detailLine).joined(separator:"\n")
         let pinnedUnknownCompact=pinnedUnknownRows.prefix(3).map(\.compactLine).joined(separator:"\n")
         let eventRejections=cycleState.historyProgressEventRejections?.summary ?? "none"
-        currentCycleSummaryOutput.stringValue="Build: v\(gptLimitsAppVersion) · \(gptLimitsExecutableBuildIDMarker)\n\(line("Discovery source:"))\n\(line("Coverage:"))\n\(checkedLine)\nPinned proof unknown rows: \(pinnedUnknownRows.count)\(pinnedUnknownCompact.isEmpty ? "":"\n\(pinnedUnknownCompact)")\nLast render readiness: \(readiness)\nLast chat check result: \(result)\nLast chat check trace stages: \(stages)\n\(historyParsing)\nHistory parser event rejections: \(eventRejections)\nPer-chat history diagnostics:\n\(perChatSummary.isEmpty ? "not recorded":perChatSummary)"
+        currentCycleSummaryOutput.stringValue="Build: v\(gptLimitsAppVersion) · \(gptLimitsExecutableBuildIDMarker)\n\(line("Discovery source:"))\n\(line("Coverage:"))\n\(checkedLine)\n\(maintenancePresentation.counters)\n\(maintenancePresentation.admission)\nPinned proof unknown rows: \(pinnedUnknownRows.count)\(pinnedUnknownCompact.isEmpty ? "":"\n\(pinnedUnknownCompact)")\nLast render readiness: \(readiness)\nLast chat check result: \(result)\nLast chat check trace stages: \(stages)\n\(historyParsing)\nHistory parser event rejections: \(eventRejections)\nPer-chat history diagnostics:\n\(perChatSummary.isEmpty ? "not recorded":perChatSummary)"
     }
     @objc func toggleRawDiagnostics() {
         rawDiagnosticsVisible.toggle();rawDiagnosticsStack?.isHidden = !rawDiagnosticsVisible
@@ -818,6 +839,17 @@ let pinnedDiagnosticVersion="6.1.0"
             self.conversationHistoryDiagnosticOutput.stringValue="Current chat history source: failure · diagnostic_timeout"
             self.updateCurrentCycleSummary();self.conversationHistoryDiagnosticTask=nil
         }
+    }
+    @objc func inspectCurrentChatPersistedRecord() {
+        let safeRoute=sanitizedChatCheckRoute(web.url)
+        guard safeRoute.category == .chat else {
+            persistedChatRecordDiagnosticOutput.stringValue="Current chat persisted record: matched: no · reason route_id_unavailable"
+            updateCurrentCycleSummary();return
+        }
+        let routeID=conversationID(in:web.url)
+        let snapshot=persistedChatRecordDiagnostic(routeConversationID:routeID,state:cycleState,model:currentRiskModel())
+        persistedChatRecordDiagnosticOutput.stringValue="Current chat persisted record:\n"+snapshot.displayText
+        updateCurrentCycleSummary()
     }
     @objc func inspectCurrentMessageDOMStructure() {
         guard !cycleRunning else {messageDOMStructureDiagnosticOutput.stringValue="Current message DOM structure: unavailable · a cycle is running";return}
@@ -1144,7 +1176,7 @@ let pinnedDiagnosticVersion="6.1.0"
         mainRiskRows.setViews([],in:.leading);mainUncertaintyRows.setViews([],in:.leading)
         warningAcknowledgeTagToConversationID=[:];nextWarningAcknowledgeTag=4100
         let confirmed=relevant.filter{$0.3 != .uncertain}
-        let uncertainWithoutConfirmedRisk=relevant.filter{$0.1 == .uncertain && $0.2 == .normal}
+        let uncertainWithoutConfirmedRisk=relevant.filter{$0.1 == .uncertain && $0.2 == .normal && needsAttentionActionable(record:$0.0,model:model,nowMs:nowMs)}
         let activeUncertain=uncertainWithoutConfirmedRisk.filter{warningBadgeVisible(record:$0.0,model:model,nowMs:nowMs)}
         let dismissedUncertain=uncertainWithoutConfirmedRisk.filter{!warningBadgeVisible(record:$0.0,model:model,nowMs:nowMs)}
         if confirmed.isEmpty {mainRiskRows.addArrangedSubview(uiLabel("No confirmed conversation risks."))}
@@ -1163,7 +1195,8 @@ let pinnedDiagnosticVersion="6.1.0"
             let title=record.title.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty ? "Unnamed chat":record.title
             if completeness == .uncertain && state == .uncertain {
                 let acknowledged = !warningBadgeVisible(record:record,model:model,nowMs:nowMs)
-                let status=record.lastCheckedUpdatedAt == nil || record.lastSeenUpdatedAt>record.lastCheckedUpdatedAt! ? "New activity hasn’t been fully checked yet":"Couldn’t verify full history"
+                let hasUnprocessedActivity=record.pendingActivityNeedsAttention || hasUnprocessedChatActivity(record)
+                let status=hasUnprocessedActivity ? "New activity hasn’t been fully checked yet":"Couldn’t verify full history"
                 let titleRow=uiLabel("\(title)",size:13,bold:true)
                 let lowerBound=record.aggregate.map{$0.estimatedTextTokens}.flatMap{$0>0 ? lowerBoundUserLabel($0):nil}
                 let checked=record.lastCheckAt.map{Date(timeIntervalSince1970:$0/1000).formatted(date:.abbreviated,time:.shortened)} ?? "Not checked yet"
@@ -1278,6 +1311,7 @@ let pinnedDiagnosticVersion="6.1.0"
         for id in Array(cycleState.records.keys) {
             guard var record=cycleState.records[id] else{continue}
             guard monitoringState(record:record,model:model,nowMs:nowMs) == .uncertain,
+                  needsAttentionActionable(record:record,model:model,nowMs:nowMs),
                   confirmedRiskFromLowerBound(record.aggregate?.estimatedTextTokens,model:model) == .normal,
                   warningBadgeVisible(record:record,model:model,nowMs:nowMs) else{continue}
             record.uncertainAcknowledgedAt=max(nowMs,record.lastSeenUpdatedAt)
@@ -1302,7 +1336,7 @@ let pinnedDiagnosticVersion="6.1.0"
             let confirmedStates:[RiskMonitoringState]=[.watch,.near,.critical]
             let risk=confirmedStates.contains(completeness) ? completeness:lowerBoundRisk
             if risk != .normal {counts[risk,default:0]+=1}
-            else if completeness == .uncertain && warningBadgeVisible(record:record,model:model,nowMs:nowMs) {counts[.uncertain,default:0]+=1}
+            else if completeness == .uncertain && needsAttentionActionable(record:record,model:model,nowMs:nowMs) && warningBadgeVisible(record:record,model:model,nowMs:nowMs) {counts[.uncertain,default:0]+=1}
         }
         let degraded=cycleState.monitoringDegraded == true
         var parts=[String]()

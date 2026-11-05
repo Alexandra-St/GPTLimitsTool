@@ -83,6 +83,46 @@ final class TestLockedCounter:@unchecked Sendable {
   _=failed;_=noResponse;_=noRows
  }
  static func perChatHistoryDiagnosticsTests() throws {
+  func agg(_ messages:Int,_ complete:Bool,_ previous:Bool?)->SafeAggregate {
+   SafeAggregate(conversationId:"private-id",title:"private title",processedMessageIds:[],messagesCollected:messages,userMessages:messages,assistantMessages:0,otherMessages:0,estimatedTextTokens:messages*10,attachments:.init(images:0,audio:0,video:0,files:0),historyComplete:complete,hasPreviousPage:previous,hasNextPage:nil,responsesCaptured:1,updatedAt:nil)
+  }
+  // A detail response with a non-empty aggregate and terminal false-page proof is accepted.
+  var decisionState=CycleState();decisionState.beginPerChatHistoryDiagnostic(ordinal:1)
+  let terminalDetail:[String:Any] = ["responseParseDiagnostic":["endpointTemplate":"/backend-api/conversations/:id","transport":"fetch","status":200,"contentTypeCategory":"json","topLevelType":"object","topLevelKeyNames":["messages","has_previous_page"],"topLevelArrayCounts":[],"expectedStructure":["conversationId":true,"messagesArray":true,"hasPreviousPageBoolean":true],"parserAttempted":true,"parserAccepted":true,"rejectionReason":"accepted","extractedPageCount":1,"extractedMessageCount":3,"hasPreviousPage":false]]
+  let terminalEntry=HistoryResponseParseEntry.make(terminalDetail)
+  decisionState.recordHistoryResponseParsing(terminalEntry)
+  let complete=agg(3,true,false)
+  let behaviorBefore=complete
+  decisionState.recordPerChatCompletionDecision(candidate:true,accepted:true,reason:"none",aggregate:complete,hasPreviousPage:false,historyComplete:true)
+  decisionState.recordPerChatPersistedAggregate(complete)
+  assert(complete.messagesCollected==behaviorBefore.messagesCollected && complete.historyComplete==behaviorBefore.historyComplete && complete.hasPreviousPage==behaviorBefore.hasPreviousPage)
+  assert(decisionState.perChatHistoryDiagnostics?.chats[0].completionDecision?.accepted==true)
+  assert(decisionState.perChatHistoryDiagnostics?.chats[0].completionDecision?.persistedHistoryComplete==true)
+  assert(decisionState.perChatHistoryDiagnostics?.chats[0].completionDecision?.persistedHasPreviousPage==false)
+  assert(decisionState.perChatHistoryDiagnostics?.chats[0].completionSummary.contains("completion accepted")==true)
+  decisionState.finishPerChatHistoryDiagnostic(terminal:"Complete",telemetry:nil)
+  let persistedAccepted=try JSONDecoder().decode(CycleState.self,from:JSONEncoder().encode(decisionState))
+  assert(persistedAccepted.perChatHistoryDiagnostics?.chats[0].completionDetail.contains("endpoint categories [conversation_detail]")==true)
+  // Explicit rejection gates remain distinguishable, and a later partial persistence is called out.
+  var rejectedState=CycleState();rejectedState.beginPerChatHistoryDiagnostic(ordinal:2)
+  var partial=agg(3,false,true)
+  rejectedState.recordPerChatCompletionDecision(candidate:true,accepted:false,reason:"has_previous_page_true",aggregate:partial,hasPreviousPage:true,historyComplete:false)
+  rejectedState.recordPerChatPersistedAggregate(partial)
+  assert(rejectedState.perChatHistoryDiagnostics?.chats[0].completionDecision?.reason=="has_previous_page_true")
+  partial=agg(0,false,nil)
+  rejectedState.beginPerChatHistoryDiagnostic(ordinal:3)
+  rejectedState.recordPerChatCompletionDecision(candidate:true,accepted:false,reason:"aggregate_empty",aggregate:partial,hasPreviousPage:nil,historyComplete:false)
+  assert(rejectedState.perChatHistoryDiagnostics?.chats[1].completionDecision?.reason=="aggregate_empty")
+  rejectedState.beginPerChatHistoryDiagnostic(ordinal:4)
+  rejectedState.recordPerChatCompletionDecision(candidate:true,accepted:true,reason:"none",aggregate:complete,hasPreviousPage:false,historyComplete:true)
+  rejectedState.recordPerChatPersistedAggregate(agg(3,false,true))
+  assert(rejectedState.perChatHistoryDiagnostics?.chats[2].completionDecision?.reason=="completion_set_but_lost_before_persist")
+  rejectedState.beginPerChatHistoryDiagnostic(ordinal:5)
+  rejectedState.recordPerChatCompletionDecision(candidate:false,accepted:false,reason:"no_accepted_history_response",aggregate:agg(0,false,nil),hasPreviousPage:nil,historyComplete:false)
+  assert(rejectedState.perChatHistoryDiagnostics?.chats[3].completionDecision?.reason=="no_accepted_history_response")
+  rejectedState.beginPerChatHistoryDiagnostic(ordinal:6)
+  rejectedState.recordPerChatCompletionDecision(candidate:false,accepted:false,reason:"has_previous_page_unknown",aggregate:agg(1,false,nil),hasPreviousPage:nil,historyComplete:false)
+  assert(rejectedState.perChatHistoryDiagnostics?.chats[4].completionDecision?.reason=="has_previous_page_unknown")
   var state=CycleState()
   state.beginPerChatHistoryDiagnostic(ordinal:1)
   state.recordObservedHistoryRequest();state.recordObservedHistoryResponse()
@@ -134,7 +174,7 @@ final class TestLockedCounter:@unchecked Sendable {
   assert(chats[1].ordinal==2 && chats[1].historyRequestsObserved==2 && chats[1].parserAccepted==2)
   assert(chats[2].terminalReason=="waiting_history" && chats[2].parserRejected==1 && chats[2].endpointNotRecognized==1 && chats[2].topRejectionReason=="endpoint_not_recognized")
   assert(chats[3].timeoutState=="timed_out" && chats[3].timeoutReason=="timeout_absolute_cap" && chats[3].paginationProgressObserved)
-  assert(diagnostics.summary.contains("Chat 4") && diagnostics.summary.contains("callbacks 1"))
+  assert(diagnostics.summary.contains("Chat 4") && diagnostics.summary.contains("completion not evaluated"))
   let persistedFour=try JSONDecoder().decode(CycleState.self,from:JSONEncoder().encode(state))
   assert(persistedFour.perChatHistoryDiagnostics?.chats.count==4)
   assert(persistedFour.perChatHistoryDiagnostics?.chats[2].terminalReason=="waiting_history")
@@ -242,6 +282,60 @@ final class TestLockedCounter:@unchecked Sendable {
   assert(assessRisk(model:beta,estimatedTextTokens:beta.watch,measurement:.complete).level=="Watch")
   assert(assessRisk(model:beta,estimatedTextTokens:beta.near,measurement:.complete).level=="Near")
   assert(assessRisk(model:beta,estimatedTextTokens:beta.critical,measurement:.complete).level=="Critical")
+  let cutoff=1_800_000_000_000.0
+  func maintenanceRecord(_ id:String,checked:Double,tokens:Int=131_546,result:String="Partial · pagination_progressing")->ChatRecord {
+   let aggregate=SafeAggregate(conversationId:id,title:"private",processedMessageIds:[],messagesCollected:1282,userMessages:641,assistantMessages:641,otherMessages:0,estimatedTextTokens:tokens,attachments:.init(images:0,audio:0,video:0,files:0),historyComplete:false,hasPreviousPage:true,hasNextPage:nil,responsesCaptured:2,updatedAt:nil)
+   return ChatRecord(conversationId:id,title:"private",lastSeenUpdatedAt:cutoff-2*86400000,lastCheckAt:checked,lastCheckResult:result,aggregate:aggregate)
+  }
+  let caseRecord=maintenanceRecord("vikkey-series",checked:cutoff-13*3600000)
+  let admitted=selectStaleIncompleteMaintenanceCandidates(records:[caseRecord],discoveredIDs:["vikkey-series"],recentIDs:[],nowMs:cutoff)
+  assert(admitted.eligibleCount==1 && admitted.admitted.map(\.conversationId)==["vikkey-series"])
+  assert(CycleState().queue(admitted.admitted).count==1)
+  assert(staleIncompleteMaintenanceEligibilityReason(admitted:true)=="stale_incomplete_maintenance")
+  assert(staleIncompleteMaintenanceEligibilityReason(admitted:false)==nil)
+  let tooFresh=maintenanceRecord("fresh",checked:cutoff-11*3600000)
+  assert(selectStaleIncompleteMaintenanceCandidates(records:[tooFresh],discoveredIDs:["fresh"],recentIDs:[],nowMs:cutoff).admitted.isEmpty)
+  var completeRecord=maintenanceRecord("complete",checked:cutoff-13*3600000,result:"Complete")
+  completeRecord.aggregate=SafeAggregate(conversationId:"complete",title:"private",processedMessageIds:[],messagesCollected:1282,userMessages:641,assistantMessages:641,otherMessages:0,estimatedTextTokens:131546,attachments:.init(images:0,audio:0,video:0,files:0),historyComplete:true,hasPreviousPage:false,hasNextPage:false,responsesCaptured:2,updatedAt:nil)
+  assert(selectStaleIncompleteMaintenanceCandidates(records:[completeRecord],discoveredIDs:["complete"],recentIDs:[],nowMs:cutoff).admitted.isEmpty)
+  assert(selectStaleIncompleteMaintenanceCandidates(records:[caseRecord],discoveredIDs:[],recentIDs:[],nowMs:cutoff).admitted.isEmpty)
+  assert(selectStaleIncompleteMaintenanceCandidates(records:[caseRecord],discoveredIDs:["vikkey-series"],recentIDs:["vikkey-series"],nowMs:cutoff).admitted.isEmpty)
+  let many=(0..<5).map{maintenanceRecord("id\($0)",checked:cutoff-Double(20-$0)*3600000,tokens:131546+$0)}
+  let capped=selectStaleIncompleteMaintenanceCandidates(records:many,discoveredIDs:Set(many.map(\.conversationId)),recentIDs:[],nowMs:cutoff)
+  assert(capped.eligibleCount==5 && capped.admitted.count==3 && capped.deferredCount==2)
+  assert(capped.admitted.compactMap(\.lastCheckAt)==many.prefix(3).compactMap(\.lastCheckAt))
+  let tie=selectStaleIncompleteMaintenanceCandidates(records:[maintenanceRecord("b",checked:cutoff-13*3600000,tokens:200),maintenanceRecord("a",checked:cutoff-13*3600000,tokens:300)],discoveredIDs:["a","b"],recentIDs:[],nowMs:cutoff,cap:1)
+  assert(tie.admitted.first?.aggregate?.estimatedTextTokens==300)
+  let deterministicTie=selectStaleIncompleteMaintenanceCandidates(records:[maintenanceRecord("z",checked:cutoff-13*3600000,tokens:300),maintenanceRecord("a",checked:cutoff-13*3600000,tokens:300)],discoveredIDs:["a","z"],recentIDs:[],nowMs:cutoff,cap:1)
+  assert(deterministicTie.admitted.first?.conversationId=="a")
+  let regression=maintenanceRecord("regression-vikkey-series",checked:cutoff-13*3600000)
+  assert(regression.aggregate?.estimatedTextTokens==131546 && regression.lastSeenUpdatedAt<cutoff-21600000)
+  assert(selectStaleIncompleteMaintenanceCandidates(records:[regression],discoveredIDs:["regression-vikkey-series"],recentIDs:[],nowMs:cutoff).admitted.count==1)
+  let skippedUnchangedRecord=ChatRecord(conversationId:"unchanged",title:"private",lastSeenUpdatedAt:cutoff-10_000,lastCheckedUpdatedAt:cutoff-10_000,lastCheckResult:"Complete",aggregate:SafeAggregate(conversationId:"unchanged",title:"",processedMessageIds:[],messagesCollected:2,userMessages:1,assistantMessages:1,otherMessages:0,estimatedTextTokens:100,attachments:.init(images:0,audio:0,video:0,files:0),historyComplete:true,hasPreviousPage:false,hasNextPage:false,responsesCaptured:1,updatedAt:nil))
+  let excludedForCooldown=maintenanceRecord("cooldown",checked:cutoff-11*3600000)
+  let unchangedQueue=CycleState().queue([skippedUnchangedRecord]+selectStaleIncompleteMaintenanceCandidates(records:[excludedForCooldown],discoveredIDs:["cooldown"],recentIDs:[],nowMs:cutoff).admitted)
+  assert(unchangedQueue.isEmpty) // excluded maintenance records never enter candidate count or alter Skipped unchanged
+  var diagnosticState=CycleState()
+  var matchedRecord=ChatRecord(conversationId:"route-secret-id",title:"PRIVATE TITLE",lastSeenUpdatedAt:2_000,lastCheckAt:1_500,lastCheckResult:"Partial · pagination_progressing",lastRiskRank:2,lastNotifiedRiskRank:2)
+  matchedRecord.aggregate=SafeAggregate(conversationId:"route-secret-id",title:"PRIVATE TITLE",processedMessageIds:["PRIVATE MESSAGE ID"],messagesCollected:17,userMessages:8,assistantMessages:9,otherMessages:0,estimatedTextTokens:420_000,attachments:.init(images:0,audio:0,video:0,files:0),historyComplete:false,hasPreviousPage:true,hasNextPage:nil,responsesCaptured:2,updatedAt:nil)
+  matchedRecord.pendingActivityNeedsAttention=true
+  var decoyRecord=ChatRecord(conversationId:"other-secret-id",title:"OTHER PRIVATE TITLE",lastSeenUpdatedAt:3_000,lastCheckResult:"Complete")
+  decoyRecord.aggregate=SafeAggregate(conversationId:"other-secret-id",title:"OTHER PRIVATE TITLE",processedMessageIds:[],messagesCollected:4,userMessages:2,assistantMessages:2,otherMessages:0,estimatedTextTokens:beta.critical,attachments:.init(images:0,audio:0,video:0,files:0),historyComplete:true,hasPreviousPage:false,hasNextPage:false,responsesCaptured:1,updatedAt:nil)
+  diagnosticState.records[matchedRecord.conversationId]=matchedRecord;diagnosticState.records[decoyRecord.conversationId]=decoyRecord
+  diagnosticState.notificationAudit=[NotificationAuditRecord(auditId:"audit-secret",kind:"risk",conversationId:"route-secret-id",level:"Near",createdAt:1_550,dispatchAttemptedAt:1_551,outcome:"accepted",dedupKey:"PRIVATE DEDUP KEY",userVisibleDelivery:"unknown")]
+  let beforeDiagnostic=try! JSONSerialization.jsonObject(with:JSONEncoder().encode(diagnosticState)) as! NSDictionary
+  let matchedDiagnostic=persistedChatRecordDiagnostic(routeConversationID:"route-secret-id",state:diagnosticState)
+  let afterDiagnostic=try! JSONSerialization.jsonObject(with:JSONEncoder().encode(diagnosticState)) as! NSDictionary
+  assert(matchedDiagnostic.matched && matchedDiagnostic.lastCheckResult=="Partial · pagination_progressing")
+  assert(matchedDiagnostic.measurement=="Partial" && matchedDiagnostic.riskCategory=="At least Near" && matchedDiagnostic.betaRiskCategory=="At least Near", "\(matchedDiagnostic.measurement) / \(matchedDiagnostic.riskCategory) / \(matchedDiagnostic.betaRiskCategory)")
+  assert(matchedDiagnostic.tokenLowerBound==420_000 && matchedDiagnostic.messageLowerBound==17 && matchedDiagnostic.historyComplete=="no" && matchedDiagnostic.hasPreviousPage=="yes")
+  assert(matchedDiagnostic.activityState=="new_activity_pending" && matchedDiagnostic.notificationGenerated=="yes" && matchedDiagnostic.notificationOutcome=="accepted" && matchedDiagnostic.notificationLevel=="Near")
+  assert(matchedDiagnostic.priorWatchNearCritical=="yes · Near")
+  for secret in ["route-secret-id","other-secret-id","PRIVATE TITLE","OTHER PRIVATE TITLE","PRIVATE MESSAGE ID","PRIVATE DEDUP KEY","https://"] {assert(!matchedDiagnostic.displayText.contains(secret))}
+  assert(beforeDiagnostic==afterDiagnostic)
+  assert(persistedChatRecordDiagnostic(routeConversationID:"missing-secret-id",state:diagnosticState).displayText=="matched: no · reason record_not_present")
+  assert(persistedChatRecordDiagnostic(routeConversationID:nil,state:diagnosticState).displayText=="matched: no · reason route_id_unavailable")
+  assert(persistedChatRecordDiagnostic(routeConversationID:"route-secret-id",state:nil).displayText=="matched: no · reason state_not_loaded")
   // Token thresholds never label a chat Limit reached.
   assert(assessRisk(model:beta,estimatedTextTokens:900000,measurement:.complete).level=="Critical")
   assert(assessRisk(model:beta,estimatedTextTokens:beta.watch-1,measurement:.partial).level=="Unknown")
@@ -346,6 +440,54 @@ final class TestLockedCounter:@unchecked Sendable {
   assert(riskMeasurementStatus(result:"Complete",aggregate:aggregate) == .complete)
   assert(riskMeasurementStatus(result:"Partial",aggregate:aggregate) == .partial)
   assert(riskMeasurementStatus(result:"Failed",aggregate:aggregate) == .unknown)
+  // A short conversation is complete only when the accepted terminal page proves it.
+  let shortComplete=SafeAggregate(conversationId:"short",title:"Short",processedMessageIds:["u","a"],messagesCollected:2,userMessages:1,assistantMessages:1,otherMessages:0,estimatedTextTokens:120,attachments:.init(images:0,audio:0,video:0,files:0),historyComplete:true,hasPreviousPage:false,hasNextPage:false,responsesCaptured:1,updatedAt:nil)
+  let stalePartial=SafeAggregate(conversationId:"short",title:"Short",processedMessageIds:["u","a"],messagesCollected:2,userMessages:1,assistantMessages:1,otherMessages:0,estimatedTextTokens:100,attachments:.init(images:0,audio:0,video:0,files:0),historyComplete:false,hasPreviousPage:true,hasNextPage:false,responsesCaptured:1,updatedAt:nil)
+  var staleShort=ChatRecord(conversationId:"short",title:"Short",lastSeenUpdatedAt:2000,lastCheckedUpdatedAt:1000,lastCheckResult:"Partial · pagination_no_progress",aggregate:stalePartial,consecutiveIncompleteChecks:2,uncertainSince:900,uncertainAcknowledgedAt:1100,partialObservedActivityAt:2000,paginationBoundaryMessageCount:2)
+  staleShort.aggregate=shortComplete;staleShort.lastCheckResult="Complete";staleShort.lastCheckedUpdatedAt=staleShort.lastSeenUpdatedAt
+  staleShort.consecutiveIncompleteChecks=0;staleShort.partialObservedActivityAt=nil;staleShort.paginationBoundaryMessageCount=nil;staleShort.uncertainSince=nil;staleShort.uncertainAcknowledgedAt=nil
+  assert(riskMeasurementStatus(result:staleShort.lastCheckResult,aggregate:staleShort.aggregate) == .complete)
+  assert(monitoringState(record:staleShort,model:beta,nowMs:3000) == .normal)
+  assert(!warningBadgeVisible(record:staleShort,model:beta,nowMs:3000))
+  func partialRecord(lastSeen:Double,lastCheck:Double?,tokens:Int,activityFlag:Bool=false)->ChatRecord {
+   let partialAggregate=SafeAggregate(conversationId:"attention",title:"private",processedMessageIds:[],messagesCollected:2,userMessages:1,assistantMessages:1,otherMessages:0,estimatedTextTokens:tokens,attachments:.init(images:0,audio:0,video:0,files:0),historyComplete:false,hasPreviousPage:true,hasNextPage:nil,responsesCaptured:1,updatedAt:nil)
+   var value=ChatRecord(conversationId:"attention",title:"private",lastSeenUpdatedAt:lastSeen,lastCheckedUpdatedAt:nil,lastCheckAt:lastCheck,lastCheckResult:"Partial · pagination_no_progress",aggregate:partialAggregate)
+   value.pendingActivityNeedsAttention=activityFlag
+   return value
+  }
+  let stalePartialRecord=partialRecord(lastSeen:1000,lastCheck:1001,tokens:beta.watch-1)
+  assert(monitoringState(record:stalePartialRecord,model:beta,nowMs:3000) == .uncertain)
+  assert(!needsAttentionActionable(record:stalePartialRecord,model:beta,nowMs:3000)) // old partial, no activity delta and below Watch
+  let noTimestampGate=partialRecord(lastSeen:1000,lastCheck:nil,tokens:beta.watch-1)
+  assert(!hasUnprocessedChatActivity(noTimestampGate) && !needsAttentionActionable(record:noTimestampGate,model:beta,nowMs:3000))
+  let activePartial=partialRecord(lastSeen:1002,lastCheck:1001,tokens:beta.watch-1)
+  assert(needsAttentionActionable(record:activePartial,model:beta,nowMs:3000))
+  let currentCyclePartial=partialRecord(lastSeen:1000,lastCheck:1001,tokens:beta.watch-1,activityFlag:true)
+  assert(needsAttentionActionable(record:currentCyclePartial,model:beta,nowMs:3000))
+  let pendingRoundTrip=try! JSONDecoder().decode(ChatRecord.self,from:JSONEncoder().encode(currentCyclePartial))
+  assert(pendingRoundTrip.pendingActivityNeedsAttention)
+  for (tokens,expected) in [(beta.watch,RiskMonitoringState.watch),(beta.near,.near),(beta.critical,.critical)] {
+   let riskPartial=partialRecord(lastSeen:1000,lastCheck:1001,tokens:tokens)
+   assert(confirmedRiskFromLowerBound(tokens,model:beta)==expected)
+   assert(needsAttentionActionable(record:riskPartial,model:beta,nowMs:3000))
+  }
+  var staleThenActive=stalePartialRecord;assert(!needsAttentionActionable(record:staleThenActive,model:beta,nowMs:3000))
+  staleThenActive.lastSeenUpdatedAt=1002 // new activity makes the same preserved Partial actionable again
+  assert(needsAttentionActionable(record:staleThenActive,model:beta,nowMs:3000))
+  assert(!needsAttentionActionable(record:staleShort,model:beta,nowMs:3000)) // Complete below Watch
+  var shortWithoutProof=staleShort;shortWithoutProof.lastCheckResult="Partial · no_progress · waiting_history";shortWithoutProof.aggregate?.historyComplete=false;shortWithoutProof.aggregate?.hasPreviousPage=nil;shortWithoutProof.uncertainSince=2000
+  assert(riskMeasurementStatus(result:shortWithoutProof.lastCheckResult,aggregate:shortWithoutProof.aggregate) == .partial)
+  assert(monitoringState(record:shortWithoutProof,model:beta,nowMs:3000) == .uncertain)
+  var largePartial=staleShort;largePartial.lastCheckResult="Partial · pagination_no_progress";largePartial.aggregate?.historyComplete=false;largePartial.aggregate?.hasPreviousPage=true;largePartial.aggregate?.estimatedTextTokens=250_000;largePartial.uncertainSince=2000
+  assert(warningBadgeVisible(record:largePartial,model:beta,nowMs:3000))
+  let completeBelowWatch=staleShort
+  assert(monitoringState(record:completeBelowWatch,model:beta,nowMs:3000) == .normal)
+  for (tokens,expected) in [(beta.watch,"Watch"),(beta.near,"Near"),(beta.critical,"Critical")] {
+   var atRisk=staleShort;atRisk.aggregate?.estimatedTextTokens=tokens
+   let state=monitoringState(record:atRisk,model:beta,nowMs:3000)
+   assert(state.rawValue==expected)
+   assert(warningBadgeVisible(record:atRisk,model:beta,nowMs:3000))
+  }
   assert(confirmedRiskFromLowerBound(200_000,model:beta) == .normal)
   assert(confirmedRiskFromLowerBound(330_000,model:beta) == .watch)
   assert(confirmedRiskFromLowerBound(420_000,model:beta) == .near)
@@ -360,6 +502,7 @@ final class TestLockedCounter:@unchecked Sendable {
   assert(oldRecord.calibrationLabel==nil && oldRecord.lastRiskRank==nil)
   assert(oldRecord.lastNotifiedRiskRank==nil && oldRecord.consecutiveIncompleteChecks==0)
   assert(oldRecord.uncertainSince==nil && oldRecord.uncertainAcknowledgedAt==nil)
+  assert(oldRecord.pendingActivityNeedsAttention==false)
   var active=ChatRecord(conversationId:"private-id",title:"private-title",lastSeenUpdatedAt:1000,lastCheckResult:"Partial · pagination_no_progress",aggregate:aggregate)
   active.aggregate?.historyComplete=false;active.aggregate?.hasPreviousPage=true
   assert(monitoringState(record:active,model:beta,nowMs:2000) == .uncertain)

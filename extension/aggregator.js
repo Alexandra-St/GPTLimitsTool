@@ -159,7 +159,9 @@
     if (typeof page.hasPreviousPage === "boolean") {
       if (page.hasPreviousPage === false) {
         state.hasPreviousPage = false;
-        if (page.isPaginationResponse === true) state.historyComplete = true;
+        // Endpoint class is not itself completion proof: an accepted response with
+        // explicit terminal pagination metadata and a nonempty aggregate is.
+        if (state.messagesCollected > 0) state.historyComplete = true;
       } else if (state.hasPreviousPage !== false) {
         state.hasPreviousPage = true;
       }

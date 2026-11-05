@@ -167,10 +167,11 @@ struct ChatRecord: Codable {
  var uncertainSince:Double? = nil
  var uncertainAcknowledgedAt:Double? = nil
  var partialObservedActivityAt:Double? = nil
+ var pendingActivityNeedsAttention=false
  var paginationBoundaryMessageCount:Int? = nil
 }
 extension ChatRecord {
- private enum CodingKeys:String,CodingKey {case conversationId,title,lastSeenUpdatedAt,lastSeenUpdatedAtSource,lastSeenUpdatedAtObservedAt,lastCheckedUpdatedAt,lastCheckAt,lastCheckResult,aggregate,calibrationLabel,lastRiskRank,lastNotifiedRiskRank,consecutiveIncompleteChecks,lastUncertainNotificationAt,uncertainSince,uncertainAcknowledgedAt,partialObservedActivityAt,paginationBoundaryMessageCount}
+ private enum CodingKeys:String,CodingKey {case conversationId,title,lastSeenUpdatedAt,lastSeenUpdatedAtSource,lastSeenUpdatedAtObservedAt,lastCheckedUpdatedAt,lastCheckAt,lastCheckResult,aggregate,calibrationLabel,lastRiskRank,lastNotifiedRiskRank,consecutiveIncompleteChecks,lastUncertainNotificationAt,uncertainSince,uncertainAcknowledgedAt,partialObservedActivityAt,pendingActivityNeedsAttention,paginationBoundaryMessageCount}
  init(from decoder:Decoder)throws {
   let c=try decoder.container(keyedBy:CodingKeys.self)
   conversationId=try c.decode(String.self,forKey:.conversationId);title=try c.decode(String.self,forKey:.title)
@@ -187,6 +188,7 @@ extension ChatRecord {
   uncertainSince=try c.decodeIfPresent(Double.self,forKey:.uncertainSince)
   uncertainAcknowledgedAt=try c.decodeIfPresent(Double.self,forKey:.uncertainAcknowledgedAt)
   partialObservedActivityAt=try c.decodeIfPresent(Double.self,forKey:.partialObservedActivityAt)
+  pendingActivityNeedsAttention=try c.decodeIfPresent(Bool.self,forKey:.pendingActivityNeedsAttention) ?? false
   paginationBoundaryMessageCount=try c.decodeIfPresent(Int.self,forKey:.paginationBoundaryMessageCount)
  }
 }
@@ -423,6 +425,40 @@ func confirmedRiskFromLowerBound(_ lowerBoundTokens:Int?,model:RiskModel)->RiskM
  if tokens>=model.watch {return .watch}
  return .normal
 }
+func hasUnprocessedChatActivity(_ record:ChatRecord)->Bool {
+ guard record.lastSeenUpdatedAt.isFinite,record.lastSeenUpdatedAt>0 else{return false}
+ if let checkedAt=record.lastCheckAt,checkedAt.isFinite,checkedAt>0 {return record.lastSeenUpdatedAt>checkedAt}
+ if let checkedActivity=record.lastCheckedUpdatedAt,checkedActivity.isFinite,checkedActivity>0 {return record.lastSeenUpdatedAt>checkedActivity}
+ return false
+}
+struct StaleIncompleteMaintenanceSelection {
+ let eligibleCount:Int
+ let admitted:[ChatRecord]
+ var deferredCount:Int {max(0,eligibleCount-admitted.count)}
+}
+func staleIncompleteMaintenanceEligibilityReason(admitted:Bool)->String? {admitted ? "stale_incomplete_maintenance":nil}
+let staleIncompleteMaintenanceCooldownMs:Double=12*60*60*1000
+let staleIncompleteMaintenanceCap=3
+func selectStaleIncompleteMaintenanceCandidates(records:[ChatRecord],discoveredIDs:Set<String>,recentIDs:Set<String>,nowMs:Double,cap:Int=staleIncompleteMaintenanceCap)->StaleIncompleteMaintenanceSelection {
+ let unique=Dictionary(records.map{($0.conversationId,$0)},uniquingKeysWith:{_,newer in newer})
+ let eligible=unique.values.filter { record in
+  guard discoveredIDs.contains(record.conversationId),!recentIDs.contains(record.conversationId),
+        riskMeasurementStatus(result:record.lastCheckResult,aggregate:record.aggregate) != .complete,
+        let checked=record.lastCheckAt,checked.isFinite,checked>0 else{return false}
+  return nowMs.isFinite && nowMs>=checked && nowMs-checked>=staleIncompleteMaintenanceCooldownMs
+ }.sorted {
+  let a=$0.lastCheckAt ?? 0,b=$1.lastCheckAt ?? 0
+  if a != b {return a<b}
+  let at=$0.aggregate?.estimatedTextTokens ?? -1,bt=$1.aggregate?.estimatedTextTokens ?? -1
+  if at != bt {return at>bt}
+  return $0.conversationId<$1.conversationId
+ }
+ return StaleIncompleteMaintenanceSelection(eligibleCount:eligible.count,admitted:Array(eligible.prefix(max(0,cap))))
+}
+func needsAttentionActionable(record:ChatRecord,model:RiskModel,nowMs:Double)->Bool {
+ guard monitoringState(record:record,model:model,nowMs:nowMs) == .uncertain else{return false}
+ return hasUnprocessedChatActivity(record) || record.pendingActivityNeedsAttention || confirmedRiskFromLowerBound(record.aggregate?.estimatedTextTokens,model:model) != .normal
+}
 func monitoringState(record:ChatRecord,model:RiskModel,nowMs:Double)->RiskMonitoringState {
  let measurement=riskMeasurementStatus(result:record.lastCheckResult,aggregate:record.aggregate)
  if measurement == .complete,let aggregate=record.aggregate,record.lastCheckedUpdatedAt != nil,
@@ -473,6 +509,57 @@ struct NotificationAuditRecord:Codable {
  var outcome:String
  var dedupKey:String
  var userVisibleDelivery:String? = "unknown"
+}
+struct PersistedChatRecordDiagnostic:Equatable {
+ let matched:Bool
+ let reason:String?
+ let lastCheckResult:String
+ let measurement:String
+ let riskCategory:String
+ let tokenLowerBound:Int?
+ let messageLowerBound:Int?
+ let historyComplete:String
+ let hasPreviousPage:String
+ let lastCheckAt:Double?
+ let activityState:String
+ let betaRiskCategory:String
+ let notificationGenerated:String
+ let notificationOutcome:String
+ let notificationLevel:String
+ let notificationSuppressionReason:String
+ let lastAcceptedNotifiedRisk:String
+ let priorWatchNearCritical:String
+ var displayText:String {
+  guard matched else{return "matched: no · reason \(reason ?? "record_not_present")"}
+  func number(_ value:Int?)->String {value.map(String.init) ?? "unknown"}
+  func timestamp(_ value:Double?)->String {guard let value,value.isFinite,value>0 else{return "unknown"};return ISO8601DateFormatter().string(from:Date(timeIntervalSince1970:value/1000))}
+  return "matched: yes\nlastCheckResult: \(lastCheckResult)\nrisk measurement: \(measurement)\nrisk category: \(riskCategory)\ntoken lower bound: \(number(tokenLowerBound)) · message lower bound: \(number(messageLowerBound))\nhistoryComplete: \(historyComplete) · hasPreviousPage: \(hasPreviousPage)\nlastCheckAt: \(timestamp(lastCheckAt))\nactivity/new activity: \(activityState)\nBeta-baseline risk classification: \(betaRiskCategory)\nnotification: generated \(notificationGenerated) · \(notificationOutcome) · level \(notificationLevel) · reason \(notificationSuppressionReason) · last accepted rank \(lastAcceptedNotifiedRisk)\nwas Watch/Near/Critical before last check: \(priorWatchNearCritical)"
+ }
+}
+func persistedChatRecordDiagnostic(routeConversationID:String?,state:CycleState?,model:RiskModel = .beta)->PersistedChatRecordDiagnostic {
+ func unavailable(_ reason:String)->PersistedChatRecordDiagnostic {PersistedChatRecordDiagnostic(matched:false,reason:reason,lastCheckResult:"unknown",measurement:"unknown",riskCategory:"unknown",tokenLowerBound:nil,messageLowerBound:nil,historyComplete:"unknown",hasPreviousPage:"unknown",lastCheckAt:nil,activityState:"unknown",betaRiskCategory:"unknown",notificationGenerated:"no",notificationOutcome:"not_recorded",notificationLevel:"unknown",notificationSuppressionReason:reason,lastAcceptedNotifiedRisk:"unknown",priorWatchNearCritical:"unknown")}
+ guard let routeConversationID,routeConversationID.range(of:#"^[A-Za-z0-9_-]{1,128}$"#,options:.regularExpression) != nil else{return unavailable("route_id_unavailable")}
+ guard let state else{return unavailable("state_not_loaded")}
+ guard let record=state.records[routeConversationID],record.conversationId==routeConversationID else{return unavailable("record_not_present")}
+ let aggregate=record.aggregate
+ let measurement=riskMeasurementStatus(result:record.lastCheckResult,aggregate:aggregate)
+ let assessment=assessRisk(model:model,estimatedTextTokens:aggregate?.estimatedTextTokens,measurement:measurement)
+ let betaAssessment=assessRisk(model:.beta,estimatedTextTokens:aggregate?.estimatedTextTokens,measurement:measurement)
+ let previousAudit=(state.notificationAudit ?? []).filter{$0.conversationId==routeConversationID && $0.kind=="risk"}.max{$0.createdAt < $1.createdAt}
+ let outcome=previousAudit?.outcome ?? "not_recorded"
+ let auditLevel=previousAudit?.level
+ let suppression:String
+ if let previousAudit {
+  switch previousAudit.outcome {case "accepted":suppression="none";case "add_error","permission_denied","interrupted":suppression=previousAudit.outcome;case "pending","attempted":suppression="dispatch_\(previousAudit.outcome)";default:suppression="audit_\(previousAudit.outcome)"}
+ } else {suppression="notification_decision_not_persisted"}
+ let completeAndCurrent=measurement == .complete && record.lastCheckedUpdatedAt != nil && record.lastSeenUpdatedAt<=record.lastCheckedUpdatedAt!
+ let activity=hasUnprocessedChatActivity(record) ? "new_activity_pending":(record.pendingActivityNeedsAttention ? "pending_activity_flagged":(completeAndCurrent ? "no_new_activity":"not_proven"))
+ let riskLevel=assessment.level
+ let betaRisk=betaAssessment.rank.map{betaAssessment.measurement == .partial ? "At least \(["Normal","Watch","Near","Critical"][max(0,min(3,$0))])":"\(["Normal","Watch","Near","Critical"][max(0,min(3,$0))])"} ?? "Unknown"
+ let priorRisk=record.lastRiskRank.map{$0>=3 ? "yes · Critical":($0==2 ? "yes · Near":($0==1 ? "yes · Watch":"no"))} ?? "unknown"
+ let acceptedRisk=record.lastNotifiedRiskRank.map{$0>=3 ? "Critical":($0==2 ? "Near":($0==1 ? "Watch":"Normal"))} ?? "none recorded"
+ let generated=previousAudit == nil ? "unknown · no retained per-record audit":"yes"
+ return PersistedChatRecordDiagnostic(matched:true,reason:nil,lastCheckResult:record.lastCheckResult ?? "unknown",measurement:measurement.rawValue,riskCategory:riskLevel,tokenLowerBound:aggregate?.estimatedTextTokens,messageLowerBound:aggregate?.messagesCollected,historyComplete:aggregate.map{$0.historyComplete ? "yes":"no"} ?? "unknown",hasPreviousPage:aggregate?.hasPreviousPage.map{$0 ? "yes":"no"} ?? "unknown",lastCheckAt:record.lastCheckAt,activityState:activity,betaRiskCategory:betaRisk,notificationGenerated:generated,notificationOutcome:outcome,notificationLevel:auditLevel ?? "unknown",notificationSuppressionReason:suppression,lastAcceptedNotifiedRisk:acceptedRisk,priorWatchNearCritical:priorRisk)
 }
 func notificationAuditStatus(outcome:String,userVisibleDelivery:String?)->String {
  let visibility=(userVisibleDelivery ?? "unknown") == "unknown" ? "user-visible delivery unknown":"user-visible delivery (userVisibleDelivery!)"
@@ -746,10 +833,22 @@ struct PerChatHistoryDiagnostic:Codable,Equatable {
  var timeoutState="not_timed_out"
  var timeoutReason="none"
  var responseEntries:[HistoryResponseParseEntry]=[]
+ var completionDecision:ChatCompletionDecisionDiagnostic?
 
  init(ordinal:Int){self.ordinal=max(1,ordinal)}
  mutating func recordHistoryRequest(){historyRequestsObserved=min(100000,historyRequestsObserved+1)}
  mutating func recordHistoryResponse(){historyResponsesObserved=min(100000,historyResponsesObserved+1)}
+ mutating func recordCompletionDecision(candidate:Bool,accepted:Bool,reason:String,aggregate:SafeAggregate,hasPreviousPage:Bool?,historyComplete:Bool) {
+  guard completionDecision?.accepted != true else{return}
+  let allowed=Set(["none","no_accepted_history_response","aggregate_empty","has_previous_page_true","has_previous_page_unknown","terminal_false_page_observed","completion_set_but_lost_before_persist","completion_proof_not_set","completion_candidate_not_present","previously_complete_unchanged"])
+  completionDecision=ChatCompletionDecisionDiagnostic(candidate:candidate,accepted:accepted,reason:allowed.contains(reason) ? reason:"completion_proof_not_set",aggregateMessages:min(100000,max(0,aggregate.messagesCollected)),hasPreviousPage:hasPreviousPage,historyComplete:historyComplete)
+ }
+ mutating func recordPersistedAggregate(_ aggregate:SafeAggregate?) {
+  guard var decision=completionDecision else{return}
+  decision.persistedHistoryComplete=aggregate?.historyComplete;decision.persistedHasPreviousPage=aggregate?.hasPreviousPage;decision.persistedMessages=aggregate?.messagesCollected
+  if decision.accepted && !(aggregate?.historyComplete == true && aggregate?.hasPreviousPage == false) {decision.reason="completion_set_but_lost_before_persist"}
+  completionDecision=decision
+ }
  mutating func append(_ entry:HistoryResponseParseEntry){
   if entry.parserAttempted {
    parserAttempted=min(100000,parserAttempted+1)
@@ -809,9 +908,25 @@ struct PerChatHistoryDiagnostic:Codable,Equatable {
   return responseEntries.enumerated().map {index,e in
    let keys=e.topLevelKeyNames.sorted().joined(separator:",")
    let arrays=e.topLevelArrayCounts.keys.sorted().map{"\($0)=\(e.topLevelArrayCounts[$0] ?? 0)"}.joined(separator:",")
-   return "Chat \(ordinal) response \(index+1) · \(e.endpointTemplate) · \(e.transport) HTTP \(e.status) \(e.contentTypeCategory) · shape \(e.topLevelType) keys [\(keys)] arrays [\(arrays)] · expected conversation/messages/mapping/pageInfo/hasPrevious \(e.expectedConversationId)/\(e.expectedMessagesArray)/\(e.mappingObjectPresent)/\(e.pageInfoObjectPresent)/\(e.hasPreviousPageField) · parser attempted/accepted \(e.parserAttempted)/\(e.parserAccepted) · rejection \(e.rejectionReason) · extracted \(e.extractedMessageCount.map(String.init) ?? "unknown") messages / \(e.extractedPageCount) pages · hasPreviousPage \(e.hasPreviousPage.map{$0 ? "yes":"no"} ?? "unknown") · callback \(e.pageUpdateCallbackFired ? "yes":"no")"
+   let category=e.endpointTemplate.contains("/messages") ? "conversation_messages":(e.endpointTemplate.contains("/conversations/:id") ? "conversation_detail":"other")
+   return "Chat \(ordinal) response \(index+1) · endpoint_category \(category) · \(e.transport) HTTP \(e.status) \(e.contentTypeCategory) · shape \(e.topLevelType) keys [\(keys)] arrays [\(arrays)] · expected conversation/messages/mapping/pageInfo/hasPrevious \(e.expectedConversationId)/\(e.expectedMessagesArray)/\(e.mappingObjectPresent)/\(e.pageInfoObjectPresent)/\(e.hasPreviousPageField) · parser attempted/accepted \(e.parserAttempted)/\(e.parserAccepted) · rejection \(e.rejectionReason) · extracted \(e.extractedMessageCount.map(String.init) ?? "unknown") messages / \(e.extractedPageCount) pages · hasPreviousPage \(e.hasPreviousPage.map{$0 ? "yes":"no"} ?? "unknown") · callback \(e.pageUpdateCallbackFired ? "yes":"no")"
   }.joined(separator:"\n")
  }
+ var completionSummary:String {
+  guard let d=completionDecision else{return "Chat \(ordinal) · completion not evaluated"}
+  return "Chat \(ordinal) · messages \(d.aggregateMessages) · hasPreviousPage \(d.hasPreviousPage.map{$0 ? "yes":"no"} ?? "unknown") · completion \(d.accepted ? "accepted":"rejected") · reason \(d.reason)"
+ }
+ var completionDetail:String {
+  guard let d=completionDecision else{return "Chat \(ordinal) completion decision: not evaluated"}
+  let endpoints=responseEntries.filter{$0.parserAccepted}.map{$0.endpointTemplate.contains("/messages") ? "conversation_messages":($0.endpointTemplate.contains("/conversations/:id") ? "conversation_detail":"other")}.suffix(20).joined(separator:",")
+  let falsePage=responseEntries.contains{$0.parserAccepted && $0.hasPreviousPage==false} ? "yes":"no"
+  return "Chat \(ordinal) completion trace · accepted history responses \(parserAccepted) · endpoint categories [\(endpoints.isEmpty ? "none":endpoints)] · aggregate messages at decision \(d.aggregateMessages) · latest hasPreviousPage \(d.hasPreviousPage.map{$0 ? "yes":"no"} ?? "unknown") · false page observed \(falsePage) · aggregate non-empty then \(d.aggregateMessages>0 ? "yes":"no") · historyComplete set \(d.historyComplete ? "yes":"no") · completion candidate \(d.candidate ? "yes":"no") · completion proof \(d.accepted ? "accepted":"rejected") · rejection reason \(d.reason) · terminal result \(terminalResult) · persisted messages \(d.persistedMessages.map(String.init) ?? "unknown") · persisted historyComplete \(d.persistedHistoryComplete.map{$0 ? "true":"false"} ?? "unknown") · persisted hasPreviousPage \(d.persistedHasPreviousPage.map{$0 ? "true":"false"} ?? "unknown")"
+ }
+}
+
+struct ChatCompletionDecisionDiagnostic:Codable,Equatable {
+ let candidate:Bool;let accepted:Bool;var reason:String;let aggregateMessages:Int;let hasPreviousPage:Bool?;let historyComplete:Bool
+ var persistedHistoryComplete:Bool?;var persistedHasPreviousPage:Bool?;var persistedMessages:Int?
 }
 
 struct PerChatHistoryDiagnostics:Codable,Equatable {
@@ -832,8 +947,10 @@ struct PerChatHistoryDiagnostics:Codable,Equatable {
  mutating func append(_ entry:HistoryResponseParseEntry){updateActive{$0.append(entry)}}
  mutating func finish(terminal:String,telemetry:ChatCheckStageTelemetry?){updateActive{$0.finish(terminal:terminal,telemetry:telemetry)};activeOrdinal=nil}
  mutating func observe(telemetry:ChatCheckStageTelemetry){updateActive{$0.observe(telemetry:telemetry)}}
- var summary:String {chats.map{$0.compactSummary}.joined(separator:"\n")}
- var detailedResponseSummary:String {chats.map{$0.detailedResponseSummary}.joined(separator:"\n")}
+ mutating func recordCompletionDecision(candidate:Bool,accepted:Bool,reason:String,aggregate:SafeAggregate,hasPreviousPage:Bool?,historyComplete:Bool){updateActive{$0.recordCompletionDecision(candidate:candidate,accepted:accepted,reason:reason,aggregate:aggregate,hasPreviousPage:hasPreviousPage,historyComplete:historyComplete)}}
+ mutating func recordPersistedAggregate(_ aggregate:SafeAggregate?){updateActive{$0.recordPersistedAggregate(aggregate)}}
+ var summary:String {chats.map{$0.completionSummary}.joined(separator:"\n")}
+ var detailedResponseSummary:String {chats.flatMap{[$0.compactSummary,$0.detailedResponseSummary,$0.completionDetail]}.joined(separator:"\n")}
 }
 func chatCheckTraceTerminalReason(_ result:String)->ChatCheckTraceReason {
  let value=result.lowercased()
@@ -895,6 +1012,8 @@ struct CycleState: Codable {
  mutating func recordObservedHistoryResponse(){if lastHistoryResponseParsing==nil {lastHistoryResponseParsing=HistoryResponseParsingState()};lastHistoryResponseParsing?.recordObservedResponse();perChatHistoryDiagnostics?.recordObservedResponse()}
  mutating func recordObservedHistoryRequest(){perChatHistoryDiagnostics?.recordRequest()}
  mutating func observePerChatHistoryDiagnostic(_ telemetry:ChatCheckStageTelemetry){perChatHistoryDiagnostics?.observe(telemetry:telemetry)}
+ mutating func recordPerChatCompletionDecision(candidate:Bool,accepted:Bool,reason:String,aggregate:SafeAggregate,hasPreviousPage:Bool?,historyComplete:Bool){perChatHistoryDiagnostics?.recordCompletionDecision(candidate:candidate,accepted:accepted,reason:reason,aggregate:aggregate,hasPreviousPage:hasPreviousPage,historyComplete:historyComplete)}
+ mutating func recordPerChatPersistedAggregate(_ aggregate:SafeAggregate?){perChatHistoryDiagnostics?.recordPersistedAggregate(aggregate)}
  mutating func finishPerChatHistoryDiagnostic(terminal:String,telemetry:ChatCheckStageTelemetry?){perChatHistoryDiagnostics?.finish(terminal:terminal,telemetry:telemetry)}
  mutating func recordHistoryProgressEventRejection(_ reason:String){if historyProgressEventRejections==nil{historyProgressEventRejections=HistoryProgressEventRejectionState()};historyProgressEventRejections?.record(reason)}
  mutating func recordRenderReadiness(phase:String,result:RenderReadinessResult,reason:String,routeCategory:RenderReadinessRouteCategory,timestamp:Date=Date()) {
@@ -2416,7 +2535,7 @@ struct ChatCheckStageTelemetry {
   }
  }
 
- func report(ordinal:Int,terminal:String,now:Date=Date())->String {
+ func report(ordinal:Int,terminal:String,now:Date=Date(),eligibilityReason:String?=nil)->String {
   let total=Int(now.timeIntervalSince(startedAt)*1000),current=terminalStageDurationMs ?? Int(now.timeIntervalSince(stageStartedAt)*1000)
   let status=httpStatuses.sorted().map(String.init).joined(separator:",")
   var compactStages=[String]();for value in stages where compactStages.last != value {compactStages.append(value)}
@@ -2432,13 +2551,14 @@ struct ChatCheckStageTelemetry {
   let continuationTrace=continuationSelected ? " · continuation diagnostics [\(continuationStages.joined(separator:" → "))] · trigger telemetry sources [\(continuationTriggerSources.joined(separator:","))] (one logical attempt) · first-pass hook baseline \(continuationBaselineHistoryRequests)/\(continuationBaselineHistoryResponses) · continuation hook delta \(continuationHistoryRequests)/\(continuationHistoryResponses) · continuation page responses \(continuationPageResponses) · aggregate growth \(continuationAggregateGrowth) · unique older messages \(continuationOlderUniqueMessages) · first request \(continuationFirstHistoryRequestMs.map(String.init) ?? "none") ms · first response \(continuationFirstHistoryResponseMs.map(String.init) ?? "none") ms · diagnosis \(continuationDiagnosis)\(responsePipelineSummary)":""
   let domTurns=renderedDOMTurnCount.map{String($0)} ?? "unobserved"
   let domRoles="rendered DOM turns \(domTurns) (user/assistant/unknown \(renderedDOMUserTurnCount)/\(renderedDOMAssistantTurnCount)/\(renderedDOMUnknownRoleTurnCount))"
-  return "Chat \(ordinal): \(terminal) · last stage \(stageBeforeFinish ?? stage) · stages [\(compactStages.joined(separator:" → "))] · stage \(current) ms / total \(total) ms · \(lifecycle) · navigation object/provisional \(navigationObjectReturned ? "yes":"no")/\(navigationProvisionalStarted ? "yes":"no") · navigation reason \(navigationTerminalReason) · route \(routeReached ? "yes":"no") · history requests/responses \(historyRequests)/\(historyResponses) · \(domRoles) · \(paginationSummary) · first-pass provenance {\(firstPassIdentityProvenanceSummary)} · continuation \(continuationAttempted ? continuationTerminalReason:"not_attempted") · pass 1 pages/messages \(continuationFirstPassPages)/\(continuationStartingMessages) · page update callbacks \(automationPageUpdateCallbacks) · same document \(documentIdentity == nil ? "unverified":"verified")\(continuationTrace) · timing {\(timing.report(now:now))} · page progression [\(pageDetails.isEmpty ? "none":pageDetails)] · has_previous_page \(hasPreviousPage.map{ $0 ? "yes":"no" } ?? "unknown") · HTTP [\(status.isEmpty ? "none":status)] · 429 \(rateLimitSeen ? "yes":"no") · aggregation \(aggregationStarted ? "started":"not_started")/\(aggregationCompleted ? "complete":"incomplete") · hooks \(hookHealth) · render lease \(renderLeaseActive ? "active":"inactive")"
+  return "Chat \(ordinal): \(terminal) · last stage \(stageBeforeFinish ?? stage) · stages [\(compactStages.joined(separator:" → "))] · stage \(current) ms / total \(total) ms · \(lifecycle) · navigation object/provisional \(navigationObjectReturned ? "yes":"no")/\(navigationProvisionalStarted ? "yes":"no") · navigation reason \(navigationTerminalReason) · route \(routeReached ? "yes":"no") · history requests/responses \(historyRequests)/\(historyResponses) · \(domRoles) · \(paginationSummary) · first-pass provenance {\(firstPassIdentityProvenanceSummary)} · continuation \(continuationAttempted ? continuationTerminalReason:"not_attempted") · pass 1 pages/messages \(continuationFirstPassPages)/\(continuationStartingMessages) · page update callbacks \(automationPageUpdateCallbacks) · same document \(documentIdentity == nil ? "unverified":"verified")\(continuationTrace) · timing {\(timing.report(now:now))} · page progression [\(pageDetails.isEmpty ? "none":pageDetails)] · has_previous_page \(hasPreviousPage.map{ $0 ? "yes":"no" } ?? "unknown") · HTTP [\(status.isEmpty ? "none":status)] · 429 \(rateLimitSeen ? "yes":"no") · aggregation \(aggregationStarted ? "started":"not_started")/\(aggregationCompleted ? "complete":"incomplete") · hooks \(hookHealth) · render lease \(renderLeaseActive ? "active":"inactive")\(eligibilityReason.map { " · eligibility reason \($0)" } ?? "")"
  }
 }
 struct ChatCheckReportSnapshot {
  var telemetry:ChatCheckStageTelemetry
  let ordinal:Int
  let terminal:String
+ let eligibilityReason:String?
 }
 struct ChatCheckContinuationCheckpoint {
  let documentIdentity:String

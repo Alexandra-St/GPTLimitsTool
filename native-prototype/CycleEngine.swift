@@ -747,7 +747,7 @@ extension Prototype {
   let legacy=records.filter{$0.lastSeenUpdatedAtSource == .legacyUnknown}.count
   return "records \(summary.records) · timestamps \(summary.timestamps) · trusted \(summary.trusted) (root \(root), project \(project), history \(history)) · activity metadata \(activity) · legacy/unknown \(legacy) · fresh observedAt \(summary.freshObservations) · stale/missing observedAt \(summary.staleObservations)"
  }
- func finishChatCheckReport(terminal:String,ordinal:Int) {
+ func finishChatCheckReport(terminal:String,ordinal:Int,eligibilityReason:String?=nil) {
   guard var telemetry=chatCheckTelemetry else{return}
   if let budget=chatCheckBudgetController {telemetry.timing.recordBudget(budget.snapshot())}
   if telemetry.continuationSelected {telemetry.timing.markContinuationEnded(at:Date())}
@@ -760,9 +760,9 @@ extension Prototype {
   telemetry.renderLeaseActive=backgroundRenderLeaseOwner != nil
   chatCheckTelemetry=telemetry
   if let generation=telemetry.operationGeneration {
-   chatCheckReportSnapshots[generation]=ChatCheckReportSnapshot(telemetry:telemetry,ordinal:ordinal,terminal:terminal)
+   chatCheckReportSnapshots[generation]=ChatCheckReportSnapshot(telemetry:telemetry,ordinal:ordinal,terminal:terminal,eligibilityReason:eligibilityReason)
   }
-  chatCheckReports.append(telemetry.report(ordinal:ordinal,terminal:terminal))
+  chatCheckReports.append(telemetry.report(ordinal:ordinal,terminal:terminal,eligibilityReason:eligibilityReason))
   cycleChatTerminalResults.append(terminal)
   if chatCheckReports.count>12 {chatCheckReports.removeFirst(chatCheckReports.count-12)}
   renderCycle()
@@ -777,7 +777,7 @@ extension Prototype {
     chatCheckReportSnapshots[ownerGeneration]=snapshot
     let prefix="Chat \(snapshot.ordinal):"
     if let index=chatCheckReports.firstIndex(where:{$0.hasPrefix(prefix)}) {
-     chatCheckReports[index]=snapshot.telemetry.report(ordinal:snapshot.ordinal,terminal:snapshot.terminal)
+     chatCheckReports[index]=snapshot.telemetry.report(ordinal:snapshot.ordinal,terminal:snapshot.terminal,eligibilityReason:snapshot.eligibilityReason)
      renderCycle()
     }
    }
@@ -997,6 +997,9 @@ extension Prototype {
      cycleState.discoveryStatus = .incomplete
     }
     let recent=cycleState.records.values.filter{cycleIds.contains($0.conversationId) && $0.lastSeenUpdatedAt>=cycleCutoffTimestamp && $0.lastSeenUpdatedAt<=observedNow}.sorted{$0.lastSeenUpdatedAt>$1.lastSeenUpdatedAt}
+    let recentIDs=Set(recent.map(\.conversationId))
+    let maintenance=selectStaleIncompleteMaintenanceCandidates(records:Array(cycleState.records.values),discoveredIDs:cycleIds,recentIDs:recentIDs,nowMs:observedNow)
+    let maintenanceCandidateIDs=Set(maintenance.admitted.map(\.conversationId))
     // A failed OS submission is retried from the last Complete observation, without
     // requiring another potentially expensive full history pass.
     for record in recent {
@@ -1009,6 +1012,7 @@ extension Prototype {
      submitMonitoredNotification(kind:"risk",level:level,body:content.body,conversationID:record.conversationId)
     }
     var checkCandidatesByID=Dictionary(uniqueKeysWithValues:recent.map{($0.conversationId,$0)})
+    for record in maintenance.admitted {checkCandidatesByID[record.conversationId]=record}
     for id in cycleDOMFallbackIds {
      if checkCandidatesByID[id]==nil {
       checkCandidatesByID[id]=cycleState.records[id] ?? ChatRecord(conversationId:id,title:"Chat",lastSeenUpdatedAt:0,lastSeenUpdatedAtSource:.legacyUnknown)
@@ -1022,6 +1026,7 @@ extension Prototype {
      checked+=1
      cyclePhase="Checking \(checked)/\(queue.count)";renderCycle()
      cycleCurrentChatCheckOrdinal=checked
+    let activityPendingAtCheckStart=hasUnprocessedChatActivity(record)
      let checkBudget=ChatCheckBudgetController(checkStartedAt:Date(),cycleDeadline:cycleHardDeadline)
      chatCheckBudgetController=checkBudget
      var attempt=try await isolateCheck(budget:checkBudget) {try await self.checkRecord(record,budget:checkBudget)}
@@ -1116,7 +1121,7 @@ extension Prototype {
      saved.lastCheckAt=Date().timeIntervalSince1970*1000
      switch attempt {
      case .success(let result):
-      finishChatCheckReport(terminal:result.1,ordinal:checked)
+      finishChatCheckReport(terminal:result.1,ordinal:checked,eligibilityReason:staleIncompleteMaintenanceEligibilityReason(admitted:maintenanceCandidateIDs.contains(record.conversationId)))
       let priorAggregate=saved.aggregate
       let priorMeasurement=riskMeasurementStatus(result:saved.lastCheckResult,aggregate:priorAggregate)
       let riskModelBefore=buildRiskModel(samples:personalRiskSamples())
@@ -1174,15 +1179,17 @@ extension Prototype {
        // Detach this generation before the next chat starts; late worker cleanup
        // will be rejected by the same generation check.
        _=clearChatCheckState(ownerGeneration:chatCheckTelemetry?.operationGeneration ?? "",caller:"timeout handler")
-       finishChatCheckReport(terminal:terminal,ordinal:checked)
+       finishChatCheckReport(terminal:terminal,ordinal:checked,eligibilityReason:staleIncompleteMaintenanceEligibilityReason(admitted:maintenanceCandidateIDs.contains(record.conversationId)))
        cycleFreshRiskCounts["Unknown",default:0] += 1
       }
       else {
        saved.lastCheckResult="Failed · check_error"
        saved.consecutiveIncompleteChecks+=1
-       finishChatCheckReport(terminal:"Failed · check_error",ordinal:checked)
+       finishChatCheckReport(terminal:"Failed · check_error",ordinal:checked,eligibilityReason:staleIncompleteMaintenanceEligibilityReason(admitted:maintenanceCandidateIDs.contains(record.conversationId)))
       }
      }
+     if saved.lastCheckResult=="Complete" {saved.pendingActivityNeedsAttention=false}
+     else if activityPendingAtCheckStart {saved.pendingActivityNeedsAttention=true}
      let finalMeasurement=riskMeasurementStatus(result:saved.lastCheckResult,aggregate:saved.aggregate)
      if let aggregate=saved.aggregate,finalMeasurement != .complete {
       let model=buildRiskModel(samples:personalRiskSamples(replacing:saved))
@@ -1201,6 +1208,23 @@ extension Prototype {
       if let acknowledged=saved.uncertainAcknowledgedAt,saved.lastSeenUpdatedAt>acknowledged {saved.uncertainAcknowledgedAt=nil}
      }
      let terminal=saved.lastCheckResult ?? "Failed · check_error"
+     if let aggregate=saved.aggregate {
+      let accepted=terminal=="Complete" && aggregate.historyComplete && aggregate.hasPreviousPage==false
+      let progress=chatCheckTelemetry?.checkProgress
+      let reason:String
+      if accepted {reason="none"}
+      else if (progress?.parserAccepted ?? 0)==0 {reason="no_accepted_history_response"}
+      else if aggregate.messagesCollected==0 {reason="aggregate_empty"}
+      else if (progress?.hasPreviousPage ?? aggregate.hasPreviousPage)==true {reason="has_previous_page_true"}
+      else if (progress?.hasPreviousPage ?? aggregate.hasPreviousPage)==nil {reason="has_previous_page_unknown"}
+      else if progress?.historyCompleteProven != true {reason="terminal_false_page_observed"}
+      else {reason="completion_proof_not_set"}
+      cycleState.recordPerChatCompletionDecision(candidate:progress?.historyCompleteProven ?? false,accepted:accepted,reason:reason,aggregate:aggregate,hasPreviousPage:progress?.hasPreviousPage ?? aggregate.hasPreviousPage,historyComplete:progress?.historyCompleteProven ?? false)
+     } else {
+      let empty=SafeAggregate(conversationId:record.conversationId,title:"",processedMessageIds:[],messagesCollected:0,userMessages:0,assistantMessages:0,otherMessages:0,estimatedTextTokens:0,attachments:.init(images:0,audio:0,video:0,files:0),historyComplete:false,hasPreviousPage:chatCheckTelemetry?.checkProgress.hasPreviousPage,hasNextPage:nil,responsesCaptured:0,updatedAt:nil)
+      cycleState.recordPerChatCompletionDecision(candidate:chatCheckTelemetry?.checkProgress.historyCompleteProven ?? false,accepted:false,reason:(chatCheckTelemetry?.checkProgress.parserAccepted ?? 0)==0 ? "no_accepted_history_response":"aggregate_empty",aggregate:empty,hasPreviousPage:chatCheckTelemetry?.checkProgress.hasPreviousPage,historyComplete:chatCheckTelemetry?.checkProgress.historyCompleteProven ?? false)
+     }
+     cycleState.recordPerChatPersistedAggregate(saved.aggregate)
      cycleState.finishPerChatHistoryDiagnostic(terminal:terminal,telemetry:chatCheckTelemetry)
      finishPersistedChatCheckTrace(terminalResult:terminal,expectedConversationID:record.conversationId,generation:chatCheckTraceGeneration ?? "")
      cycleState.records[record.conversationId]=saved;saveCycle();updateCurrentCycleSummary();chatCheckBudgetController=nil
@@ -1213,7 +1237,7 @@ extension Prototype {
     let freshRisk=cycleFreshRiskCounts.map{"\($0.key) \($0.value)"}.sorted().joined(separator:", ")
     let summary=CycleChatOutcomeCounts(finalPerChatResults:cycleChatTerminalResults,freshRiskCounts:cycleFreshRiskCounts)
     let riskModel=currentRiskModel().source.rawValue
-    cycleState.lastStatus="Last cycle: \(Date().formatted(date:.omitted,time:.shortened))\nCoverage: \(coverageDisplayLabel(composite)) · \(composite.detail)\nCoverage scope: \(composite.scope)\nDiscovery source: \(cycleDiscoverySource) · DOM candidates \(cycleDOMCandidateCount) · accepted conversation rows \(cycleDOMAcceptedRowCount) · rejected navigation rows \(cycleDOMRejectedNavigationRowCount) · coverage reason \(composite.detail)\nCombined unique: \(cycleIds.count) · recent: \(recent.count)\nChecked: \(summary.checked) · Complete: \(summary.complete) · Failed: \(summary.failed) · Partial: \(summary.partial) · Skipped unchanged: \(max(0,checkCandidates.count-queue.count)) · Skipped cycle budget: \(cycleBudgetSkipped)\nFresh risk (current cycle, \(riskModel)): \(freshRisk)\nNotifications generated/suppressed: \(cycleRiskNotificationsGenerated)/\(cycleRiskNotificationsSuppressed)\nProvenance before: \(cycleProvenanceBefore)\nProvenance after: \(cycleProvenanceSummary())\nRender lease cleanup: \(renderLeaseCleanupSummary)"
+    cycleState.lastStatus="Last cycle: \(Date().formatted(date:.omitted,time:.shortened))\nCoverage: \(coverageDisplayLabel(composite)) · \(composite.detail)\nCoverage scope: \(composite.scope)\nDiscovery source: \(cycleDiscoverySource) · DOM candidates \(cycleDOMCandidateCount) · accepted conversation rows \(cycleDOMAcceptedRowCount) · rejected navigation rows \(cycleDOMRejectedNavigationRowCount) · coverage reason \(composite.detail)\nCombined unique: \(cycleIds.count) · recent: \(recent.count)\nStale incomplete maintenance: eligible \(maintenance.eligibleCount) · admitted \(maintenance.admitted.count) · deferred by cap \(maintenance.deferredCount)\nChecked: \(summary.checked) · Complete: \(summary.complete) · Failed: \(summary.failed) · Partial: \(summary.partial) · Skipped unchanged: \(max(0,checkCandidates.count-queue.count)) · Skipped cycle budget: \(cycleBudgetSkipped)\nFresh risk (current cycle, \(riskModel)): \(freshRisk)\nNotifications generated/suppressed: \(cycleRiskNotificationsGenerated)/\(cycleRiskNotificationsSuppressed)\nProvenance before: \(cycleProvenanceBefore)\nProvenance after: \(cycleProvenanceSummary())\nRender lease cleanup: \(renderLeaseCleanupSummary)"
    } catch {
     cycleState.discoveryStatus = .incomplete
     cycleState.lastCoverageStatus = .incompleteStall
@@ -1528,8 +1552,15 @@ extension Prototype {
     if update.state.historyComplete {
      if record.aggregate?.historyComplete != true || update.overlap || update.oldest {
       if var telemetry=chatCheckTelemetry {telemetry.checkProgress.recordCompletionProof();chatCheckTelemetry=telemetry}
+      cycleState.recordPerChatCompletionDecision(candidate:true,accepted:true,reason:"none",aggregate:update.state,hasPreviousPage:update.state.hasPreviousPage,historyComplete:update.state.historyComplete)
       recordChatCheckStage("chat_check_finished");return(update.state,"Complete")
      }
+     let rejectedReason:String
+     if update.state.messagesCollected==0 {rejectedReason="aggregate_empty"}
+     else if update.state.hasPreviousPage==true {rejectedReason="has_previous_page_true"}
+     else if update.state.hasPreviousPage==nil {rejectedReason="has_previous_page_unknown"}
+     else {rejectedReason="previously_complete_unchanged"}
+     cycleState.recordPerChatCompletionDecision(candidate:true,accepted:false,reason:rejectedReason,aggregate:update.state,hasPreviousPage:update.state.hasPreviousPage,historyComplete:update.state.historyComplete)
      if update.state.hasPreviousPage==true {recordChatCheckStage("pagination_started")} else {recordChatCheckStage("history_wait_started")}
     }
    }

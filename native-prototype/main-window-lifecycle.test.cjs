@@ -68,18 +68,30 @@ test('main window separates confirmed risks from compact plain-language uncertai
 
   const render=section(main,'func renderUserUI()','func monitoringDegradedReason()');
   assert.match(render,/let confirmed=relevant\.filter\{\$0\.3 != \.uncertain\}/);
-  assert.match(render,/let uncertainWithoutConfirmedRisk=relevant\.filter\{\$0\.1 == \.uncertain && \$0\.2 == \.normal\}/);
+  assert.match(render,/let uncertainWithoutConfirmedRisk=relevant\.filter\{\$0\.1 == \.uncertain && \$0\.2 == \.normal && needsAttentionActionable/);
   assert.match(render,/let activeUncertain=uncertainWithoutConfirmedRisk\.filter\{warningBadgeVisible/);
   assert.match(render,/prefix\(3\)/);
   assert.match(section(main,'func uiLabel(','func buildUserWindows()'),/lineBreakMode = \.byWordWrapping/);
   assert.match(render,/No confirmed limit risk was detected for these chats, but GPT Limits Tool couldn't verify their complete history\./);
   const uncertainty=section(render,'if completeness == .uncertain && state == .uncertain {','mainUncertaintyRows.addArrangedSubview(row)');
   assert.match(uncertainty,/New activity hasn’t been fully checked yet/);
+  assert.match(uncertainty,/pendingActivityNeedsAttention \|\| hasUnprocessedChatActivity/);
+  assert.doesNotMatch(uncertainty,/lastCheckedUpdatedAt == nil \|\| record\.lastSeenUpdatedAt>/);
   assert.match(uncertainty,/Couldn’t verify full history/);
   assert.match(uncertainty,/lowerBoundUserLabel/);
   assert.match(uncertainty,/Hide until new activity/);
   assert.match(uncertainty,/Last checked:/);
   assert.doesNotMatch(uncertainty,/monitoringWarningReason|lastCheckResult|per_chat_timeout|pagination_progressing|waiting_history/);
+});
+
+test('Needs attention hides stale Partial rows and only uses the activity timestamp gate for new activity copy',()=>{
+  const modelSource=fs.readFileSync(path.join(__dirname,'CycleModel.swift'),'utf8');
+  const engine=fs.readFileSync(path.join(__dirname,'CycleEngine.swift'),'utf8');
+  assert.match(modelSource,/func hasUnprocessedChatActivity\(_ record:ChatRecord\)[\s\S]*lastSeenUpdatedAt>checkedAt/);
+  assert.match(modelSource,/func needsAttentionActionable\(record:ChatRecord,model:RiskModel,nowMs:Double\)->Bool[\s\S]*hasUnprocessedChatActivity\(record\) \|\| record\.pendingActivityNeedsAttention \|\| confirmedRiskFromLowerBound/);
+  assert.match(engine,/let activityPendingAtCheckStart=hasUnprocessedChatActivity\(record\)[\s\S]*if saved\.lastCheckResult=="Complete" \{saved\.pendingActivityNeedsAttention=false\}[\s\S]*else if activityPendingAtCheckStart \{saved\.pendingActivityNeedsAttention=true\}/);
+  const indicator=section(main,'func updateWarningIndicator(records:[ChatRecord]','@objc func toggleWarningAcknowledgement');
+  assert.match(indicator,/needsAttentionActionable\(record:record,model:model,nowMs:nowMs\)/);
 });
 
 test('uncertainty dismissal is UI-only, scoped to current entries, and resurfaces through existing model semantics',()=>{
@@ -106,7 +118,7 @@ test('lower-bound-confirmed risk appears only in the confirmed section and preve
   assert.match(render,/let lowerBoundRisk=confirmedRiskFromLowerBound\(record\.aggregate\?\.estimatedTextTokens,model:model\)/);
   assert.match(render,/let riskState=riskStates\.contains\(completeness\) \? completeness:lowerBoundRisk/);
   assert.match(render,/if confirmed\.isEmpty \{mainRiskRows\.addArrangedSubview\(uiLabel\("No confirmed conversation risks\."\)\)\}/);
-  assert.match(render,/let uncertainWithoutConfirmedRisk=relevant\.filter\{\$0\.1 == \.uncertain && \$0\.2 == \.normal\}/);
+  assert.match(render,/let uncertainWithoutConfirmedRisk=relevant\.filter\{\$0\.1 == \.uncertain && \$0\.2 == \.normal && needsAttentionActionable/);
   assert.ok(render.includes('Full history not verified · \\(lowerBoundUserLabel(record.aggregate?.estimatedTextTokens ?? 0))'));
   assert.ok(main.includes('At least ~\\(Int((Double(tokens)/1000).rounded()))k tokens counted'));
 });
@@ -202,7 +214,7 @@ test('empty or whitespace-only chat names fall back while genuine short titles r
 test('confirmed-risk rows are excluded from the neutral uncertainty preview',()=>{
   const render=section(main,'func renderUserUI()','func monitoringDegradedReason()');
   assert.match(render,/let confirmed=relevant\.filter\{\$0\.3 != \.uncertain\}/);
-  assert.match(render,/let uncertainWithoutConfirmedRisk=relevant\.filter\{\$0\.1 == \.uncertain && \$0\.2 == \.normal\}/);
+  assert.match(render,/let uncertainWithoutConfirmedRisk=relevant\.filter\{\$0\.1 == \.uncertain && \$0\.2 == \.normal && needsAttentionActionable/);
   assert.match(render,/let activeUncertain=uncertainWithoutConfirmedRisk\.filter\{warningBadgeVisible/);
   assert.match(render,/mainRiskRows\.addArrangedSubview\(row\)/);
   assert.match(render,/mainUncertaintyRows\.addArrangedSubview\(row\)/);

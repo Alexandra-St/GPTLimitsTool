@@ -543,6 +543,19 @@ test('no-progress terminal uses accepted page evidence without requiring a live 
  assert.match(model,/usableCandidate\.messagesCollected>=existing\.messagesCollected && usableCandidate\.estimatedTextTokens>=existing\.estimatedTextTokens/);
 });
 
+test('accepted hasPreviousPage false is carried from the terminal page through persistence and clears stale uncertainty',()=>{
+ const aggregator=fs.readFileSync(path.join(__dirname,'../extension/aggregator.js'),'utf8');
+ const bridge=fs.readFileSync(path.join(__dirname,'automation-bridge.js'),'utf8');
+ const record=section(engine,'func checkRecord(','\n}');
+ const cycleState=section(engine,'func startCycle(trigger:String)','func discoverPinnedPrefix(');
+ assert.match(aggregator,/if \(page\.hasPreviousPage === false\) \{\s*state\.hasPreviousPage = false;[\s\S]*state\.historyComplete = true;/);
+ assert.match(bridge,/state=GptLimitsAggregator\.mergePage\(state,acceptedPage\)/);
+ assert.match(record,/if update\.state\.historyComplete \{[\s\S]*recordCompletionProof\(\)[\s\S]*return\(update\.state,"Complete"\)/);
+ assert.match(cycleState,/if result\.1=="Complete" \{saved\.lastCheckedUpdatedAt=record\.lastSeenUpdatedAt\}/);
+ assert.match(cycleState,/if result\.1=="Complete" \{saved\.consecutiveIncompleteChecks=0;saved\.partialObservedActivityAt=nil;saved\.paginationBoundaryMessageCount=nil\}/);
+ assert.match(cycleState,/if completeAndCurrent \{saved\.uncertainSince=nil;saved\.uncertainAcknowledgedAt=nil\}/);
+});
+
 test('continuation carries canonical parser progress and rejected generations are recorded safely',()=>{
  const record=section(engine,'func checkRecord(','\n}');
  const parser=section(engine,'func recordChatCheckHistoryResponseParsing(',' func cycleProvenanceSummary(');
@@ -1186,7 +1199,7 @@ test('v6.1.1 partial-risk notifications use one post-result decision for timeout
  assert.match(engine,/case \.failure\(let error\):[\s\S]*let partialAggregate=timeoutProgressPartialAggregate[\s\S]*terminal="Partial · pagination_progressing · per_chat_timeout[\s\S]*saved\.lastCheckResult=terminal[\s\S]*terminal="Timed out · per_chat_timeout[\s\S]*saved\.lastCheckResult=terminal[\s\S]*saved\.lastCheckResult="Failed · check_error"/);
  assert.match(engine,/let finalMeasurement=riskMeasurementStatus\(result:saved\.lastCheckResult,aggregate:saved\.aggregate\)[\s\S]*if let aggregate=saved\.aggregate,finalMeasurement != \.complete[\s\S]*incompleteRiskNotificationNeeded\(measurement:finalMeasurement,lastAcceptedRank:saved\.lastNotifiedRiskRank,lowerBoundTokens:aggregate\.estimatedTextTokens,model:model\)/);
  assert.match(engine,/func finishNotificationAudit[\s\S]*if kind=="risk",let rank=riskRank\(level\) \{record\.lastNotifiedRiskRank=rank\}/);
- assert.match(main,/let gptLimitsAppVersion="6\.2\.2"/);
+ assert.match(main,/let gptLimitsAppVersion="6\.2\.3"/);
  assert.match(main,/let pinnedDiagnosticVersion="6\.1\.0"/);
  assert.match(main,/guard bundleBuildVersion==gptLimitsAppVersion,[\s\S]*gptLimitsExecutableBuildVersionMarker==gptLimitsAppVersion/);
 });

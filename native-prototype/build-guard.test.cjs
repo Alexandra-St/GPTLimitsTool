@@ -16,7 +16,7 @@ function verify(bundle) {
 test('stable bundle freshness verifier accepts the current built app', () => {
   const result = verify(stableBundle);
   assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
-  assert.match(result.stdout, /Freshness check passed: v6\.2\.2/);
+  assert.match(result.stdout, /Freshness check passed: v6\.2\.3/);
 });
 
 test('freshness verifier rejects a stale bundled resource', () => {

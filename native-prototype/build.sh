@@ -12,7 +12,7 @@ fi
 main="$root/native-prototype/Main.swift"
 manifest="$root/extension/manifest.json"
 version=$(sed -n 's/^[[:space:]]*let gptLimitsAppVersion="\([^"]*\)".*/\1/p' "$main" | head -n 1)
-expected_version=6.2.2
+expected_version=6.2.3
 [ -n "$version" ] || { echo "Build failed: native runtime version marker missing." >&2; exit 1; }
 [ "$version" = "$expected_version" ] || { echo "Build failed: expected native v$expected_version, found v$version." >&2; exit 1; }
 python3 - "$manifest" <<'PY'

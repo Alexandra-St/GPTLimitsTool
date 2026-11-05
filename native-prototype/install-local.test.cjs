@@ -43,7 +43,7 @@ test('installer replaces an older app while preserving external WebKit and prefe
     assert.equal(fs.existsSync(path.join(installed, 'old-install-marker')), false);
     assert.equal(fs.readFileSync(webkitData, 'utf8'), 'preserve');
     assert.equal(fs.readFileSync(preferences, 'utf8'), 'preserve');
-    assert.equal(plist(installed, 'GPTLimitsBuildVersion'), '6.2.2');
+    assert.equal(plist(installed, 'GPTLimitsBuildVersion'), '6.2.3');
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 

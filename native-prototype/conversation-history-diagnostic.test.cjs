@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const { spawnSync } = require('node:child_process');
 
 const root = __dirname;
 const source = fs.readFileSync(path.join(root, 'conversation-history-diagnostic.js'), 'utf8');
@@ -192,4 +193,58 @@ test('Diagnostics starts with compact current-cycle summary and keeps raw teleme
   assert.match(engine, /updateCurrentCycleSummary\(\)/);
   assert.match(main, /manualDiagnosticOwnerLabel\(\)==nil[\s\S]*sanitizedChatCheckRoute\(web\.url\)\.category == \.chat/);
   assert.doesNotMatch(main.slice(main.indexOf('func inspectCurrentChatHistorySource()'), main.indexOf('func renderCurrentChatHistoryDiagnostic')), /runCycle\(|checkRecord\(|load\(URLRequest/);
+});
+
+test('Task 11 pure formatter renders runtime maintenance values and safe report provenance',()=>{
+ const source=main.match(/func formatMaintenanceDiagnostics\(lastStatus:String,chatCheckReports:\[String\]\)->\(counters:String,admission:String\) \{[\s\S]*?\n\}/)?.[0];
+ assert.ok(source,'pure formatter exists');
+ const swift=spawnSync('swift',['-e',`import Foundation\n${source}\nlet report="Chat 4: Partial · eligibility reason stale_incomplete_maintenance · safe report"\nprint(formatMaintenanceDiagnostics(lastStatus:"Stale incomplete maintenance: eligible 4 · admitted 3 · deferred by cap 1",chatCheckReports:[report]).counters)\nprint(formatMaintenanceDiagnostics(lastStatus:"Stale incomplete maintenance: eligible 4 · admitted 3 · deferred by cap 1",chatCheckReports:[report]).admission)\nprint(formatMaintenanceDiagnostics(lastStatus:"Stale incomplete maintenance: eligible 0 · admitted 0 · deferred by cap 0",chatCheckReports:[]).counters)\nprint(formatMaintenanceDiagnostics(lastStatus:"Stale incomplete maintenance: eligible 0 · admitted 0 · deferred by cap 0",chatCheckReports:[]).admission)`],{encoding:'utf8'});
+ assert.equal(swift.status,0,swift.stderr);
+ assert.match(swift.stdout,/eligible: 4 · admitted: 3 · deferred by cap: 1/);
+ assert.match(swift.stdout,/stale_incomplete_maintenance/);
+ assert.match(swift.stdout,/eligible: 0 · admitted: 0 · deferred by cap: 0/);
+ assert.match(swift.stdout,/Per-chat admission provenance: unavailable/);
+ for(const sentinel of ['private-chat-id','Private title','https://secret.invalid']) assert.equal(swift.stdout.includes(sentinel),false);
+ const cycleState=model.slice(model.indexOf('struct CycleState: Codable'),model.indexOf('let nativeCycleStateDefaultsKey'));
+ assert.doesNotMatch(cycleState,/admissionProvenance|maintenanceAdmission|chatCheckReports/);
+});
+
+test('per-chat completion diagnostics follow the accepted response through proof, terminal, and persistence', () => {
+  assert.match(engine, /if update\.state\.historyComplete[\s\S]*recordCompletionProof\(\)[\s\S]*recordPerChatCompletionDecision\(candidate:true,accepted:true,reason:"none"/);
+  assert.match(engine, /recordPerChatPersistedAggregate\(saved\.aggregate\)[\s\S]*finishPerChatHistoryDiagnostic\(terminal:terminal/);
+  assert.match(model, /no_accepted_history_response[\s\S]*aggregate_empty[\s\S]*has_previous_page_true[\s\S]*has_previous_page_unknown[\s\S]*terminal_false_page_observed[\s\S]*completion_set_but_lost_before_persist/);
+  assert.match(model, /accepted history responses[\s\S]*endpoint categories[\s\S]*aggregate messages at decision[\s\S]*persisted historyComplete[\s\S]*persisted hasPreviousPage/);
+  assert.match(main, /Per-chat history diagnostics:[\s\S]*perChatSummary/);
+  assert.match(model, /responseEntries\.count>20/);
+});
+
+test('an already-open Diagnostics window refreshes one cycle snapshot after cycle completion', () => {
+  const cycle=engine.slice(engine.indexOf('cycleTask=Task { @MainActor in'),engine.indexOf('// One read-only prefix pass per cycle'));
+  const refresh=main.slice(main.indexOf('func updateCurrentCycleSummary()'),main.indexOf('@objc func toggleRawDiagnostics()'));
+  assert.match(cycle,/defer \{[\s\S]*saveCycle\(\);scheduleCycle\(\);renderCycle\(\)/);
+  assert.match(cycle,/let summary=CycleChatOutcomeCounts\(finalPerChatResults:cycleChatTerminalResults/);
+  assert.match(cycle,/cycleState\.lastStatus="Last cycle:[\s\S]*Skipped unchanged:/);
+  assert.match(engine,/func renderCycle\(\)[\s\S]*updateCurrentCycleSummary\(\)/);
+  assert.match(refresh,/let perChatDiagnostics=cycleState\.perChatHistoryDiagnostics[\s\S]*let perChatSummary=perChatDiagnostics\?\.summary[\s\S]*let perChatDetails=perChatDiagnostics\?\.detailedResponseSummary[\s\S]*perChatHistoryRawOutput\.stringValue=[\s\S]*currentCycleSummaryOutput\.stringValue=/);
+  assert.match(refresh,/let checkedLine=line\("Checked:"\)/);
+  assert.match(cycle,/cycleState\.finishPerChatHistoryDiagnostic\(terminal:terminal,telemetry:chatCheckTelemetry\)[\s\S]*cycleState\.records\[record\.conversationId\]=saved;saveCycle\(\)/);
+  assert.match(model,/func needsAttentionActionable\(record:ChatRecord/); // state selection remains in the existing display predicate
+});
+
+test('current chat persisted-record diagnostic matches only the route ID and is read-only and private',()=>{
+  const helper=model.slice(model.indexOf('struct PersistedChatRecordDiagnostic:'),model.indexOf('func notificationAuditStatus'));
+  const action=main.slice(main.indexOf('func inspectCurrentChatPersistedRecord()'),main.indexOf('func inspectCurrentMessageDOMStructure()'));
+  assert.match(main,/Inspect current chat persisted record/);
+  assert.match(action,/let safeRoute=sanitizedChatCheckRoute\(web\.url\)[\s\S]*safeRoute\.category == \.chat/);
+  assert.match(action,/let routeID=conversationID\(in:web\.url\)/);
+  assert.match(action,/persistedChatRecordDiagnostic\(routeConversationID:routeID,state:cycleState,model:currentRiskModel\(\)\)/);
+  assert.doesNotMatch(action,/runCycle\(|checkRecord\(|saveCycle\(|load\(URLRequest/);
+  assert.match(helper,/state\.records\[routeConversationID\],record\.conversationId==routeConversationID/);
+  assert.match(helper,/record_not_present/);
+  assert.match(helper,/route_id_unavailable/);
+  assert.match(helper,/state_not_loaded/);
+  assert.match(helper,/state\.notificationAudit/);
+  assert.match(helper,/record\.lastNotifiedRiskRank/);
+  assert.match(helper,/measurement|riskCategory|tokenLowerBound|messageLowerBound|historyComplete|hasPreviousPage|lastCheckAt|activityState|betaRiskCategory|priorWatchNearCritical/);
+  assert.doesNotMatch(helper,/print\(|FileHandle|UserDefaults|conversationId:.*displayText|title:.*displayText|rawURL|messageText/);
 });

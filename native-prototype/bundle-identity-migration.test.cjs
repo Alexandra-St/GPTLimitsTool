@@ -33,5 +33,5 @@ test('bundle identity migration is bounded to the legacy domain, two data keys, 
 
 test('production build and installer use the v6 bundle identity', () => {
   for (const source of [build, installer]) assert.match(source, /com\.alexandrast\.gptlimitstool/);
-  assert.match(main, /gptLimitsAppVersion="6\.2\.2"/);
+  assert.match(main, /gptLimitsAppVersion="6\.2\.3"/);
 });

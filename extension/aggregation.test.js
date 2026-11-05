@@ -202,7 +202,7 @@ test("history stays partial until a page confirms there are no earlier pages", (
   assert.equal(complete.hasPreviousPage, false);
 });
 
-test("completes only on the oldest pagination page and keeps final counters stable on replay", () => {
+test("completes on an accepted nonempty terminal page and keeps final counters stable on replay", () => {
   let state = mergePage(null, page("chat-history-complete", "Known title", [
     item("newest", "user", 10, { images: 1 }),
   ], true, false));
@@ -258,6 +258,11 @@ test("completes only on the oldest pagination page and keeps final counters stab
   const unconfirmed = mergePage(null, page("chat-unconfirmed", "", [], false, false));
   assert.equal(unconfirmed.hasPreviousPage, false);
   assert.equal(unconfirmed.historyComplete, false);
+  const shortResponse = page("chat-short", "", [item("user-turn", "user"), item("assistant-turn", "assistant")], false, false);
+  assert.equal(shortResponse.isPaginationResponse, false);
+  const shortDetail = mergePage(null, shortResponse);
+  assert.equal(shortDetail.messagesCollected, 2);
+  assert.equal(shortDetail.historyComplete, true);
 });
 
 test("network hook forwards aggregate metadata and never forwards message content", async () => {
@@ -853,7 +858,7 @@ test("captures plural conversations endpoint and merges repeated responses witho
   assert.equal(state.responsesCaptured, 3);
   assert.equal(state.hasPreviousPage, false);
   assert.equal(state.hasNextPage, false);
-  assert.equal(state.historyComplete, false);
+  assert.equal(state.historyComplete, true);
   assert.deepEqual(state.processedMessageIds, ["m1", "m2", "m3"]);
   const stored = JSON.stringify({ captures: captures.map((capture) => capture.summary), state });
   for (const forbidden of [privateText, "assistant secret", "new secret", "num_turns=10", "cursor-0", "cursor-1", "cursor-2"]) {
