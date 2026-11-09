@@ -15,7 +15,7 @@ It works with your existing ChatGPT session and can monitor regular and project 
 
 ## Current beta
 
-- **Version:** v5.106.0
+- **Published beta:** v5.106.0
 - **Build:** `dffbf97fa46307b5`
 
 Beta package: `GPT-Limits-Tool-v5.106.0-beta.dmg`
@@ -23,6 +23,14 @@ Beta package: `GPT-Limits-Tool-v5.106.0-beta.dmg`
 SHA-256:
 
 `8c39557040df48b32ef0beb8ef7f46b107ee6c22396b4f406473eff62cbc2fc0`
+
+Current native source/runtime version: **6.2.3**. The published beta and current native source use separate version numbers because development has continued since v5.106.0.
+
+## Repository structure
+
+- `native-prototype/` — current primary macOS implementation.
+- `extension/` — separate Chrome beta implementation (`0.2.0-beta`).
+- `gpt_limits.py` — standalone local analyzer for saved ChatGPT conversation JSON.
 
 ## Installation
 
