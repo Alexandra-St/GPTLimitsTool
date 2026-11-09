@@ -72,3 +72,7 @@ If something behaves strangely, the most useful report includes:
 - whether the problem happens again after repeating the same steps.
 
 Please do not include private conversation content in bug reports unless it is genuinely necessary.
+
+## License
+
+MIT License. See [LICENSE](LICENSE).
