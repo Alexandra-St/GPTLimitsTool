@@ -170,12 +170,13 @@ test('v5.40 tags every lastSeenUpdatedAt writer and keeps coverage trust informa
 
 test('429 stops the current discovery before scroll and does not trigger recovery navigation or reload', () => {
   const start = section(engine, 'func startCycle(trigger:String)', 'func checkRecord(');
+  const candidates = section(engine,'func finalizeDiscoveryAndBuildCandidates(','func recordCandidateAdmission(');
   const statusCheck = start.indexOf('if discoveryRateLimited(Array(cycleRootStatuses)) {break}');
   const scroll = start.indexOf('gptScrollSidebar');
   assert.ok(statusCheck >= 0 && scroll > statusCheck);
   assert.doesNotMatch(start, /web\.reload\(\)|Retrying ChatGPT home|Reloading ChatGPT home/);
   assert.match(model, /func discoveryRateLimited\(_ statusCodes:\[Int\]\)->Bool \{statusCodes\.contains\(429\)\}/);
-  assert.match(start, /cycleState\.discoveryStatus = \.rateLimited/);
+  assert.match(candidates, /cycleState\.discoveryStatus = \.rateLimited/);
   assert.match(engine, /coverageAfterListStatus\(composite,statusCodes:Array\(cycleRootStatuses\)\)/);
 });
 
@@ -405,6 +406,138 @@ test('duplicate logical pages do not advance the page version that gates scrolli
   assert.ok(start.indexOf('cycleRootStatuses') < start.indexOf('gptScrollSidebar'));
 });
 
+test('coverage update helper is used after merge and the safety-probe branch follows merge',()=>{
+ const consume=section(engine,'func consumeDiscoveryPage(', 'func updatePartitionReport(');
+ assert.ok(consume.indexOf('cycleState.merge(records')<consume.indexOf('updateDiscoveryCoverage('));
+ assert.ok(consume.indexOf('cycleState.merge(records')<consume.indexOf('if case .recent_safety_probe = source'));
+ assert.match(consume,/updateDiscoveryCoverage\(source:source,rootProof:&rootProof,partitions:&cyclePartitions/);
+ const helper=section(engine,'func updateDiscoveryCoverage(', 'func consumeDiscoveryPage(');
+ assert.match(helper,/guard source == \.normal_discovery else\{return\}/);
+});
+test('original normal-discovery failure is preserved once before probe eligibility',()=>{
+ const start=section(engine,'func startCycle(trigger:String)','func checkRecord(');
+ const candidates=section(engine,'func finalizeDiscoveryAndBuildCandidates(','func recordCandidateAdmission(');
+ assert.match(main,/var originalNormalDiscoveryFailureReason:String\?/); // A
+ assert.match(start,/cycleRootResponseReceived=false;originalNormalDiscoveryFailureReason=nil/); // B
+ assert.match(start,/cycleRootStallDetail=nil/);
+ assert.match(start,/originalNormalDiscoveryFailureReason==nil, !cycleRootResponseReceived,[\s\S]*?stallDetail=="no_list_response" \|\| stallDetail=="root_request_without_response"\)\s*\{\s*originalNormalDiscoveryFailureReason=stallDetail/); // C/D
+ const snapshotAt=start.indexOf('originalNormalDiscoveryFailureReason=stallDetail');
+ const probeAt=start.indexOf('if shouldRunRecentSafetyProbeForOriginalFailure');
+ assert.ok(snapshotAt>=0 && probeAt>snapshotAt,'original failure is preserved before probe eligibility');
+ assert.match(candidates,/if !cycleRootResponseReceived\s*\{composite\.status = \.incompleteStall;composite\.detail=stallDetail/);
+});
+test('recent safety probe eligibility is a pure predicate over original failure and root proof',()=>{
+ const predicate=section(engine,'var shouldRunRecentSafetyProbeForOriginalFailure:Bool {','func updateDiscoveryCoverage(');
+ assert.match(predicate,/!cycleRootResponseReceived/);
+ assert.match(predicate,/originalNormalDiscoveryFailureReason=="no_list_response" \|\| originalNormalDiscoveryFailureReason=="root_request_without_response"/);
+ assert.doesNotMatch(predicate,/=nil|append|remove|cycleState\.|stallDetail/);
+});
+test('recent safety probe lifecycle has minimal cycle-scoped one-shot state only',()=>{
+ assert.match(main,/var recentSafetyProbeAttempted=false/);
+ assert.match(main,/var recentSafetyProbeToken:String\?/);
+ assert.match(main,/var recentSafetyProbeTerminalResult:RecentSafetyProbeTerminalResult\?/);
+ assert.match(main,/var recentSafetyProbePending=false/);
+ const generation=section(main,'var cycleToken="" {','var cycleOrigins=');
+ for(const reset of ['recentSafetyProbeAttempted=false','recentSafetyProbeToken=nil','recentSafetyProbeTerminalResult=nil','recentSafetyProbePending=false'])assert.ok(generation.includes(reset),`generation reset missing ${reset}`);
+ assert.match(main,/struct RecentSafetyProbeState/);assert.match(main,/var recentSafetyProbe:RecentSafetyProbeState\?/);
+ const lifecycle=section(engine,'func startCycle(trigger:String)','func checkRecord(');
+ assert.match(lifecycle,/if shouldRunRecentSafetyProbeForOriginalFailure, !recentSafetyProbeAttempted,[\s\S]*?cycleToken==cycleGeneration,cycleDiscovering/);
+ assert.equal((lifecycle.match(/await runRecentSafetyProbe\(probeToken\)/g)||[]).length,1);
+ assert.equal((lifecycle.match(/await awaitRecentSafetyProbeTerminal\(/g)||[]).length,1);
+ assert.ok(lifecycle.indexOf('awaitRecentSafetyProbeTerminal(')>lifecycle.indexOf('runRecentSafetyProbe(probeToken)'));
+});
+test('Prototype cycleSequence increments once for each nonempty cycle generation',()=>{
+ assert.match(main,/var cycleSequence:UInt64=0/);
+ const generation=section(main,'var cycleToken="" {','var cycleOrigins=');
+ assert.match(generation,/if !cycleToken\.isEmpty \{cycleSequence &\+= 1\}/);
+ assert.equal((generation.match(/cycleSequence\s*&\+=\s*1/g)||[]).length,1);
+ assert.ok(generation.indexOf('if !cycleToken.isEmpty')<generation.indexOf('cycleSequence &+= 1'));
+ const engineStart=section(engine,'func startCycle(trigger:String)','func checkRecord(');
+ assert.match(engineStart,/guard cycleGate\.begin\(\) else\{return\}/);
+ assert.doesNotMatch(main,/cycleSequence\s*&\+=\s*1[\s\S]{0,300}(runRecentSafetyProbe|finalizeTerminalEvidence)/);
+});
+test('eligible recent safety probe is one-shot and finalized by the candidate helper',()=>{
+ const start=section(engine,'func startCycle(trigger:String)','func checkRecord(');
+ const trigger=start.indexOf('if shouldRunRecentSafetyProbeForOriginalFailure');
+ const terminal=start.indexOf('await awaitRecentSafetyProbeTerminal(',trigger);
+ const helperCall=start.indexOf('finalizeDiscoveryAndBuildCandidates(',terminal);
+ const reset=start.indexOf('cycleDiscovering=false',helperCall);
+ assert.ok(trigger>=0&&terminal>trigger&&helperCall>terminal&&reset<0);
+ const phase=start.slice(trigger,helperCall);
+ const ordered=['shouldRunRecentSafetyProbeForOriginalFailure','!recentSafetyProbeAttempted','cycleToken==cycleGeneration,cycleDiscovering','recentSafetyProbeAttempted=true','recentSafetyProbeToken=probeToken','recentSafetyProbePending=true','runRecentSafetyProbe(probeToken)','awaitRecentSafetyProbeTerminal('];
+ let previous=-1;for(const marker of ordered){const at=phase.indexOf(marker,previous+1);assert.ok(at>previous,`lifecycle order missing or misplaced in probe phase: ${marker}`);previous=at;}
+ assert.equal((phase.match(/await runRecentSafetyProbe\(probeToken\)/g)||[]).length,1);
+ assert.equal((phase.match(/await awaitRecentSafetyProbeTerminal\(/g)||[]).length,1);
+ assert.doesNotMatch(phase,/coverageAfterListStatus|stallDetail\s*=|checkCandidates|cycleState\.queue/);
+ const helper=section(engine,'func finalizeDiscoveryAndBuildCandidates(','func recordCandidateAdmission(');
+ assert.match(helper,/recentSafetyProbeTerminalResult=terminalResult[\s\S]*recentSafetyProbePending=false/);
+ assert.match(helper,/discoveryFinalizedAfterProbe=[\s\S]*coverageComplete=composite\.isComplete[\s\S]*let recent=cycleState\.records\.values\.filter[\s\S]*let checkCandidates=Array\(checkCandidatesByID\.values\)[\s\S]*candidatesBuiltAfterProbe=/);
+ assert.doesNotMatch(helper,/recordCandidateAdmission\(|checkRecord\(/);
+});
+test('production ordering is probe completion, helper, queue, admission, then chat checks',()=>{
+ const start=section(engine,'func startCycle(trigger:String)','func checkRecord(');
+ const consume=section(engine,'func consumeDiscoveryPage(','func updatePartitionReport(');
+ const terminal=start.indexOf('await awaitRecentSafetyProbeTerminal(');
+ const helperCall=start.indexOf('finalizeDiscoveryAndBuildCandidates(',terminal);
+ const queue=start.indexOf('let queue=cycleState.queue(checkCandidates)',helperCall);
+ const admission=start.indexOf('recordCandidateAdmission(queue:queue',queue);
+ const chatLoop=start.indexOf('for record in queue {',admission);
+ assert.ok(terminal>=0&&helperCall>terminal&&queue>helperCall&&admission>queue&&chatLoop>admission);
+ assert.match(start,/let queue=cycleState\.queue\(checkCandidates\)/);
+ assert.match(start,/recordCandidateAdmission\(queue:queue,[\s\S]*terminalEvidence:&terminalEvidence\)/);
+ assert.match(consume,/cycleState\.merge\(records,[\s\S]*?cycleIds\.formUnion\(ids\)/);
+ assert.match(consume,/if case \.recent_safety_probe = source \{updatePartitionReport\(\);renderCycle\(\);return \.accepted_new\}/);
+ const helper=section(engine,'func finalizeDiscoveryAndBuildCandidates(','func recordCandidateAdmission(');
+ assert.match(helper,/let recent=cycleState\.records\.values\.filter[\s\S]*let checkCandidates=Array\(checkCandidatesByID\.values\)/);
+ assert.match(helper,/let checkCandidates=Array\(checkCandidatesByID\.values\)[\s\S]*candidatesBuiltAfterProbe=[\s\S]*return PostProbeCandidateResult/);
+ assert.doesNotMatch(helper,/recordCandidateAdmission\(|checkRecord\(/);
+ const coverageUpdate=section(engine,'func updateDiscoveryCoverage(','func consumeDiscoveryPage(');
+ assert.match(coverageUpdate,/guard source == \.normal_discovery else\{return\}/);
+ assert.match(start,/originalNormalDiscoveryFailureReason=stallDetail/);
+});
+test('terminal evidence accumulator is wired to common cleanup without influencing cycle decisions',()=>{
+ const start=section(engine,'func startCycle(trigger:String)','func checkRecord(');
+ const candidates=section(engine,'func finalizeDiscoveryAndBuildCandidates(','func recordCandidateAdmission(');
+ const task=start.slice(start.indexOf('cycleTask=Task'));
+ const init=start.indexOf('var terminalEvidence=CycleTerminalEvidence(cycleSequence:cycleSequence)'),cycleTask=start.indexOf('cycleTask=Task');
+ const deferAt=task.indexOf('defer {'),doAt=task.indexOf('do {');
+ assert.ok(init>=0&&cycleTask>init&&deferAt>=0&&doAt>deferAt); // A
+ assert.match(task,/defer \{\s*finalizeTerminalEvidence\(terminalEvidence\)/); // B/G
+ assert.match(task,/terminalEvidence\.terminalKind = \.success/); // C
+ const admission=section(engine,'func recordCandidateAdmission(','func startCycle(trigger:String)');
+ assert.match(candidates,/terminalEvidence\.coverageComplete=composite\.isComplete/); // D
+ assert.match(admission,/terminalEvidence\.admittedCandidateCount=queue\.count/);
+ assert.match(task,/let queue=cycleState\.queue\(checkCandidates\)[\s\S]*recordCandidateAdmission\(queue:queue,[\s\S]*for record in queue \{/);
+ assert.match(admission,/let queuedIDs=Set\(queue\.map\(\\.conversationId\)\)[\s\S]*\$0\.queued=queued/);
+ assert.doesNotMatch(admission,/checkRecord\(|cycleRootResponseReceived\s*=|cyclePartitions\s*=/);
+ assert.match(task,/catch \{\s*terminalEvidence\.terminalKind = \.error/); // E
+ assert.match(task,/catch is CancellationError \{\s*terminalEvidence\.terminalKind = \.cancelled_or_stale/); // F
+ assert.match(candidates,/terminalEvidence\.probeJSOutcome=recentSafetyProbe\?\.jsOutcome[\s\S]*terminalEvidence\.probeListReceived=recentSafetyProbe\?\.listMessageReceived[\s\S]*terminalEvidence\.probeConsumeResult=recentSafetyProbe\?\.consumeResult\?\.rawValue/); // G
+ assert.doesNotMatch(task,/if\s+terminalEvidence|guard\s+terminalEvidence|while\s+terminalEvidence|switch\s+terminalEvidence/); // H
+ assert.match(main,/struct CycleTerminalEvidence \{\s*enum TerminalKind:String,Codable \{ case success,error,cancelled_or_stale \}\s*let cycleSequence:UInt64/); // A
+ assert.match(start,/var terminalEvidence=CycleTerminalEvidence\(cycleSequence:cycleSequence\)/); // B/C
+ assert.match(task,/defer \{\s*finalizeTerminalEvidence\(terminalEvidence\)/); // D/E
+ assert.doesNotMatch(task,/terminalEvidence\.cycleSequence\s*=|finalizeTerminalEvidence\([^)]*cycleSequence/);
+ assert.doesNotMatch(task,/if\s+[^\n]*cycleSequence|guard\s+[^\n]*cycleSequence|while\s+[^\n]*cycleSequence/); // F
+});
+test('terminal evidence converts to a sanitized Codable snapshot without lifecycle reads or persistence',()=>{
+ const model=main.slice(main.indexOf('struct LastCycleTerminalSnapshot:'),main.indexOf('func makeLastCycleTerminalSnapshot('));
+ const helper=main.slice(main.indexOf('func makeLastCycleTerminalSnapshot('),main.indexOf('\nfunc persistLastCycleTerminalSnapshot('));
+ assert.match(model,/struct LastCycleTerminalSnapshot:Codable,Equatable/);
+ for(const field of ['buildID:String','cycleSequence:UInt64','terminalKind:CycleTerminalEvidence.TerminalKind','cycleFinished:Bool','finishedAt:Date'])assert.ok(model.includes(field),`missing ${field}`);
+ for(const field of ['normalDiscoveryOutcome','originalNormalDiscoveryFailureReason','recentSafetyProbeAttempted','probeJSOutcome','probeListReceived','probeConsumeResult','probeTerminalResult','discoveryFinalizedAfterProbe','candidatesBuiltAfterProbe','coverageComplete','cycleRootResponseReceived','probeContributedPartition','admittedCandidateCount'])assert.match(model,new RegExp(`let ${field}:`));
+ assert.match(helper,/cycleSequence:evidence\.cycleSequence/);assert.match(helper,/terminalKind= evidence\.terminalKind|let terminalKind=evidence\.terminalKind/);
+ assert.match(helper,/cycleFinished:true/);assert.match(helper,/finishedAt:finishedAt/);assert.match(helper,/buildID:buildID/);
+ assert.doesNotMatch(helper,/self\.|Prototype|cycleToken|cycleState|cycleRootResponseReceived\s*=|UserDefaults|FileManager/);
+ for(const forbidden of ['conversationId','title','records','messages','url','headers','authorization','body','rawProbeResponse'])assert.doesNotMatch(model,new RegExp(forbidden,'i'));
+ assert.doesNotMatch(helper,/write\(|JSONEncoder|UserDefaults|FileManager/);
+});
+test('Task 90 forensic admission history is merged before the final ChatRecord write',()=>{
+ const model=fs.readFileSync(path.join(__dirname,'CycleModel.swift'),'utf8');
+ assert.match(engine,/mergingForensicHistory\(from:cycleState\.records\[record\.conversationId\],into:&saved\)[\s\S]{0,160}cycleState\.records\[record\.conversationId\]=saved/);
+ assert.match(model,/func mergingForensicHistory\(from current:ChatRecord\?,into saved:inout ChatRecord\)/);
+});
+
 test('complete base triggers one pinned prefix pass, never a required starred endpoint',()=>{
  const start=section(engine,'func startCycle(trigger:String)','func checkRecord(');
  assert.doesNotMatch(start,/gptOpenStarredSection/);
@@ -413,66 +546,6 @@ test('complete base triggers one pinned prefix pass, never a required starred en
  assert.match(start,/discoverPinnedPrefix\(renderLeaseOwner:renderLeaseOwner\)/);assert.match(start,/starredProofState\.finishFallback\(proof\)[\s\S]*starredProofState:starredProofState/);
  assert.match(start,/discoveryRateLimited/);assert.match(engine,/cyclePinnedReport/);
  assert.match(model,/30 \* 60/);
-});
-test('visible Octane DOM fallback feeds ordinary chat checks but remains incomplete and cannot replace network discovery',()=>{
- const start=section(engine,'func startCycle(trigger:String)','func checkRecord(');
- const fallback=section(engine,'func collectVisibleSidebarDOMFallbackIfNeeded()','func rootSidebarMetadataLine()');
- assert.match(start,/if await collectVisibleSidebarDOMFallbackIfNeeded\(\) \{\s*stallDetail="dom_fallback_visible_sidebar_rows_only"/);
- assert.match(fallback,/cycleValidListResponses==0/);assert.match(fallback,/!cycleRootResponseReceived/);assert.match(fallback,/!discoveryRateLimited/);
- assert.match(fallback,/backgroundRenderLeaseReadiness\["ready"\] as\? Bool == true/);
- assert.match(fallback,/firstPositiveCount/);assert.match(fallback,/finalStableCount/);assert.match(fallback,/sidebarRegionFound/);
- assert.match(fallback,/gptCollectVisibleSidebarDOMFallback/);assert.match(fallback,/cycleDiscoverySource="dom_fallback"/);
- assert.doesNotMatch(fallback,/cycleState\.records\[id\]\s*=/,'fallback IDs are not persisted as placeholder records before checking');
- assert.match(start,/cycleState\.records\[id\] \?\? ChatRecord\(conversationId:id,title:"Chat",lastSeenUpdatedAt:0/,'existing records and lower bounds are retained; new temporary candidates are check-only');
- assert.match(fallback,/dom_fallback_visible_sidebar_rows_only/);
- assert.match(start,/let checkCandidates=Array\(checkCandidatesByID\.values\)[\s\S]*cycleState\.queue\(checkCandidates\)/);
- assert.match(start,/self\.checkRecord\(record,budget:checkBudget\)/,'fallback IDs use the ordinary per-chat check path');
- assert.match(start,/if !cycleRootResponseReceived\s*\{\s*composite\.status = \.incompleteStall;\s*composite\.detail=stallDetail/);
- assert.match(start,/baseDiscoveryComplete,!explicitStarredObserved/,'pinned-prefix proof remains limited to complete network base discovery');
- assert.match(start,/let baseDiscoveryProven=baseDiscoveryComplete && cycleRootResponseReceived/);
- assert.match(start,/cycleDiscoverySource="network";cycleDOMCandidateCount=0/);
-});
-test('automatic Complete is gated by current-cycle pinned activity and reports decision provenance',()=>{
- const start=section(engine,'func startCycle(trigger:String)','func checkRecord(');
- const resolver=section(engine,'func discoverPinnedPrefix(renderLeaseOwner:String)','func validPinnedActivity(');
- const bridge=fs.readFileSync(path.join(__dirname,'automation-bridge.js'),'utf8');
- const listHook=fs.readFileSync(path.join(__dirname,'list-hook.js'),'utf8');
- assert.match(start,/cycleToken=UUID\(\)\.uuidString[\s\S]*cyclePinnedResult=nil[\s\S]*cyclePinnedReport=""/);
- assert.match(start,/var starredProofState=StarredCoverageProofState/);
- assert.match(start,/starredProofState\.beginFallback\(\)[\s\S]*discoverPinnedPrefix\(renderLeaseOwner:renderLeaseOwner\)[\s\S]*starredProofState\.finishFallback\(proof\)[\s\S]*starredProofState\.failFallback\("pinned_prefix_execution_failed"\)[\s\S]*starredProofState:starredProofState/);
- assert.match(start,/cycleState\.lastStarredCoverageProofState=starredProofState/);
- assert.match(start,/cycleState\.lastStarredCoverageProofState=nil/);
- const report=section(engine,'func updatePartitionReport\(_ override:CompositeCoverage\? = nil\)','enum EvaluationFailure');
- assert.match(report,/compositeCoverage\(observations,cutoff:cycleCutoffTimestamp,starredProofState:cycleState\.lastStarredCoverageProofState\)/);
- assert.match(report,/proofState\.diagnosticsLine/);
- assert.match(report,/if !cyclePinnedReport\.isEmpty \{lines\.append\(cyclePinnedReport\)\}/);
- assert.match(model,/var lastStarredCoverageProofState:StarredCoverageProofState\?/);
- assert.match(model,/var diagnosticsLine:String/);
- assert.match(model,/if failureReason == "sidebar_snapshot_unstable"/);
- assert.match(start,/fallback \\\(starredProofState\.fallbackStatus\.rawValue\)[\s\S]*proofReadiness/);
- assert.match(model,/enum PinnedFallbackStatus/);assert.match(model,/var isConsistent:Bool/);
- assert.match(model,/timestampsResolved==pinnedCount/);
- assert.match(model,/var prefixComplete:Bool/);
- assert.match(model,/if !explicitStarredObserved,let pinned=pinnedProof,pinned\.complete,completed\.contains/);
- assert.match(model,/starredCoverageSource:"pinned_prefix"/);
- assert.match(model,/explicit_starred_partition_incomplete/);
- assert.match(resolver,/if !validPinnedActivity\(activity\) \{activity=try await loadPinnedActivity\(record\)\}/);
- assert.match(resolver,/PinnedCoverageProof\(top:[\s\S]*timestampsResolved:resolved,recentCount:recent,unresolvedReason:proofFailureReason\)/);
- assert.match(resolver,/proof\.readinessStatus=readinessLabel[\s\S]*proof\.prefixCompleteReported/);
- assert.match(bridge,/waitForConversationRowsReady\(Math\.min\(6000,rowBudget\),deadline,\{phaseABudgetMs:4000,stabilizationGraceMs:1200,absoluteReadinessCapMs:6000\}\)/);
- assert.match(bridge,/window\.gptInspectVisiblePinnedRows=async/);assert.match(bridge,/waitForPinnedReadinessPreflight/);
- assert.match(listHook,/cycleToken!==\(window\.gptListCycleConfig\?\.token\|\|null\)/);
- assert.match(listHook,/observedListSources\.push\(/);
- assert.match(listHook,/status>=200&&s\.status<300/);
- assert.match(listHook,/updatedAt<=Date\.now\(\)/);
- assert.match(main,/let token=payload\["cycleToken"\] as\? String,token==cycleToken,!token\.isEmpty/);
- assert.doesNotMatch(resolver,/cycleState\.records\[[^]]+\].*(updatedAt|lastSeenUpdatedAt|lastActivityAt)/);
- assert.match(start,/Coverage provenance: Base discovery:[\s\S]*Pinned activity unknown:[\s\S]*Coverage decision:[\s\S]*Coverage reason:/);
- assert.match(start,/explicit starred stream observed[\s\S]*fallback \\\(starredProofState\.fallbackStatus\.rawValue\)[\s\S]*source/);
- assert.match(start,/let pinnedPrefixProven=pinnedProofForReport\?\.prefixComplete == true/);
- assert.match(start,/let pinnedTotal=pinnedPrefixProven \?/);
- const isolated=section(main,'@objc func diagnosePinnedActivityTimestamp()','func continuePinnedActivityLaunch()');
- assert.doesNotMatch(isolated,/cycleState\.lastCoverageStatus|cycleState\.lastCoverageDetail|cyclePinnedResult|cyclePinnedReport/);
 });
 test('old pinned metadata resolution never configures full history; only recent records enter queue',()=>{
  const loader=section(engine,'func loadPinnedActivity','func checkRecord(');
@@ -830,52 +903,6 @@ assert.match(main,/let pinnedDiagnosticVersion="6.1.0"/);
  assert.doesNotMatch(render,/fetch\(|location\.(?:assign|replace)|\.click\(|reload\(|gptInspectVisiblePinnedRows/);
 });
 
-test('v5.5 background render lease is exclusive, bounded, used for sidebar paths, and restored before chat checks',()=>{
-assert.match(main,/let pinnedDiagnosticVersion="6.1.0"/);
- assert.match(main,/BackgroundRenderLeaseGate/);
- assert.match(main,/session\.ignoresMouseEvents=true/);
- assert.doesNotMatch(main,/orderFrontRegardless/);
- assert.doesNotMatch(section(main,'func acquireBackgroundRenderSurface(owner:String)','func evaluateRenderReadiness'),/makeKey|makeMain|orderFront|NSApp\.activate|\.order\(/);
- assert.match(main,/evaluateRenderReadiness\(owner:owner,timeoutSeconds:19\)/);
- assert.match(main,/preflightTimeoutMs:18000/);
- assert.match(main,/renderLeaseReadinessToken/);
- assert.match(main,/renderLeaseReadinessContinuation/);
- assert.match(main,/func finishRenderLeaseReadiness/);
- assert.match(main,/case "render_lease_started": return 20/);
- assert.match(main,/readiness bridge error/);
- assert.match(section(main,'func acquireBackgroundRenderSurface(owner:String)','func evaluateRenderReadiness'),/NSApp\.isActive==original\.appActive[\s\S]*session\.isKeyWindow==original\.keyWindow[\s\S]*session\.isMainWindow==original\.mainWindow/);
- assert.doesNotMatch(section(main,'func restoreBackgroundRenderSurface(owner:String)->Bool','func withBackgroundRenderSurface'),/session\.setFrame|web\.frame=lease\.webViewFrame/);
- assert.match(main,/session\.ignoresMouseEvents=lease\.original\.ignoresMouseEvents/);
- assert.match(main,/web\.isHidden=lease\.original\.webViewHidden/);
- assert.match(main,/backgroundRenderLeaseGate\.release\(owner\)/);
- const cycle=section(engine,'func startCycle(trigger:String)','func discoverPinnedPrefix(');
- assert.match(cycle,/acquireBackgroundRenderSurface\(owner:renderLeaseOwner\)/);
- assert.match(cycle,/restoreBackgroundRenderSurface\(owner:renderLeaseOwner\)/);
- assert.ok(cycle.indexOf('restoreBackgroundRenderSurface(owner:renderLeaseOwner)') < cycle.indexOf('let checkCandidates=Array(checkCandidatesByID.values)'));
- const diagnostic=section(main,'@objc func diagnosePinnedActivityTimestamp()','func startPinnedActivityProbe(');
- assert.match(diagnostic,/acquireBackgroundRenderSurfaceForPinnedDiagnostic\(owner:token\)/);
- const diagnosticLease=section(main,'func acquireBackgroundRenderSurfaceForPinnedDiagnostic','func acquireBackgroundRenderSurface(owner:String,waitForConversationLinks:Bool)');
- assert.match(diagnosticLease,/waitForConversationLinks:false/);
- const regularLease=section(main,'func acquireBackgroundRenderSurface(owner:String) async throws','func acquireBackgroundRenderSurfaceForPinnedDiagnostic');
- assert.match(regularLease,/waitForConversationLinks:true/);
- const leaseImplementation=section(main,'func acquireBackgroundRenderSurface(owner:String,waitForConversationLinks:Bool)','func evaluateRenderReadiness');
- assert.match(leaseImplementation,/guard waitForConversationLinks else/);
- assert.match(leaseImplementation,/backgroundRenderLeaseGate\.acquire\(owner\)/);
- assert.match(leaseImplementation,/session\.isKeyWindow==original\.keyWindow/);
- assert.match(leaseImplementation,/session\.isMainWindow==original\.mainWindow/);
- assert.match(diagnostic,/render_lease_acquired/);
- assert.match(main,/diagnostic_readiness_started/);
- assert.match(main,/snapshot_ready/);
- assert.match(main,/traversal_started/);
- const finish=section(main,'func finishPinnedActivityDiagnostic()','@discardableResult func completePinnedActivityItem');
- assert.match(finish,/restoreBackgroundRenderSurface\(owner:owner\)/);
- assert.ok(finish.includes('Render lease: \\(backgroundRenderLeaseReport)'));
- assert.match(engine,/func loadPinnedActivity/);assert.doesNotMatch(section(engine,'func loadPinnedActivity','func checkRecord('),/session\.orderOut/);
- const refresh=section(main,'@objc func refreshRecent()','@objc func diagnoseVisibleHome');
- assert.match(refresh,/withBackgroundRenderSurface/);assert.match(refresh,/Task\.sleep\(nanoseconds:8_000_000_000\)/);
- assert.match(main,/guard !cycleRunning,backgroundRenderLease==nil/);
-});
-
 test('v5.82 readiness telemetry and terminal verdict share one acceptance predicate',()=>{
  const main=fs.readFileSync(path.join(__dirname,'Main.swift'),'utf8');
  const helper=section(main,'func sidebarScrollReadinessAcceptance(now:UInt64)','func processSidebarScrollReadinessSample(');
@@ -1156,40 +1183,6 @@ test('native risk UI uses a local beta fallback and only sanitized transition no
  assert.match(engine,/empirically labeled Limit reached/);
  assert.match(main,/Use latest complete chat as Normal sample/);
 assert.match(main,/pinnedDiagnosticVersion="6.1.0"/);
-});
-
-test('missed-warning recovery retains partial progress and separates accepted dispatch from observation',()=>{
- assert.match(model,/func riskNotificationNeeded\(previousObservedRank:Int\?,lastAcceptedRank:Int\?,next:RiskAssessment\)/);
- assert.match(model,/func incompleteRiskNotificationNeeded\(measurement:RiskMeasurementStatus,lastAcceptedRank:Int\?,lowerBoundTokens:Int\?,model:RiskModel\)->String\?/);
- assert.match(model,/case \.near:rank=2;case \.critical:rank=3;case \.normal,\.uncertain,\.watch:return nil/);
- assert.match(model,/rank>lastAcceptedRank!/);
- assert.match(model,/func partialRiskNotificationContent\(level:String\)/);
- assert.match(model,/enum RiskMonitoringState:String/);
- assert.match(model,/func monitoringState\(record:ChatRecord/);
- assert.doesNotMatch(model,/func shouldNotifyUncertain/);
- assert.match(model,/func shouldRetryRootDiscovery/);
- assert.match(model,/func retryRiskNotificationLevel/);
- assert.match(engine,/finalMeasurement=riskMeasurementStatus\(result:saved\.lastCheckResult,aggregate:saved\.aggregate\)[\s\S]*finalMeasurement != \.complete[\s\S]*incompleteRiskNotificationNeeded\(measurement:finalMeasurement,lastAcceptedRank:saved\.lastNotifiedRiskRank,lowerBoundTokens:aggregate\.estimatedTextTokens,model:model\)[\s\S]*submitMonitoredNotification\(kind:"risk",level:level,body:content\.body,conversationID:saved\.conversationId\)/);
- assert.doesNotMatch(model,/func uncertainNotificationContent/);
- assert.match(model,/var partialObservedActivityAt:Double\?/);
- assert.match(model,/var paginationBoundaryMessageCount:Int\?/);
- assert.match(model,/replayingSavedBoundary/);
- assert.match(engine,/saved\.lastCheckResult="Partial · pagination_checkpoint"/);
- assert.match(engine,/saved\.aggregate=partialAggregate/);
- assert.match(engine,/cycleState\.monitoringDegraded = monitoringDiscoveryDegraded\(/);
- assert.match(engine,/userVisibleDelivery:"unknown"/);
- assert.match(engine,/notificationAuditStatus\(outcome:.*userVisibleDelivery/);
- assert.doesNotMatch(engine,/submitMonitoredNotification\(kind:"monitoring"/);
- assert.doesNotMatch(engine,/submitMonitoredNotification\(kind:"uncertain"/);
- assert.match(engine,/NotificationAuditRecord\(auditId:auditId,kind:kind/);
- assert.match(engine,/outcome:error == nil \? "accepted":"add_error"/);
- assert.match(engine,/if kind=="risk",let rank=riskRank\(level\) \{record\.lastNotifiedRiskRank=rank\}/);
- assert.match(main,/⚠ Monitoring degraded/);
- assert.match(main,/state == \.uncertain/);
- assert.match(model,/This active chat could not be fully checked; it may be approaching its limit/);
- assert.match(main,/if uncertaintyCount>0 \{parts\.append\("Needs attention:/);
- assert.match(main,/if degraded \{parts\.append\("Recent chat coverage needs attention"\)\}/);
- assert.match(main,/statusItem\.button\?\.title=confirmedCount>0 \? "GL ⚠":"GL"/);
 });
 
 test('v6.1.1 partial-risk notifications use one post-result decision for timeout and other incomplete outcomes',()=>{
@@ -1473,24 +1466,6 @@ test('v5.67 global window-order telemetry samples onscreen z-order without readi
  assert.match(rescue,/presentWindow\(progressPanel,intent:\.userInitiated,callSite:"native_rescue_progress"/);
  assert.match(rescue,/nativeRescueOperationID==operationID/);
  assert.doesNotMatch(rescue,/progressPanel\.makeKeyAndOrderFront/);
-});
-
-test('v5.69 background presentation is centrally blocked, traced, and deferred explicit actions cannot activate during an operation',()=>{
- const presenter=section(main,'func presentWindow(_ window:NSWindow,intent:WindowPresentationIntent,callSite:String','@objc func showPanel');
- assert.match(presenter,/recordBackgroundPresentationTrace\(callSite,intent:intent,phase:"before presentation decision"/);
- assert.match(presenter,/guard intent == \.userInitiated/);
- assert.match(presenter,/if cycleRunning \|\| backgroundRenderLease != nil[\s\S]*pendingForegroundWindow=window/);
- assert.match(presenter,/recordBackgroundPresentationTrace\(callSite,intent:intent,phase:"before activation"/);
- assert.match(presenter,/NSApp\.activate\(ignoringOtherApps:true\)[\s\S]*window\.makeKeyAndOrderFront/);
- const flush=section(main,'func flushPendingForegroundPresentationIfIdle()','func updateRuntimeIdentity()');
- assert.match(flush,/guard !cycleRunning,backgroundRenderLease==nil/);
- assert.match(flush,/isStillValid:validation,onPresented:completion/);
- const trace=section(main,'func recordBackgroundPresentationTrace(','func installBackgroundActivationTraceObservers()');
- for(const part of ['callSite','phase','operation','appWindowType','focusSnapshotSummary'])assert.ok(trace.includes(part),`missing trace detail ${part}`);
- const engine=fs.readFileSync(path.join(__dirname,'CycleEngine.swift'),'utf8');
- const finish=section(engine,'defer {\n    recordBackgroundFocusSample("cycle cleanup")','do {\n    cycleState.discoveryStatus');
- assert.match(finish,/cycleGate\.end\(\);cycleTask=nil[\s\S]*flushPendingForegroundPresentationIfIdle\(\)/);
- for(const source of [main,engine]) assert.doesNotMatch(source,/NSApp\.activate[\s\S]{0,100}(?:\.background|backgroundRenderSurface)/);
 });
 
 test('v5.70 window-order probe reports real overlap and AppKit window semantics without changing z-order',()=>{

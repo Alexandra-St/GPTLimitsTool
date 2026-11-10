@@ -131,8 +131,46 @@ extension Prototype {
   }
   controller.addUserScript(WKUserScript(source:prefix+runtimeScripts,injectionTime:.atDocumentStart,forMainFrameOnly:true))
  }
- func consumeDiscoveryPage(_ data:[String:Any],records:[[String:Any]]) {
-  guard data["cycleToken"] as? String == cycleToken,!cycleToken.isEmpty,!discoveryRateLimited(Array(cycleRootStatuses)) else{return}
+ enum DiscoveryPageSource:Equatable { case normal_discovery,recent_safety_probe }
+ struct RootResponseCoverageProof {
+  var received:Bool
+  var lastPageRelativeMs:Int?
+  var lastPageOffset:Int?
+  var lastPageNewIdentities:Int
+  var lastIdentityProgressRelativeMs:Int?
+  var lastIdentityProgressOffset:Int?
+ }
+ var shouldRunRecentSafetyProbeForOriginalFailure:Bool {
+  !cycleRootResponseReceived && (originalNormalDiscoveryFailureReason=="no_list_response" || originalNormalDiscoveryFailureReason=="root_request_without_response")
+ }
+ func updateDiscoveryCoverage(source:DiscoveryPageSource,rootProof:inout RootResponseCoverageProof,
+  partitions:inout [PartitionDescriptor:PartitionObservation],descriptor:PartitionDescriptor?,metadata:[String:Any],
+  records:[[String:Any]],newIdentityCount:Int,offset:Int?) {
+  guard source == .normal_discovery else{return}
+  rootProof.received=true
+  rootProof.lastPageRelativeMs=(metadata["relativeMs"] as? NSNumber)?.intValue
+  rootProof.lastPageOffset=offset
+  rootProof.lastPageNewIdentities=newIdentityCount
+  if newIdentityCount>0 {rootProof.lastIdentityProgressRelativeMs=rootProof.lastPageRelativeMs;rootProof.lastIdentityProgressOffset=offset}
+  guard let descriptor else{return}
+  var observation=partitions[descriptor] ?? PartitionObservation(descriptor:descriptor)
+  var page=CoveragePage(scope:.filtered,streamId:0,sequence:observation.pages.count+1,
+   paginationKind:paginationKind(offset:offset,cursorPresent:(metadata["cursorPresent"] as? Bool)==true),offset:offset,
+   limit:(metadata["limit"] as? NSNumber)?.intValue,
+   cursorPresent:(metadata["cursorPresent"] as? Bool)==true,cursorNull:(metadata["cursorNull"] as? Bool)==true,
+   cursorType:metadata["cursorType"] as? String ?? "undefined",itemCount:(metadata["itemCount"] as? NSNumber)?.intValue ?? -1,
+   timestampsValid:(metadata["timestampsValid"] as? Bool)==true,times:metadata["pageTimes"] as? [Double] ?? [])
+  page.requestCursorPresent=(metadata["requestCursorPresent"] as? Bool)==true
+  page.sortOrder=metadata["sortOrder"] as? String
+  page.httpStatus=(metadata["httpStatus"] as? NSNumber)?.intValue
+  let ids=Set(records.compactMap{$0["conversationId"] as? String})
+  page.recordCountMatches=records.count==page.itemCount && ids.count==records.count && ids.allSatisfy{$0.range(of:"^[A-Za-z0-9-]+$",options:.regularExpression) != nil}
+  _=observation.append(page,records:records)
+  partitions[descriptor]=observation
+ }
+ @discardableResult func consumeDiscoveryPage(_ data:[String:Any],records:[[String:Any]],source:DiscoveryPageSource = .normal_discovery) -> DiscoveryPageConsumeResult {
+  guard data["cycleToken"] as? String == cycleToken,!cycleToken.isEmpty else{return .rejected_stale_cycle}
+  guard !discoveryRateLimited(Array(cycleRootStatuses)) else{return .rejected_rate_limited}
   let scope=ListScope(rawValue:data["scope"] as? String ?? "") ?? .unclassified
   let offset=(data["offset"] as? NSNumber)?.intValue
   var descriptorLabel=""
@@ -143,52 +181,42 @@ extension Prototype {
   } else if scope != .project {descriptorLabel="invalid"}
   let endpointClass=scope == .project ? "project-conversations" : "root-conversations"
   guard let signature=logicalDiscoveryPageSignature(endpointClass:endpointClass,partition:descriptorLabel,offset:offset,
-    cursorPresent:(data["cursorPresent"] as? Bool)==true,records:records),cyclePageKeys.insert(signature).inserted else{return}
+    cursorPresent:(data["cursorPresent"] as? Bool)==true,records:records) else{return .rejected_invalid_page}
+  let isNew=cyclePageKeys.insert(signature).inserted
+  if let sequence=(data["rootRequestSequence"] as? NSNumber)?.intValue,sequence>0 {
+   recordRootRequestCorrelation(sequence:sequence,stage:isNew ? .consume_new:.consume_repeated)
+   saveCycle()
+  }
+  guard isNew else{return .accepted_repeated}
   cycleValidListResponses+=1
   cycleState.merge(records,source:scope == .project ? .projectConversationUpdateTime:.rootConversationUpdateTime)
   let ids=Set(records.compactMap{$0["conversationId"] as? String})
   let newIdentityCount=ids.subtracting(cycleIds).count
   cycleIds.formUnion(ids);cycleListVersion+=1
+  if scope != .project {
+   var rootProof=RootResponseCoverageProof(received:cycleRootResponseReceived,lastPageRelativeMs:cycleRootLastPageRelativeMs,
+    lastPageOffset:cycleRootLastPageOffset,lastPageNewIdentities:cycleRootLastPageNewIdentities,
+    lastIdentityProgressRelativeMs:cycleRootLastIdentityProgressRelativeMs,lastIdentityProgressOffset:cycleRootLastIdentityProgressOffset)
+   updateDiscoveryCoverage(source:source,rootProof:&rootProof,partitions:&cyclePartitions,descriptor:decodedDescriptor,
+    metadata:data,records:records,newIdentityCount:newIdentityCount,offset:offset)
+   cycleRootResponseReceived=rootProof.received;cycleRootLastPageRelativeMs=rootProof.lastPageRelativeMs
+   cycleRootLastPageOffset=rootProof.lastPageOffset;cycleRootLastPageNewIdentities=rootProof.lastPageNewIdentities
+   cycleRootLastIdentityProgressRelativeMs=rootProof.lastIdentityProgressRelativeMs
+   cycleRootLastIdentityProgressOffset=rootProof.lastIdentityProgressOffset
+  }
+  if case .recent_safety_probe = source {updatePartitionReport();renderCycle();return .accepted_new}
   if scope == .project {
    cycleProjectIds.formUnion(ids)
    let stream=(data["streamId"] as? NSNumber)?.intValue ?? 0
    cycleProjectStreams.insert(stream)
    cycleProjectPages+=1
   } else {
-   cycleRootResponseReceived=true
-   cycleRootLastPageRelativeMs=(data["relativeMs"] as? NSNumber)?.intValue
-   cycleRootLastPageOffset=offset
-   cycleRootLastPageNewIdentities=newIdentityCount
-   if newIdentityCount>0 {cycleRootLastIdentityProgressRelativeMs=cycleRootLastPageRelativeMs;cycleRootLastIdentityProgressOffset=offset}
-   guard let descriptor=decodedDescriptor else {
-    cyclePhase="Invalid sanitized partition descriptor";renderCycle();return
+   guard decodedDescriptor != nil else {
+    cyclePhase="Invalid sanitized partition descriptor";renderCycle();return .accepted_new
    }
-   var observation=cyclePartitions[descriptor] ?? PartitionObservation(descriptor:descriptor)
-   var page=CoveragePage(scope:.filtered,streamId:0,sequence:observation.pages.count+1,
-     paginationKind:paginationKind(offset:offset,cursorPresent:(data["cursorPresent"] as? Bool)==true),offset:offset,
-     limit:(data["limit"] as? NSNumber)?.intValue,
-     cursorPresent:(data["cursorPresent"] as? Bool)==true,cursorNull:(data["cursorNull"] as? Bool)==true,
-     cursorType:data["cursorType"] as? String ?? "undefined",itemCount:(data["itemCount"] as? NSNumber)?.intValue ?? -1,
-     timestampsValid:(data["timestampsValid"] as? Bool)==true,times:data["pageTimes"] as? [Double] ?? [])
-   page.requestCursorPresent=(data["requestCursorPresent"] as? Bool)==true
-   page.sortOrder=data["sortOrder"] as? String
-   page.httpStatus=(data["httpStatus"] as? NSNumber)?.intValue
-   page.recordCountMatches=records.count==page.itemCount && ids.count==records.count && ids.allSatisfy{$0.range(of:"^[A-Za-z0-9-]+$",options:.regularExpression) != nil}
-   _=observation.append(page,records:records)
-   cyclePartitions[descriptor]=observation
-   let pageRelativeMs=(data["relativeMs"] as? NSNumber)?.intValue ?? -1
-   let responseOffset=(data["responseOffset"] as? NSNumber)?.intValue ?? offset
-   let expectedNextOffset=(data["expectedNextOffset"] as? NSNumber)?.intValue
-   let baseCompleteNow=hasCompletePartitionSet(Array(cyclePartitions.values),base:PartitionDescriptor(archived:false,starred:false),cutoff:cycleCutoffTimestamp)
-   let nativeDecision=baseCompleteNow ? "stop_coverage_complete":"waiting_frontend"
-   let pageEvent:[String:Any]=["relativeMs":pageRelativeMs,"partitionShape":data["partitionShape"] as? String ?? "unknown",
-   "requestOffset":offset.map{$0 as Any} ?? NSNull(),"responseOffset":responseOffset as Any,"expectedNextOffset":expectedNextOffset.map{$0 as Any} ?? NSNull(),
-    "itemCount":(data["itemCount"] as? NSNumber)?.intValue ?? -1,"httpStatus":(data["httpStatus"] as? NSNumber)?.intValue ?? -1,
-    "newIdentityCount":newIdentityCount,"frontendHint":(data["paginationHint"] as? Bool).map{$0 ? "yes":"no"} ?? "unknown",
-    "frontendDecision":data["frontendPageDecision"] as? String ?? "unknown","nativeDecision":nativeDecision]
-   cycleRootAcceptedPageEvents.append(pageEvent);if cycleRootAcceptedPageEvents.count>40{cycleRootAcceptedPageEvents.removeFirst()}
   }
   updatePartitionReport();renderCycle()
+  return .accepted_new
  }
  func rootDiscoverySnapshotScript(attachContext:Bool)->String? {
   guard let tokenData=try? JSONSerialization.data(withJSONObject:[cycleToken]),let tokenJSON=String(data:tokenData,encoding:.utf8),
@@ -799,6 +827,93 @@ extension Prototype {
   chatCheckNavigation=nil;chatCheckExpectedConversationID=nil
   return true
  }
+ struct PostProbeCandidateResult {
+  let composite:CompositeCoverage
+  let maintenance:StaleIncompleteMaintenanceSelection
+  let recent:[ChatRecord]
+  let checkCandidates:[ChatRecord]
+  let maintenanceCandidateIDs:Set<String>
+  let observedNow:Double
+  let cycleForensicTimestamp:Double
+ }
+ func finalizeDiscoveryAndBuildCandidates(cycleGeneration:String,started:Date,stallDetail:String?,baseDiscoveryComplete:Bool,starredProofState:StarredCoverageProofState,terminalResult:RecentSafetyProbeTerminalResult?,composite initialComposite:CompositeCoverage,terminalEvidence:inout CycleTerminalEvidence)->PostProbeCandidateResult? {
+  guard cycleToken==cycleGeneration,cycleDiscovering else {terminalEvidence.terminalKind = .cancelled_or_stale;return nil}
+  if let terminalResult {
+   recentSafetyProbeAttempted=true
+   recentSafetyProbeTerminalResult=terminalResult
+   recentSafetyProbePending=false
+   terminalEvidence.probeJSOutcome=recentSafetyProbe?.jsOutcome
+   terminalEvidence.probeListReceived=recentSafetyProbe?.listMessageReceived
+   terminalEvidence.probeConsumeResult=recentSafetyProbe?.consumeResult?.rawValue
+   terminalEvidence.probeTerminalResult=terminalResult.rawValue
+   terminalEvidence.probeContributedPartition=false
+   terminalEvidence.recentSafetyProbeAttempted=recentSafetyProbeAttempted
+  }
+  var composite=initialComposite
+  cycleDiscovering=false
+  terminalEvidence.discoveryFinalizedAfterProbe=recentSafetyProbeAttempted ? (!recentSafetyProbePending && recentSafetyProbeTerminalResult != nil):true
+  terminalEvidence.cycleRootResponseReceived=cycleRootResponseReceived
+  cycleRootStallDetail=stallDetail
+  if !cycleRootResponseReceived {composite.status = .incompleteStall;composite.detail=stallDetail ?? "no_list_response";composite.scope="unproven"}
+  else if let stallDetail {composite.status = .incompleteStall;composite.detail=stallDetail}
+  composite=coverageAfterListStatus(composite,statusCodes:Array(cycleRootStatuses))
+  terminalEvidence.coverageComplete=composite.isComplete
+  if discoveryRateLimited(Array(cycleRootStatuses)) {cycleState.discoveryStatus = .rateLimited}
+  else if cycleRootResponseReceived {cycleState.discoveryStatus = .success;cycleState.lastSuccessfulDiscoveryAt=Date()}
+  else {cycleState.discoveryStatus = .incomplete}
+  if Date().timeIntervalSince(started)>=600 && !composite.isComplete {composite.status = .incompleteSafetyLimit;composite.detail="hard_safety_timeout_600s"}
+  updatePartitionReport(composite)
+  let pinnedProofForReport=starredProofState.proof
+  let pinnedPrefixProven=pinnedProofForReport?.prefixComplete == true
+  let pinnedTotal=pinnedPrefixProven ? pinnedProofForReport?.pinnedCount:nil
+  let pinnedResolved=pinnedProofForReport?.timestampsResolved
+  let pinnedUnknown=pinnedTotal.flatMap{total in pinnedResolved.map{max(0,total-$0)}}
+  let baseDiscoveryProven=baseDiscoveryComplete && cycleRootResponseReceived && stallDetail==nil && !discoveryRateLimited(Array(cycleRootStatuses)) && Date().timeIntervalSince(started)<600
+  let pinnedPrefixLabel=pinnedProofForReport.map{$0.prefixComplete ? "complete":"partial"} ?? "not_run"
+  let pinnedResolvedLabel=pinnedPrefixProven ? (pinnedResolved.map(String.init) ?? "unknown") : "\(pinnedResolved ?? 0) observed; total unknown"
+  let proofReadiness=pinnedProofForReport?.readinessStatus ?? "not_run"
+  let proofReadinessReason=pinnedProofForReport?.readinessReason ?? starredProofState.failureReason ?? "not_attempted"
+  let proofTop=pinnedProofForReport?.topProven.map{$0 ? "yes":"no"} ?? "unknown"
+  let proofPrefix=pinnedProofForReport?.prefixCompleteReported.map{$0 ? "yes":"no"} ?? (pinnedProofForReport.map{$0.prefixComplete ? "yes":"no"} ?? "unknown")
+  cyclePinnedReport += "\n\(starredProofState.diagnosticsLine)"
+  cyclePinnedReport += "\nStarred coverage evidence: explicit starred stream observed \(starredProofState.explicitStarredObserved ? "yes":"no") · explicit partition complete \(starredProofState.explicitPartitionComplete ? "yes":"no") · fallback \(starredProofState.fallbackStatus.rawValue) · readiness \(proofReadiness) · top proven \(proofTop) · prefix complete \(proofPrefix) · pinned count \(pinnedProofForReport?.pinnedCount.description ?? "unknown") · activity resolved \(pinnedResolved.map(String.init) ?? "unknown")/\(pinnedProofForReport?.pinnedCount.description ?? "unknown") · recent pinned \(pinnedProofForReport?.recentCount.description ?? "unknown") · source \(starredProofState.source) · completion reason \(pinnedProofForReport?.completionReason ?? "none") · failure \(starredProofState.failureReason ?? (pinnedProofForReport?.complete == true ? "none":pinnedProofForReport?.unresolvedReason ?? "none"))"
+  cyclePinnedReport += "\nReadiness failure reason: \(proofReadinessReason)"
+  cyclePinnedReport += "\nCoverage provenance: Base discovery: \(baseDiscoveryProven ? "complete":"partial") · Pinned prefix: \(pinnedPrefixLabel) · Pinned relevant total: \(pinnedTotal.map(String.init) ?? "unknown") · Pinned activity resolved: \(pinnedResolvedLabel) · Pinned activity unknown: \(pinnedUnknown.map(String.init) ?? "unknown") · Recent pinned: \(pinnedProofForReport?.complete == true ? String(pinnedProofForReport?.recentCount ?? 0):"unknown") · Coverage decision: \(coverageDisplayLabel(composite)) · Coverage reason: \(composite.detail)"
+  updatePartitionReport(composite)
+  let observedNow=Date().timeIntervalSince1970*1000
+  let recent=cycleState.records.values.filter{cycleIds.contains($0.conversationId) && $0.lastSeenUpdatedAt>=cycleCutoffTimestamp && $0.lastSeenUpdatedAt<=observedNow}.sorted{$0.lastSeenUpdatedAt>$1.lastSeenUpdatedAt}
+  let cycleForensicTimestamp=(cycleState.lastCycleAt ?? started).timeIntervalSince1970*1000
+  let recentIDs=Set(recent.map(\.conversationId))
+  let maintenance=selectStaleIncompleteMaintenanceCandidates(records:Array(cycleState.records.values),discoveredIDs:cycleIds,recentIDs:recentIDs,nowMs:observedNow)
+  let maintenanceCandidateIDs=Set(maintenance.admitted.map(\.conversationId))
+  for id in cycleIds where cycleState.records[id]==nil {cycleState.records[id]=ChatRecord(conversationId:id,title:"",lastSeenUpdatedAt:0,lastSeenUpdatedAtSource:.legacyUnknown)}
+  var checkCandidatesByID=Dictionary(uniqueKeysWithValues:recent.map{($0.conversationId,$0)})
+  for record in maintenance.admitted {checkCandidatesByID[record.conversationId]=record}
+  let checkCandidates=Array(checkCandidatesByID.values)
+  terminalEvidence.candidatesBuiltAfterProbe=recentSafetyProbeAttempted ? (!recentSafetyProbePending && recentSafetyProbeTerminalResult != nil):true
+  return PostProbeCandidateResult(composite:composite,maintenance:maintenance,recent:recent,checkCandidates:checkCandidates,maintenanceCandidateIDs:maintenanceCandidateIDs,observedNow:observedNow,cycleForensicTimestamp:cycleForensicTimestamp)
+ }
+ func recordCandidateAdmission(queue:[ChatRecord],checkCandidates:[ChatRecord],recent:[ChatRecord],maintenanceCandidateIDs:Set<String>,cycleForensicTimestamp:Double,observedNow:Double,terminalEvidence:inout CycleTerminalEvidence)->Set<String> {
+  let queuedIDs=Set(queue.map(\.conversationId))
+  terminalEvidence.candidatesBuiltAfterProbe=recentSafetyProbeAttempted ? (!recentSafetyProbePending && recentSafetyProbeTerminalResult != nil):true
+  terminalEvidence.admittedCandidateCount=queue.count
+  let recentIDsForAdmission=Set(recent.map(\.conversationId))
+  for candidate in checkCandidates {
+   let id=candidate.conversationId,queued=queuedIDs.contains(id)
+   let source:ForensicAdmissionSource=maintenanceCandidateIDs.contains(id) ? .staleIncompleteMaintenance : (recentIDsForAdmission.contains(id) ? .recent:.excluded)
+   cycleState.updateForensicEvent(chatID:id,cycleTimestamp:cycleForensicTimestamp) {$0.admissionSource=queued ? source:.excluded;$0.exclusionReason=queued ? nil:(source == .excluded ? "not_admitted":"already_complete_and_current");$0.queued=queued;$0.checked=false;$0.result=queued ? nil:.skipped}
+   if !queued,source == .recent,riskMeasurementStatus(result:candidate.lastCheckResult,aggregate:candidate.aggregate) != .complete {
+    var safetyRecord=cycleState.records[id] ?? candidate
+    safetyRecord.pendingActivityNeedsAttention=true
+    if safetyRecord.uncertainSince == nil {safetyRecord.uncertainSince=observedNow}
+    cycleState.records[id]=safetyRecord
+   }
+  }
+  let candidateIDs=Set(checkCandidates.map(\.conversationId))
+  for id in cycleIds where !candidateIDs.contains(id) {cycleState.updateForensicEvent(chatID:id,cycleTimestamp:cycleForensicTimestamp) {$0.admissionSource = .excluded;$0.exclusionReason="outside_recent_and_maintenance_admission";$0.queued=false;$0.checked=false;$0.result = .skipped}}
+  cycleState.records=boundedForensicHistory(cycleState.records);saveCycle()
+  return queuedIDs
+ }
  @objc func runCycle() {startCycle(trigger:"manual")}
  func startCycle(trigger:String) {
   guard cycleGate.begin() else{return}
@@ -826,8 +941,10 @@ extension Prototype {
   recordBackgroundFocusSample("after scheduler session orderOut")
   cycleState.lastCycleAt=Date();cycleState.lastCycleTrigger=trigger
   cycleState.lastCycleStartedHidden = !panel.isVisible && !session.isVisible
+  var terminalEvidence=CycleTerminalEvidence(cycleSequence:cycleSequence)
   cycleTask=Task { @MainActor in
    defer {
+    finalizeTerminalEvidence(terminalEvidence)
     recordBackgroundFocusSample("cycle cleanup")
     finishGlobalWindowOrderMonitoring()
     finalizeBackgroundFocusObservation(captureBackgroundFocusSnapshot())
@@ -842,7 +959,9 @@ extension Prototype {
    }
    do {
     cycleState.discoveryStatus = .inProgress
-    cycleDiscovering=true;cycleIds=[];cycleListVersion=0;cycleValidListResponses=0;cycleRootResponseReceived=false
+    let cycleGeneration=cycleToken
+    cycleDiscovering=true;cycleIds=[];cycleListVersion=0;cycleValidListResponses=0;cycleRootResponseReceived=false;originalNormalDiscoveryFailureReason=nil
+    recentSafetyProbeAttempted=false;recentSafetyProbePending=false;recentSafetyProbeTerminalResult=nil;recentSafetyProbeToken=nil;recentSafetyProbe=nil
     cycleDiscoverySource="network";cycleDOMCandidateCount=0;cycleDOMAcceptedRowCount=0;cycleDOMRejectedNavigationRowCount=0;cycleDOMDuplicateRowCount=0;cycleDOMFallbackIds=[]
     cycleRootStallDetail=nil;cycleRootLastPageRelativeMs=nil;cycleRootLastPageOffset=nil;cycleRootLastPageNewIdentities=0;cycleRootAcceptedPageEvents=[]
     cycleRootLastIdentityProgressRelativeMs=nil;cycleRootLastIdentityProgressOffset=nil
@@ -919,6 +1038,12 @@ extension Prototype {
       if !cycleRootResponseReceived {stallDetail=cycleRootRequests>0 ? "root_request_without_response":"no_list_response"}
      } else {stallDetail="root_trigger_failed"}
     }
+    if originalNormalDiscoveryFailureReason==nil, !cycleRootResponseReceived,
+       (stallDetail=="no_list_response" || stallDetail=="root_request_without_response") {
+     originalNormalDiscoveryFailureReason=stallDetail
+    }
+    terminalEvidence.originalNormalDiscoveryFailureReason=originalNormalDiscoveryFailureReason
+    terminalEvidence.normalDiscoveryOutcome=cycleRootResponseReceived ? "root_response_received":(stallDetail ?? "root_response_not_received")
     if let script=rootDiscoverySnapshotScript(attachContext:false) {
      do {
       _=try await evaluateForCycle(script)
@@ -963,63 +1088,26 @@ extension Prototype {
     let renderRestored=restoreBackgroundRenderSurface(owner:renderLeaseOwner)
     let renderLeaseCleanupSummary="owner generation \(renderLeaseOwnerMatched ? "matched":"mismatched") · cleanup requested yes · accepted \(renderRestored ? "yes":"no") · \(backgroundRenderLeaseRestoreDetails)"
     backgroundRenderLeaseReport += " · cleanup \(renderRestored ? "completed":"failed") · \(renderLeaseCleanupSummary)"
-    cycleDiscovering=false
-    cycleRootStallDetail=stallDetail
-    if !cycleRootResponseReceived {composite.status = .incompleteStall;composite.detail=stallDetail ?? "no_list_response";composite.scope="unproven"}
-    else if let stallDetail {composite.status = .incompleteStall;composite.detail=stallDetail}
-    composite=coverageAfterListStatus(composite,statusCodes:Array(cycleRootStatuses))
-    if discoveryRateLimited(Array(cycleRootStatuses)) {cycleState.discoveryStatus = .rateLimited}
-    else if cycleRootResponseReceived {cycleState.discoveryStatus = .success;cycleState.lastSuccessfulDiscoveryAt=Date()}
-    else {cycleState.discoveryStatus = .incomplete}
-    if Date().timeIntervalSince(started)>=600 && !composite.isComplete {composite.status = .incompleteSafetyLimit;composite.detail="hard_safety_timeout_600s"}
-    updatePartitionReport(composite)
-    let pinnedProofForReport=starredProofState.proof
-    let pinnedPrefixProven=pinnedProofForReport?.prefixComplete == true
-    let pinnedTotal=pinnedPrefixProven ? pinnedProofForReport?.pinnedCount:nil
-    let pinnedResolved=pinnedProofForReport?.timestampsResolved
-    let pinnedUnknown=pinnedTotal.flatMap{total in pinnedResolved.map{max(0,total-$0)}}
-    let baseDiscoveryProven=baseDiscoveryComplete && cycleRootResponseReceived && stallDetail==nil && !discoveryRateLimited(Array(cycleRootStatuses)) && Date().timeIntervalSince(started)<600
-    let pinnedPrefixLabel=pinnedProofForReport.map{$0.prefixComplete ? "complete":"partial"} ?? "not_run"
-    let pinnedResolvedLabel=pinnedPrefixProven ? (pinnedResolved.map(String.init) ?? "unknown") : "\(pinnedResolved ?? 0) observed; total unknown"
-    let proofReadiness=pinnedProofForReport?.readinessStatus ?? "not_run"
-    let proofReadinessReason=pinnedProofForReport?.readinessReason ?? starredProofState.failureReason ?? "not_attempted"
-    let proofTop=pinnedProofForReport?.topProven.map{$0 ? "yes":"no"} ?? "unknown"
-    let proofPrefix=pinnedProofForReport?.prefixCompleteReported.map{$0 ? "yes":"no"} ?? (pinnedProofForReport.map{$0.prefixComplete ? "yes":"no"} ?? "unknown")
-    cyclePinnedReport += "\n\(starredProofState.diagnosticsLine)"
-    cyclePinnedReport += "\nStarred coverage evidence: explicit starred stream observed \(starredProofState.explicitStarredObserved ? "yes":"no") · explicit partition complete \(starredProofState.explicitPartitionComplete ? "yes":"no") · fallback \(starredProofState.fallbackStatus.rawValue) · readiness \(proofReadiness) · top proven \(proofTop) · prefix complete \(proofPrefix) · pinned count \(pinnedProofForReport?.pinnedCount.description ?? "unknown") · activity resolved \(pinnedResolved.map(String.init) ?? "unknown")/\(pinnedProofForReport?.pinnedCount.description ?? "unknown") · recent pinned \(pinnedProofForReport?.recentCount.description ?? "unknown") · source \(starredProofState.source) · completion reason \(pinnedProofForReport?.completionReason ?? "none") · failure \(starredProofState.failureReason ?? (pinnedProofForReport?.complete == true ? "none":pinnedProofForReport?.unresolvedReason ?? "none"))"
-    cyclePinnedReport += "\nReadiness failure reason: \(proofReadinessReason)"
-    cyclePinnedReport += "\nCoverage provenance: Base discovery: \(baseDiscoveryProven ? "complete":"partial") · Pinned prefix: \(pinnedPrefixLabel) · Pinned relevant total: \(pinnedTotal.map(String.init) ?? "unknown") · Pinned activity resolved: \(pinnedResolvedLabel) · Pinned activity unknown: \(pinnedUnknown.map(String.init) ?? "unknown") · Recent pinned: \(pinnedProofForReport?.complete == true ? String(pinnedProofForReport?.recentCount ?? 0):"unknown") · Coverage decision: \(coverageDisplayLabel(composite)) · Coverage reason: \(composite.detail)"
-    updatePartitionReport(composite)
-    let observedNow=Date().timeIntervalSince1970*1000
-    let discoveryRateLimitedForMonitoring=discoveryRateLimited(Array(cycleRootStatuses))
-    cycleState.monitoringDegraded = monitoringDiscoveryDegraded(baseDiscoveryComplete:baseDiscoveryComplete,rootResponseReceived:cycleRootResponseReceived,stallDetail:stallDetail,rateLimited:discoveryRateLimitedForMonitoring,safetyLimitExceeded:Date().timeIntervalSince(started)>=600)
-    if cycleState.monitoringDegraded == true {
-     cycleState.discoveryStatus = .incomplete
+    var probeTerminalResult:RecentSafetyProbeTerminalResult?
+    if shouldRunRecentSafetyProbeForOriginalFailure, !recentSafetyProbeAttempted, cycleToken==cycleGeneration,cycleDiscovering {
+     recentSafetyProbeAttempted=true
+     terminalEvidence.recentSafetyProbeAttempted=true
+     let probeToken=UUID().uuidString
+     recentSafetyProbeToken=probeToken
+     recentSafetyProbePending=true
+     _=await runRecentSafetyProbe(probeToken)
+     probeTerminalResult=await awaitRecentSafetyProbeTerminal(probeToken:probeToken,cycleGeneration:cycleGeneration)
     }
-    let recent=cycleState.records.values.filter{cycleIds.contains($0.conversationId) && $0.lastSeenUpdatedAt>=cycleCutoffTimestamp && $0.lastSeenUpdatedAt<=observedNow}.sorted{$0.lastSeenUpdatedAt>$1.lastSeenUpdatedAt}
-    let recentIDs=Set(recent.map(\.conversationId))
-    let maintenance=selectStaleIncompleteMaintenanceCandidates(records:Array(cycleState.records.values),discoveredIDs:cycleIds,recentIDs:recentIDs,nowMs:observedNow)
-    let maintenanceCandidateIDs=Set(maintenance.admitted.map(\.conversationId))
-    // A failed OS submission is retried from the last Complete observation, without
-    // requiring another potentially expensive full history pass.
-    for record in recent {
-     guard let last=(cycleState.notificationAudit ?? []).last(where:{$0.kind=="risk" && $0.conversationId==record.conversationId}),
-           riskMeasurementStatus(result:record.lastCheckResult,aggregate:record.aggregate) == .complete,
-           let aggregate=record.aggregate else {continue}
-     let assessment=assessRisk(model:currentRiskModel(),estimatedTextTokens:aggregate.estimatedTextTokens,measurement:.complete)
-     guard let level=retryRiskNotificationLevel(lastOutcome:last.outcome,previousObservedRank:record.lastRiskRank,lastAcceptedRank:record.lastNotifiedRiskRank,next:assessment) else{continue}
-     let content=riskNotificationContent(level:level,chatTitle:record.title,showChatTitle:showChatTitlesInNotifications(storedValue:UserDefaults.standard.object(forKey:showChatTitlesInNotificationsDefaultsKey) as? Bool))
-     submitMonitoredNotification(kind:"risk",level:level,body:content.body,conversationID:record.conversationId)
-    }
-    var checkCandidatesByID=Dictionary(uniqueKeysWithValues:recent.map{($0.conversationId,$0)})
-    for record in maintenance.admitted {checkCandidatesByID[record.conversationId]=record}
-    for id in cycleDOMFallbackIds {
-     if checkCandidatesByID[id]==nil {
-      checkCandidatesByID[id]=cycleState.records[id] ?? ChatRecord(conversationId:id,title:"Chat",lastSeenUpdatedAt:0,lastSeenUpdatedAtSource:.legacyUnknown)
-     }
-    }
-    let checkCandidates=Array(checkCandidatesByID.values)
+    guard let candidateResult=finalizeDiscoveryAndBuildCandidates(cycleGeneration:cycleGeneration,started:started,stallDetail:stallDetail,baseDiscoveryComplete:baseDiscoveryComplete,starredProofState:starredProofState,terminalResult:probeTerminalResult,composite:composite,terminalEvidence:&terminalEvidence) else {return}
+    composite=candidateResult.composite
+    let maintenance=candidateResult.maintenance
+    let recent=candidateResult.recent
+    let checkCandidates=candidateResult.checkCandidates
+    let maintenanceCandidateIDs=candidateResult.maintenanceCandidateIDs
+    let observedNow=candidateResult.observedNow
+    let cycleForensicTimestamp=candidateResult.cycleForensicTimestamp
     let queue=cycleState.queue(checkCandidates);var checked=0;var continuationUsed=false,cycleBudgetSkipped=0
+    _=recordCandidateAdmission(queue:queue,checkCandidates:checkCandidates,recent:recent,maintenanceCandidateIDs:maintenanceCandidateIDs,cycleForensicTimestamp:cycleForensicTimestamp,observedNow:observedNow,terminalEvidence:&terminalEvidence)
     for record in queue {
      try Task.checkCancellation()
      if Date()>=cycleHardDeadline {cycleBudgetSkipped=queue.count-checked;break}
@@ -1227,6 +1315,7 @@ extension Prototype {
      cycleState.recordPerChatPersistedAggregate(saved.aggregate)
      cycleState.finishPerChatHistoryDiagnostic(terminal:terminal,telemetry:chatCheckTelemetry)
      finishPersistedChatCheckTrace(terminalResult:terminal,expectedConversationID:record.conversationId,generation:chatCheckTraceGeneration ?? "")
+     mergingForensicHistory(from:cycleState.records[record.conversationId],into:&saved)
      cycleState.records[record.conversationId]=saved;saveCycle();updateCurrentCycleSummary();chatCheckBudgetController=nil
     }
     cycleState.lastCoverageStatus=composite.status;cycleState.lastCoverageDetail=composite.detail
@@ -1238,7 +1327,15 @@ extension Prototype {
     let summary=CycleChatOutcomeCounts(finalPerChatResults:cycleChatTerminalResults,freshRiskCounts:cycleFreshRiskCounts)
     let riskModel=currentRiskModel().source.rawValue
     cycleState.lastStatus="Last cycle: \(Date().formatted(date:.omitted,time:.shortened))\nCoverage: \(coverageDisplayLabel(composite)) · \(composite.detail)\nCoverage scope: \(composite.scope)\nDiscovery source: \(cycleDiscoverySource) · DOM candidates \(cycleDOMCandidateCount) · accepted conversation rows \(cycleDOMAcceptedRowCount) · rejected navigation rows \(cycleDOMRejectedNavigationRowCount) · coverage reason \(composite.detail)\nCombined unique: \(cycleIds.count) · recent: \(recent.count)\nStale incomplete maintenance: eligible \(maintenance.eligibleCount) · admitted \(maintenance.admitted.count) · deferred by cap \(maintenance.deferredCount)\nChecked: \(summary.checked) · Complete: \(summary.complete) · Failed: \(summary.failed) · Partial: \(summary.partial) · Skipped unchanged: \(max(0,checkCandidates.count-queue.count)) · Skipped cycle budget: \(cycleBudgetSkipped)\nFresh risk (current cycle, \(riskModel)): \(freshRisk)\nNotifications generated/suppressed: \(cycleRiskNotificationsGenerated)/\(cycleRiskNotificationsSuppressed)\nProvenance before: \(cycleProvenanceBefore)\nProvenance after: \(cycleProvenanceSummary())\nRender lease cleanup: \(renderLeaseCleanupSummary)"
+    terminalEvidence.terminalKind = .success
+   } catch is CancellationError {
+    terminalEvidence.terminalKind = .cancelled_or_stale
+    cycleState.discoveryStatus = .incomplete
+    cycleState.lastCoverageStatus = .incompleteStall
+    cycleState.lastCoverageDetail = "cancelled_or_stale"
+    cycleState.lastStatus="Cycle stopped · cancelled"
    } catch {
+    terminalEvidence.terminalKind = .error
     cycleState.discoveryStatus = .incomplete
     cycleState.lastCoverageStatus = .incompleteStall
     cycleState.lastCoverageDetail = "render_surface_readiness_failed"

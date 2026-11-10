@@ -3,7 +3,11 @@ set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 default_out="$root/native-prototype/build/GPTLimitsNativePrototype.app"
 mode=build
-if [ "${1:-}" = "--verify" ]; then
+if [ "${1:-}" = "--typecheck" ]; then
+  [ "$#" -eq 1 ] || { echo "Usage: build.sh --typecheck" >&2; exit 2; }
+  mode=typecheck
+  out=$default_out
+elif [ "${1:-}" = "--verify" ]; then
   mode=verify
   out=${2:-$default_out}
 else
@@ -26,9 +30,21 @@ resources="$out/Contents/Resources"
 executable="$out/Contents/MacOS/GPTLimitsNativePrototype"
 icon="$root/native-prototype/AppIcon.icns"
 [ -f "$icon" ] || { echo "Build failed: required final app icon missing at $icon." >&2; exit 1; }
-input_files="$root/native-prototype/build.sh $main $root/native-prototype/CycleModel.swift $root/native-prototype/CycleEngine.swift $root/native-prototype/bridge.js $root/native-prototype/list-hook.js $root/native-prototype/conversation-list.js $root/native-prototype/automation-bridge.js $root/native-prototype/activity-hook.js $root/native-prototype/conversation-history-diagnostic.js $root/native-prototype/native-rescue-bridge.js $root/extension/rescue.js $root/extension/aggregator.js $root/extension/history-collector.js $root/extension/page-hook.js $manifest"
+input_files="$root/native-prototype/build.sh $main $root/native-prototype/CycleModel.swift $root/native-prototype/CycleEngine.swift $root/native-prototype/SingleInstanceLock.swift $root/native-prototype/RuntimeIdentity.swift $root/native-prototype/bridge.js $root/native-prototype/list-hook.js $root/native-prototype/conversation-list.js $root/native-prototype/automation-bridge.js $root/native-prototype/activity-hook.js $root/native-prototype/conversation-history-diagnostic.js $root/native-prototype/native-rescue-bridge.js $root/extension/rescue.js $root/extension/aggregator.js $root/extension/history-collector.js $root/extension/page-hook.js $manifest"
 input_files="$input_files $icon"
 build_id=$(shasum -a 256 $input_files | shasum -a 256 | awk '{print substr($1,1,16)}')
+
+if [ "$mode" = typecheck ]; then
+  tmp_metadata="/private/tmp/GPTLimitsBuildMetadata.typecheck.$$.swift"
+  trap 'rm -f "$tmp_metadata"' EXIT HUP INT TERM
+  cat > "$tmp_metadata" <<SWIFT
+let gptLimitsExecutableBuildVersionMarker = "$version"
+let gptLimitsExecutableBuildIDMarker = "$build_id"
+SWIFT
+  xcrun swiftc -typecheck -module-cache-path /private/tmp/gpt-limits-swift-cache "$main" "$root/native-prototype/CycleModel.swift" "$root/native-prototype/CycleEngine.swift" "$root/native-prototype/SingleInstanceLock.swift" "$root/native-prototype/RuntimeIdentity.swift" "$tmp_metadata" -framework AppKit -framework WebKit -framework UserNotifications
+  echo "Native Swift typecheck passed: v$version · build $build_id"
+  exit 0
+fi
 
 verify_bundle() {
   [ -x "$executable" ] || { echo "Freshness check failed: executable missing or not runnable." >&2; return 1; }
@@ -72,7 +88,7 @@ cat > "$tmp_metadata" <<SWIFT
 let gptLimitsExecutableBuildVersionMarker = "$version"
 let gptLimitsExecutableBuildIDMarker = "$build_id"
 SWIFT
-xcrun swiftc -module-cache-path /private/tmp/gpt-limits-swift-cache "$main" "$root/native-prototype/CycleModel.swift" "$root/native-prototype/CycleEngine.swift" "$tmp_metadata" -framework AppKit -framework WebKit -framework UserNotifications -o "$tmp_executable"
+xcrun swiftc -module-cache-path /private/tmp/gpt-limits-swift-cache "$main" "$root/native-prototype/CycleModel.swift" "$root/native-prototype/CycleEngine.swift" "$root/native-prototype/SingleInstanceLock.swift" "$root/native-prototype/RuntimeIdentity.swift" "$tmp_metadata" -framework AppKit -framework WebKit -framework UserNotifications -o "$tmp_executable"
 for file in aggregator.js history-collector.js page-hook.js rescue.js; do cp "$root/extension/$file" "$resources/$file"; done
 cp "$root/native-prototype/bridge.js" "$resources/bridge.js"
 for file in list-hook.js conversation-list.js automation-bridge.js activity-hook.js conversation-history-diagnostic.js native-rescue-bridge.js; do cp "$root/native-prototype/$file" "$resources/$file"; done

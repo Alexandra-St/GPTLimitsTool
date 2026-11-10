@@ -15,13 +15,76 @@ function makeContext(fetchImpl, xhrResponse, perfEntries=[],cycleConfig=null,cry
  const window={fetch:fetchImpl,webkit:{messageHandlers:{diagnostics:{postMessage:x=>diagnostics.push(x)},list:{postMessage:x=>pages.push(x)}}}};
  if(cycleConfig)window.gptListCycleConfig=cycleConfig;
  const document={readyState:'complete',body:{},documentElement:{},querySelectorAll:()=>[],querySelector:()=>null,visibilityState:'visible'};
- const ctx=vm.createContext({window,crypto:cryptoOverride||require('node:crypto').webcrypto,TextEncoder,Uint8Array,XMLHttpRequest:XHR,MutationObserver,location:{href:'https://chatgpt.com/',origin:'https://chatgpt.com',pathname:'/'},URL,Request:undefined,Date,setTimeout,performance:{getEntriesByType:()=>perfEntries,now:()=>123},innerWidth:1100,innerHeight:760,document});
+ const ctx=vm.createContext({window,crypto:cryptoOverride||require('node:crypto').webcrypto,TextEncoder,Uint8Array,XMLHttpRequest:XHR,MutationObserver,location:{href:'https://chatgpt.com/',origin:'https://chatgpt.com',pathname:'/'},URL,URLSearchParams,Request:undefined,Date,setTimeout,performance:{getEntriesByType:()=>perfEntries,now:()=>123},innerWidth:1100,innerHeight:760,document});
  for(const file of ['conversation-list.js','list-hook.js'])vm.runInContext(fs.readFileSync(path.join(__dirname,file),'utf8'),ctx);
  const waitPages=async count=>{const until=Date.now()+3000;while(pages.length<count&&Date.now()<until)await new Promise(r=>setTimeout(r,5));assert.equal(pages.length,count);};
  const waitDiagnostics=async(event,count)=>{const until=Date.now()+3000;while(diagnostics.filter(x=>x.event===event).length<count&&Date.now()<until)await new Promise(r=>setTimeout(r,5));assert.equal(diagnostics.filter(x=>x.event===event).length,count);};
  return {window,diagnostics,pages,XHR,context:ctx,mutationObservers,waitPages,waitDiagnostics};
 }
 const payload={items:[{id:'private-conversation-id',title:'private title',update_time:'2026-10-23T16:00:00Z',snippet:'private body'}],offset:0,limit:20,total:999};
+
+test('validated ephemeral root template accepts only exact safe GET offset requests',async()=>{
+ const c=makeContext(async()=>({status:200,clone:()=>({json:async()=>payload})}),null,[],{token:'cycle-template'});
+ c.window.gptRateLimitContext={owner:'scheduler_discovery',generation:'cycle-template',stage:'scheduler_discovery'};
+ const read=()=>c.window.gptGetValidatedRecentSafetyTemplate();
+ assert.equal(read().reason,'not_observed');
+ await c.window.fetch('/backend-api/conversations?offset=20&limit=20&is_archived=false',{method:'GET',credentials:'include',signal:new AbortController().signal});
+ let t=read();assert.equal(t.valid,true);assert.equal(t.reason,'valid');assert.equal(t.metadata.offsetName,'offset');assert.equal(t.metadata.credentialsMode,'include');assert.deepEqual(JSON.parse(JSON.stringify(t.request.queryEntries)),[['offset','20'],['limit','20'],['is_archived','false']]);
+ await c.window.fetch('/backend-api/conversations?offset=0',{method:'POST'});assert.equal(read().reason,'invalid_method');assert.equal(read().request,null);
+ await c.window.fetch('/backend-api/conversations?offset=0',{method:'GET',body:'private-body'});assert.equal(read().reason,'invalid_body');
+ for(const query of ['offset=0&cursor=private-cursor','offset=0&next_token=private-token']){await c.window.fetch('/backend-api/conversations?'+query);assert.equal(read().reason,'invalid_cursor_pagination');}
+ await c.window.fetch('/backend-api/conversations?limit=20');assert.equal(read().reason,'invalid_pagination');
+ await c.window.fetch('/backend-api/gizmos/project-123/conversations?offset=0');assert.equal(read().reason,'not_root');
+ await c.window.fetch('/backend-api/conversations/private-id/messages?offset=0');assert.equal(read().reason,'not_root');
+ await c.window.fetch('/backend-api/conversations?offset=10&limit=5');t=read();assert.equal(t.valid,true);assert.equal(t.request.queryEntries[0][1],'10');
+ await c.window.fetch('/backend-api/conversations?offset=2&cursor=secret');t=read();assert.equal(t.valid,false);assert.equal(t.reason,'invalid_cursor_pagination');assert.equal(t.request,null);
+ const serialized=JSON.stringify(t);for(const secret of ['https://','Authorization','cookie-secret','private-id','private-body','secret'])assert.equal(serialized.includes(secret),false);
+});
+
+test('recent safety probe is one-shot, offset-zero, credential-preserving, and returns only sanitized outcomes',async()=>{
+ const calls=[];const rootPayload=payload;
+ const fetchImpl=async(url,init)=>{calls.push({url:String(url),init:{...init}});return {status:200,json:async()=>rootPayload};};
+ const c=makeContext(fetchImpl,null,[],{token:'cycle-probe'});
+ c.window.gptRateLimitContext={owner:'scheduler_discovery',generation:'cycle-probe',stage:'scheduler_discovery'};
+ await c.window.fetch('/backend-api/conversations?offset=20&limit=20&is_archived=false',{method:'GET',credentials:'include',signal:{aborted:false}});
+ calls.length=0;
+ const first=await c.window.gptRunRecentSafetyProbe('probe-token-one');
+ assert.deepEqual(JSON.parse(JSON.stringify(first)),{outcome:'response_dispatched'});assert.equal(calls.length,1);
+ assert.equal(c.pages.length,1);assert.equal(c.pages[0].provenance,'recent_safety_probe');assert.equal(c.pages[0].probeToken,'probe-token-one');assert.equal(c.pages[0].records[0].conversationId,'private-conversation-id');
+ const request=calls[0];assert.equal(new URL(request.url).pathname,'/backend-api/conversations');
+ assert.deepEqual([...new URL(request.url).searchParams.entries()],[['offset','0'],['limit','20'],['is_archived','false']]);
+ assert.equal(request.init.method,'GET');assert.equal(request.init.credentials,'include');assert.equal(Object.hasOwn(request.init,'signal'),false);assert.equal(Object.hasOwn(request.init,'body'),false);
+ const repeated=await c.window.gptRunRecentSafetyProbe('probe-token-one');assert.deepEqual(JSON.parse(JSON.stringify(repeated)),{outcome:'response_dispatched'});assert.equal(calls.length,1);assert.equal(c.pages.length,1);
+ assert.deepEqual(JSON.parse(JSON.stringify(await c.window.gptRunRecentSafetyProbe('probe-token-two'))),{outcome:'response_dispatched'});assert.equal(calls.length,2);assert.equal(c.pages.length,2);
+ const serialized=JSON.stringify([first,repeated,c.diagnostics]);for(const secret of ['records','private-conversation-id','private title','https://','Authorization','cookie','PRIVATE_BODY'])assert.equal(serialized.includes(secret),false);
+});
+
+test('recent safety probe refuses invalid templates without fetching and consumes its token once',async()=>{
+ let calls=0;const c=makeContext(async()=>{calls++;return {status:200,json:async()=>({items:[]})};},null,[],{token:'cycle-invalid-probe'});
+ const result=await c.window.gptRunRecentSafetyProbe('invalid-template-token');assert.deepEqual(JSON.parse(JSON.stringify(result)),{outcome:'template_invalid'});assert.equal(calls,0);
+ await c.window.fetch('/backend-api/conversations?offset=0',{method:'POST'});
+ calls=0;
+ assert.deepEqual(JSON.parse(JSON.stringify(await c.window.gptRunRecentSafetyProbe('invalid-template-token'))),{outcome:'template_invalid'});assert.equal(calls,0);
+});
+
+test('recent safety probe maps 429, non-2xx, network, and parse failures without retry',async t=>{
+ const scenarios=[
+  {name:'429',response:{status:429,json:async()=>({items:[]})},expected:'http_429'},
+  {name:'non-2xx',response:{status:503,json:async()=>({items:[]})},expected:'http_non_2xx'},
+  {name:'network',error:new Error('PRIVATE_NETWORK_ERROR'),expected:'request_failed'},
+  {name:'parse',response:{status:200,json:async()=>{throw new Error('PRIVATE_BODY');}},expected:'parse_failed'},
+  {name:'malformed',response:{status:200,json:async()=>({conversations:[{id:'PRIVATE_ID'}]})},expected:'parse_failed'}
+ ];
+ for(const scenario of scenarios){await t.test(scenario.name,async()=>{
+  let calls=0,templateObserved=false;const c=makeContext(async()=>{calls++;if(!templateObserved)return {status:200,json:async()=>({items:[]}),clone:()=>({json:async()=>({items:[]})})};if(scenario.error)throw scenario.error;return scenario.response;},null,[],{token:'cycle-outcome-'+scenario.name});
+  c.window.gptRateLimitContext={owner:'scheduler_discovery',generation:'cycle-outcome-'+scenario.name,stage:'scheduler_discovery'};
+  await c.window.fetch('/backend-api/conversations?offset=4&limit=2');await c.waitPages(1);c.pages.length=0;templateObserved=true;calls=0;
+  const result=await c.window.gptRunRecentSafetyProbe('outcome-token');assert.deepEqual(JSON.parse(JSON.stringify(result)),{outcome:scenario.expected});
+  assert.deepEqual(JSON.parse(JSON.stringify(await c.window.gptRunRecentSafetyProbe('outcome-token'))),{outcome:scenario.expected});assert.equal(calls,1);
+  assert.equal(c.pages.length,0);
+  assert.equal(JSON.stringify(result).includes('PRIVATE'),false);
+ });}
+});
 
 test('list diagnostics strip query, mask IDs, and do not retain response bodies',async()=>{
  const response={status:200,clone:()=>({json:async()=>payload})};
@@ -35,6 +98,23 @@ test('list diagnostics strip query, mask IDs, and do not retain response bodies'
  const serialized=JSON.stringify(c.diagnostics);
  for(const secret of ['private-query','private-token','private-conversation-id','private title','private body','snippet'])assert.ok(!serialized.includes(secret),`diagnostics unexpectedly contain ${secret}: ${serialized}`);
  assert.equal(c.pages.length,1);assert.equal(c.pages[0].records[0].conversationId,'private-conversation-id');
+});
+
+test('root request correlation assigns a scalar sequence and keeps telemetry payload schema sanitized',async()=>{
+ const response={status:200,clone:()=>({json:async()=>payload})};
+ const c=makeContext(async()=>response,null,[],{token:'cycle-secret'});
+ await c.window.fetch('/backend-api/conversations?offset=0&cursor=opaque-private',{method:'POST',body:'private-body',headers:{Authorization:'private-header'},credentials:'include',signal:{}});
+ await c.waitPages(1);
+ const list=c.pages[0],events=c.diagnostics.filter(x=>x.event==='root_request_correlation');
+ assert.equal(list.rootRequestSequence,1);
+ assert.deepEqual(events.map(x=>x.stage),['request_observed','response_observed','list_message_sent']);
+ assert.ok(events.every(x=>x.sequence===1));
+ assert.equal(JSON.stringify(events[0].queryParameterNames),JSON.stringify(['offset','cursor']));
+ assert.equal(JSON.stringify(events[0].paginationParameterNames),JSON.stringify(['offset','cursor']));
+ assert.equal(events[0].offset,0);assert.equal(events[0].bodyPresent,true);assert.equal(events[0].signalPresent,true);
+ assert.equal(events[0].credentialsMode,'include');assert.equal(events[0].customHeadersPresent,true);assert.equal(events[0].customHeaderCount,1);
+ const telemetry=JSON.stringify(events);for(const secret of ['records','conversationId','projectId','diagnosticRequestId','private-conversation-id','opaque-private','private-body','private-header','Authorization'])assert.equal(telemetry.includes(secret),false);
+ assert.equal(JSON.stringify(list.records).includes('private-conversation-id'),true,'the existing production ingestion payload remains intact');
 });
 
 test('request observed with no response is represented without payload data',async()=>{

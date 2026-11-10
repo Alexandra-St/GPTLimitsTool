@@ -169,9 +169,10 @@ struct ChatRecord: Codable {
  var partialObservedActivityAt:Double? = nil
  var pendingActivityNeedsAttention=false
  var paginationBoundaryMessageCount:Int? = nil
+ var forensicHistory:[ForensicHistoryEvent] = []
 }
 extension ChatRecord {
- private enum CodingKeys:String,CodingKey {case conversationId,title,lastSeenUpdatedAt,lastSeenUpdatedAtSource,lastSeenUpdatedAtObservedAt,lastCheckedUpdatedAt,lastCheckAt,lastCheckResult,aggregate,calibrationLabel,lastRiskRank,lastNotifiedRiskRank,consecutiveIncompleteChecks,lastUncertainNotificationAt,uncertainSince,uncertainAcknowledgedAt,partialObservedActivityAt,pendingActivityNeedsAttention,paginationBoundaryMessageCount}
+ private enum CodingKeys:String,CodingKey {case conversationId,title,lastSeenUpdatedAt,lastSeenUpdatedAtSource,lastSeenUpdatedAtObservedAt,lastCheckedUpdatedAt,lastCheckAt,lastCheckResult,aggregate,calibrationLabel,lastRiskRank,lastNotifiedRiskRank,consecutiveIncompleteChecks,lastUncertainNotificationAt,uncertainSince,uncertainAcknowledgedAt,partialObservedActivityAt,pendingActivityNeedsAttention,paginationBoundaryMessageCount,forensicHistory}
  init(from decoder:Decoder)throws {
   let c=try decoder.container(keyedBy:CodingKeys.self)
   conversationId=try c.decode(String.self,forKey:.conversationId);title=try c.decode(String.self,forKey:.title)
@@ -190,8 +191,41 @@ extension ChatRecord {
   partialObservedActivityAt=try c.decodeIfPresent(Double.self,forKey:.partialObservedActivityAt)
   pendingActivityNeedsAttention=try c.decodeIfPresent(Bool.self,forKey:.pendingActivityNeedsAttention) ?? false
   paginationBoundaryMessageCount=try c.decodeIfPresent(Int.self,forKey:.paginationBoundaryMessageCount)
+  forensicHistory=try c.decodeIfPresent([ForensicHistoryEvent].self,forKey:.forensicHistory) ?? []
  }
 }
+
+enum ForensicAdmissionSource:String,Codable { case recent,staleIncompleteMaintenance="stale_incomplete_maintenance",excluded }
+enum ForensicResult:String,Codable { case complete="Complete",partial="Partial",failed="Failed",skipped }
+struct ForensicHistoryEvent:Codable,Equatable {
+ var timestamp:Double
+ let cycleTimestamp:Double
+ var admissionSource:ForensicAdmissionSource
+ var exclusionReason:String?
+ var queued:Bool
+ var checked:Bool
+ var result:ForensicResult?
+ mutating func refreshTimestamp(_ value:Double){timestamp=value}
+}
+func boundedForensicHistory(_ records:[String:ChatRecord],perChatLimit:Int=8,globalLimit:Int=500)->[String:ChatRecord] {
+ var result=records
+ for key in Array(result.keys) {if var record=result[key],record.forensicHistory.count>perChatLimit {record.forensicHistory=Array(record.forensicHistory.sorted{$0.timestamp<$1.timestamp}.suffix(perChatLimit));result[key]=record}}
+ let all=result.flatMap{key,record in record.forensicHistory.map{(key,$0.timestamp)}}.sorted{$0.1<$1.1}
+ if all.count>globalLimit {let removed=Set(all.prefix(all.count-globalLimit).map{"\($0.0)|\($0.1)"});for key in Array(result.keys) {if var record=result[key] {record.forensicHistory.removeAll{removed.contains("\(key)|\($0.timestamp)")};result[key]=record}}}
+ return result
+}
+extension CycleState {
+ mutating func updateForensicEvent(chatID:String,cycleTimestamp:Double,now:Double=Date().timeIntervalSince1970*1000,_ update:(inout ForensicHistoryEvent)->Void) {
+  guard var record=records[chatID] else{return}
+  if let index=record.forensicHistory.firstIndex(where:{$0.cycleTimestamp==cycleTimestamp}) {update(&record.forensicHistory[index]);record.forensicHistory[index].refreshTimestamp(now)}
+  else {var event=ForensicHistoryEvent(timestamp:now,cycleTimestamp:cycleTimestamp,admissionSource:.excluded,exclusionReason:nil,queued:false,checked:false,result:nil);update(&event);if event.queued || event.checked || event.admissionSource == .excluded && event.exclusionReason != nil {record.forensicHistory.append(event)}else{return}}
+  records[chatID]=record;records=boundedForensicHistory(records)
+ }
+}
+func mergingForensicHistory(from current:ChatRecord?,into saved:inout ChatRecord) {
+ guard let current else{return};saved.forensicHistory=current.forensicHistory
+}
+
 struct CachedActivityProvenanceSummary {
  let records:Int;let timestamps:Int;let trusted:Int;let legacyOrUnknown:Int;let freshObservations:Int;let staleObservations:Int
 }
@@ -1000,6 +1034,7 @@ struct CycleState: Codable {
  var perChatHistoryDiagnostics:PerChatHistoryDiagnostics? = nil
  var historyProgressEventRejections:HistoryProgressEventRejectionState? = nil
  var lastPinnedUnknownRows:[PinnedUnknownRowDiagnostic]? = nil
+ var lastRootRequestCorrelation:RootRequestCorrelationState? = nil
  mutating func beginHistoryResponseParsing(){lastHistoryResponseParsing=HistoryResponseParsingState()}
  mutating func beginPerChatHistoryDiagnostic(ordinal:Int){if perChatHistoryDiagnostics==nil{perChatHistoryDiagnostics=PerChatHistoryDiagnostics()};perChatHistoryDiagnostics?.begin(ordinal:ordinal)}
  mutating func recordHistoryResponseParsing(_ data:[String:Any],at:Date=Date()) {
@@ -2644,3 +2679,19 @@ struct StarredCoverageProofState:Codable {
 }
 import Foundation
 
+enum RootRequestCorrelationStage:String,Codable { case request_observed,response_observed,list_message_sent,native_handoff,consume_attempt,consume_new,consume_repeated,consume_rejected }
+struct RootRequestCorrelationEvent:Codable,Equatable {
+ let sequence:Int;let stage:RootRequestCorrelationStage;let timestamp:Date;let transport:String;let method:String;let offset:Int?;let status:Int?;let itemCount:Int?;let queryParameterNames:[String];let paginationParameterNames:[String];let bodyPresent:Bool;let signalPresent:Bool;let credentialsMode:String;let customHeadersPresent:Bool;let customHeaderCount:Int
+ static func make(_ d:[String:Any],at:Date=Date())->RootRequestCorrelationEvent? {
+  guard let n=(d["sequence"] as? NSNumber)?.intValue,n>0,let raw=d["stage"] as? String,let stage=RootRequestCorrelationStage(rawValue:raw) else{return nil}
+  func names(_ key:String,_ max:Int)->[String]{Array(Set((d[key] as? [String] ?? []).filter{$0.range(of:"^[A-Za-z][A-Za-z0-9_-]{0,39}$",options:.regularExpression) != nil})).sorted().prefix(max).map{$0}}
+  let method=d["method"] as? String ?? "UNKNOWN",transport=d["transport"] as? String ?? "unknown",credentials=d["credentialsMode"] as? String ?? "unknown"
+  return RootRequestCorrelationEvent(sequence:n,stage:stage,timestamp:at,transport:["fetch","xhr"].contains(transport) ? transport:"unknown",method:["GET","POST","PUT","PATCH","DELETE","OPTIONS","HEAD"].contains(method) ? method:"UNKNOWN",offset:(d["offset"] as? NSNumber)?.intValue,status:(d["status"] as? NSNumber)?.intValue,itemCount:(d["itemCount"] as? NSNumber)?.intValue,queryParameterNames:names("queryParameterNames",30),paginationParameterNames:names("paginationParameterNames",12),bodyPresent:d["bodyPresent"] as? Bool == true,signalPresent:d["signalPresent"] as? Bool == true,credentialsMode:["omit","same-origin","include"].contains(credentials) ? credentials:"unknown",customHeadersPresent:d["customHeadersPresent"] as? Bool == true,customHeaderCount:min(100,max(0,(d["customHeaderCount"] as? NSNumber)?.intValue ?? 0)))
+ }
+}
+struct RootRequestCorrelationState:Codable,Equatable {
+ private(set) var events:[RootRequestCorrelationEvent]=[]
+ mutating func append(_ e:RootRequestCorrelationEvent){events.append(e);if events.count>1000{events.removeFirst(events.count-1000)}}
+ func count(_ sequence:Int,_ stage:RootRequestCorrelationStage)->Int{events.filter{$0.sequence==sequence && $0.stage==stage}.count}
+ var privacySchemaIsSafe:Bool {let keys:Set<String>=["sequence","stage","timestamp","transport","method","offset","status","itemCount","queryParameterNames","paginationParameterNames","bodyPresent","signalPresent","credentialsMode","customHeadersPresent","customHeaderCount"];return keys.isDisjoint(with:["records","conversationId","projectId","diagnosticRequestId","url","body","headers","headerValues"])}
+}

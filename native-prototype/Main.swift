@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import WebKit
 import UserNotifications
 
@@ -77,6 +78,167 @@ struct SidebarDiagnosticSummary: Equatable {
     }
 }
 
+enum DiscoveryPageConsumeResult:String { case accepted_new,accepted_repeated,rejected_stale_cycle,rejected_rate_limited,rejected_invalid_page }
+enum RecentSafetyProbeTerminalResult:String { case js_terminal,consume_terminal,bridge_failure,cancelled_or_stale }
+struct CycleTerminalEvidence {
+    enum TerminalKind:String,Codable { case success,error,cancelled_or_stale }
+    let cycleSequence:UInt64
+    var normalDiscoveryOutcome:String?=nil
+    var originalNormalDiscoveryFailureReason:String?=nil
+    var recentSafetyProbeAttempted:Bool?=nil
+    var probeJSOutcome:String?=nil
+    var probeListReceived:Bool?=nil
+    var probeConsumeResult:String?=nil
+    var probeTerminalResult:String?=nil
+    var discoveryFinalizedAfterProbe:Bool?=nil
+    var candidatesBuiltAfterProbe:Bool?=nil
+    var coverageComplete:Bool?=nil
+    var cycleRootResponseReceived:Bool?=nil
+    var probeContributedPartition:Bool?=nil
+    var admittedCandidateCount:Int?=nil
+    var terminalKind:TerminalKind?
+}
+struct LastCycleTerminalSnapshot:Codable,Equatable {
+    let buildID:String
+    let cycleSequence:UInt64
+    let terminalKind:CycleTerminalEvidence.TerminalKind
+    let normalDiscoveryOutcome:String?
+    let originalNormalDiscoveryFailureReason:String?
+    let recentSafetyProbeAttempted:Bool?
+    let probeJSOutcome:String?
+    let probeListReceived:Bool?
+    let probeConsumeResult:String?
+    let probeTerminalResult:String?
+    let discoveryFinalizedAfterProbe:Bool?
+    let candidatesBuiltAfterProbe:Bool?
+    let coverageComplete:Bool?
+    let cycleRootResponseReceived:Bool?
+    let probeContributedPartition:Bool?
+    let admittedCandidateCount:Int?
+    let cycleFinished:Bool
+    let finishedAt:Date
+}
+enum TerminalSnapshotPersistenceStage:String,Codable {
+    case directoryCreate="directory_create"
+    case existingSnapshotRead="existing_snapshot_read"
+    case existingSnapshotDecode="existing_snapshot_decode"
+    case snapshotEncode="snapshot_encode"
+    case snapshotWrite="snapshot_write"
+}
+struct TerminalSnapshotPersistenceFailure:Codable,Equatable {
+    let stage:TerminalSnapshotPersistenceStage
+    let errorDomain:String
+    let errorCode:Int
+    let cycleSequence:UInt64
+    let buildID:String
+    init(stage:TerminalSnapshotPersistenceStage,error:NSError,snapshot:LastCycleTerminalSnapshot) {
+        let allowed=CharacterSet(charactersIn:"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-")
+        func sanitized(_ value:String)->String {
+            let result=String(String.UnicodeScalarView(value.unicodeScalars.map{allowed.contains($0) ? $0:UnicodeScalar(95)}.prefix(80)))
+            return result.isEmpty ? "unknown":result
+        }
+        self.stage=stage;self.errorDomain=sanitized(error.domain);self.errorCode=error.code
+        self.cycleSequence=snapshot.cycleSequence;self.buildID=sanitized(snapshot.buildID)
+    }
+    var diagnosticText:String {
+        "snapshot_status=persist_failed\npersistence_stage=\(stage.rawValue)\nerror_domain=\(errorDomain)\nerror_code=\(errorCode)\ncycle_sequence=\(cycleSequence)\nbuild_id=\(buildID)"
+    }
+}
+enum TerminalSnapshotPersistenceResult:Equatable {
+    case persisted
+    case skippedOlderExistingSequence
+    case failed(TerminalSnapshotPersistenceFailure)
+}
+let terminalSnapshotPersistenceFailureDefaultsKey="lastCycleTerminalSnapshotPersistenceFailureV1"
+func makeLastCycleTerminalSnapshot(from evidence:CycleTerminalEvidence,buildID:String,finishedAt:Date=Date())->LastCycleTerminalSnapshot? {
+    guard let terminalKind=evidence.terminalKind else{return nil}
+    return LastCycleTerminalSnapshot(buildID:buildID,cycleSequence:evidence.cycleSequence,terminalKind:terminalKind,
+        normalDiscoveryOutcome:evidence.normalDiscoveryOutcome,originalNormalDiscoveryFailureReason:evidence.originalNormalDiscoveryFailureReason,
+        recentSafetyProbeAttempted:evidence.recentSafetyProbeAttempted,probeJSOutcome:evidence.probeJSOutcome,
+        probeListReceived:evidence.probeListReceived,probeConsumeResult:evidence.probeConsumeResult,probeTerminalResult:evidence.probeTerminalResult,
+        discoveryFinalizedAfterProbe:evidence.discoveryFinalizedAfterProbe,candidatesBuiltAfterProbe:evidence.candidatesBuiltAfterProbe,
+        coverageComplete:evidence.coverageComplete,cycleRootResponseReceived:evidence.cycleRootResponseReceived,
+        probeContributedPartition:evidence.probeContributedPartition,admittedCandidateCount:evidence.admittedCandidateCount,
+        cycleFinished:true,finishedAt:finishedAt)
+}
+func persistLastCycleTerminalSnapshot(_ snapshot:LastCycleTerminalSnapshot,applicationSupportDirectory:URL?=nil)->TerminalSnapshotPersistenceResult {
+    guard let base=applicationSupportDirectory ?? FileManager.default.urls(for:.applicationSupportDirectory,in:.userDomainMask).first else {
+        let error=NSError(domain:"GPTLimitsTool",code:1)
+        return .failed(TerminalSnapshotPersistenceFailure(stage:.directoryCreate,error:error,snapshot:snapshot))
+    }
+    let directory=base.appendingPathComponent("GPTLimitsTool",isDirectory:true)
+    let file=directory.appendingPathComponent("last-cycle-terminal.json",isDirectory:false)
+    do {try FileManager.default.createDirectory(at:directory,withIntermediateDirectories:true)}
+    catch {return .failed(TerminalSnapshotPersistenceFailure(stage:.directoryCreate,error:error as NSError,snapshot:snapshot))}
+    if FileManager.default.fileExists(atPath:file.path) {
+        let existingData:Data
+        do {existingData=try Data(contentsOf:file)}
+        catch {return .failed(TerminalSnapshotPersistenceFailure(stage:.existingSnapshotRead,error:error as NSError,snapshot:snapshot))}
+        let existing:LastCycleTerminalSnapshot
+        do {
+            let decoder=JSONDecoder();decoder.dateDecodingStrategy = .iso8601
+            existing=try decoder.decode(LastCycleTerminalSnapshot.self,from:existingData)
+        } catch {return .failed(TerminalSnapshotPersistenceFailure(stage:.existingSnapshotDecode,error:error as NSError,snapshot:snapshot))}
+        if existing.cycleSequence>snapshot.cycleSequence{return .skippedOlderExistingSequence}
+    }
+    let data:Data
+    do {let encoder=JSONEncoder();encoder.dateEncodingStrategy = .iso8601;data=try encoder.encode(snapshot)}
+    catch {return .failed(TerminalSnapshotPersistenceFailure(stage:.snapshotEncode,error:error as NSError,snapshot:snapshot))}
+    do {try data.write(to:file,options:.atomic);return .persisted}
+    catch {return .failed(TerminalSnapshotPersistenceFailure(stage:.snapshotWrite,error:error as NSError,snapshot:snapshot))}
+}
+func recordTerminalSnapshotPersistenceResult(_ result:TerminalSnapshotPersistenceResult,defaults:UserDefaults = .standard) {
+    switch result {
+    case .persisted:defaults.removeObject(forKey:terminalSnapshotPersistenceFailureDefaultsKey)
+    case .skippedOlderExistingSequence:break
+    case .failed(let failure):
+        let encoder=JSONEncoder()
+        if let data=try? encoder.encode(failure){defaults.set(data,forKey:terminalSnapshotPersistenceFailureDefaultsKey)}
+    }
+}
+func terminalSnapshotPersistenceFailureDiagnostic(defaults:UserDefaults = .standard)->String? {
+    guard let data=defaults.data(forKey:terminalSnapshotPersistenceFailureDefaultsKey),
+          let failure=try? JSONDecoder().decode(TerminalSnapshotPersistenceFailure.self,from:data) else{return nil}
+    return failure.diagnosticText
+}
+func inspectLastCycleTerminalSnapshot(applicationSupportDirectory:URL?=nil)->String {
+    guard let base=applicationSupportDirectory ?? FileManager.default.urls(for:.applicationSupportDirectory,in:.userDomainMask).first else{return terminalSnapshotPersistenceFailureDiagnostic() ?? "no_completed_cycle_snapshot"}
+    let file=base.appendingPathComponent("GPTLimitsTool",isDirectory:true).appendingPathComponent("last-cycle-terminal.json",isDirectory:false)
+    guard FileManager.default.fileExists(atPath:file.path) else{return terminalSnapshotPersistenceFailureDiagnostic() ?? "no_completed_cycle_snapshot"}
+    guard let data=try? Data(contentsOf:file) else{return "invalid_completed_cycle_snapshot"}
+    let decoder=JSONDecoder()
+    decoder.dateDecodingStrategy = .iso8601
+    guard let snapshot=try? decoder.decode(LastCycleTerminalSnapshot.self,from:data) else{return "invalid_completed_cycle_snapshot"}
+    func value(_ raw:String?)->String {
+        guard let raw,!raw.isEmpty,raw.unicodeScalars.allSatisfy({CharacterSet(charactersIn:"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-").contains($0)}) else{return "unknown"}
+        return String(raw.prefix(128))
+    }
+    func optionalBool(_ raw:Bool?)->String {raw.map{$0 ? "true":"false"} ?? "unknown"}
+    func optionalInt(_ raw:Int?)->String {raw.map{String(max(0,$0))} ?? "unknown"}
+    let formatter=ISO8601DateFormatter()
+    formatter.formatOptions=[.withInternetDateTime,.withFractionalSeconds]
+    return [
+        "build_id=\(value(snapshot.buildID))",
+        "cycle_sequence=\(snapshot.cycleSequence)",
+        "terminal_kind=\(value(snapshot.terminalKind.rawValue))",
+        "normal_discovery_outcome=\(value(snapshot.normalDiscoveryOutcome))",
+        "original_normal_discovery_failure=\(value(snapshot.originalNormalDiscoveryFailureReason))",
+        "recent_safety_probe_attempted=\(optionalBool(snapshot.recentSafetyProbeAttempted))",
+        "probe_js_outcome=\(value(snapshot.probeJSOutcome))",
+        "probe_list_received=\(optionalBool(snapshot.probeListReceived))",
+        "probe_consume_result=\(value(snapshot.probeConsumeResult))",
+        "probe_terminal_result=\(value(snapshot.probeTerminalResult))",
+        "discovery_finalized_after_probe=\(optionalBool(snapshot.discoveryFinalizedAfterProbe))",
+        "candidates_built_after_probe=\(optionalBool(snapshot.candidatesBuiltAfterProbe))",
+        "coverage_complete=\(optionalBool(snapshot.coverageComplete))",
+        "cycle_root_response_received=\(optionalBool(snapshot.cycleRootResponseReceived))",
+        "probe_contributed_partition=\(optionalBool(snapshot.probeContributedPartition))",
+        "admitted_candidate_count=\(optionalInt(snapshot.admittedCandidateCount))",
+        "cycle_finished=\(snapshot.cycleFinished ? "true":"false")",
+        "finished_at=\(formatter.string(from:snapshot.finishedAt))"
+    ].joined(separator:"\n")
+}
+
 final class Prototype: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKNavigationDelegate, WKUIDelegate, UNUserNotificationCenterDelegate, NSWindowDelegate {
     struct AutomationUpdate: Decodable {
         var token: String;var state: SafeAggregate;var overlap: Bool;var oldest: Bool;var received: Int
@@ -92,7 +254,106 @@ final class Prototype: NSObject, NSApplicationDelegate, WKScriptMessageHandler, 
     var runtimeScripts=""
     var runtimeUserScript:WKUserScript?
     var pinnedActivityContextUserScriptInstalled=false
-    var cycleToken=""
+    var cycleSequence:UInt64=0
+    var cycleToken="" {
+        didSet {
+            guard oldValue != cycleToken else{return}
+            if !cycleToken.isEmpty {cycleSequence &+= 1}
+            recentSafetyProbeAttempted=false
+            recentSafetyProbeToken=nil
+            recentSafetyProbeTerminalResult=nil
+            recentSafetyProbePending=false
+        }
+    }
+    var recentSafetyProbeAttempted=false
+    var recentSafetyProbeToken:String?
+    var recentSafetyProbeTerminalResult:RecentSafetyProbeTerminalResult?
+    var recentSafetyProbePending=false
+    struct RecentSafetyProbeState {
+        let probeToken:String
+        let cycleGeneration:String
+        var terminalCompleted=false
+        var terminalResult:RecentSafetyProbeTerminalResult?
+        var waiter:((RecentSafetyProbeTerminalResult)->Void)?
+        var jsOutcome:String?
+        var listMessageReceived=false
+        var consumeResult:DiscoveryPageConsumeResult?
+        var bridgeFailureReason:String?
+        var events:[String]=[]
+    }
+    var recentSafetyProbe:RecentSafetyProbeState?
+    func finalizeTerminalEvidence(_ evidence:CycleTerminalEvidence) {
+        let buildID=RuntimeIdentity.make(buildMarker:gptLimitsExecutableBuildIDMarker,bundle:Bundle.main).buildID
+        guard let snapshot=makeLastCycleTerminalSnapshot(from:evidence,buildID:buildID,finishedAt:Date()) else{return}
+        let result=persistLastCycleTerminalSnapshot(snapshot)
+        recordTerminalSnapshotPersistenceResult(result)
+    }
+    @discardableResult func completeRecentSafetyProbe(probeToken:String,cycleGeneration:String,result:RecentSafetyProbeTerminalResult)->Bool {
+        guard var probe=recentSafetyProbe,probe.probeToken==probeToken,probe.cycleGeneration==cycleGeneration,
+              !probe.terminalCompleted else{return false}
+        probe.terminalCompleted=true
+        probe.terminalResult=result
+        probe.events.append("probe_terminal_result:\(result.rawValue)")
+        let completion=probe.waiter
+        probe.waiter=nil
+        recentSafetyProbe=probe
+        completion?(result)
+        return true
+    }
+    @MainActor func awaitRecentSafetyProbeTerminal(probeToken:String,cycleGeneration:String) async -> RecentSafetyProbeTerminalResult {
+        guard let probe=recentSafetyProbe,probe.probeToken==probeToken,probe.cycleGeneration==cycleGeneration else{return .cancelled_or_stale}
+        if probe.terminalCompleted {return probe.terminalResult ?? .cancelled_or_stale}
+        guard probe.waiter==nil else{return .cancelled_or_stale}
+        return await withCheckedContinuation { continuation in
+            // MainActor serialization keeps this registration atomic with the terminal check above.
+            guard var current=recentSafetyProbe,current.probeToken==probeToken,current.cycleGeneration==cycleGeneration,
+                  !current.terminalCompleted,current.waiter==nil else {
+                continuation.resume(returning:currentTerminalResult(probeToken:probeToken,cycleGeneration:cycleGeneration))
+                return
+            }
+            current.waiter={ result in continuation.resume(returning:result) }
+            recentSafetyProbe=current
+        }
+    }
+    @MainActor private func currentTerminalResult(probeToken:String,cycleGeneration:String)->RecentSafetyProbeTerminalResult {
+        guard let probe=recentSafetyProbe,probe.probeToken==probeToken,probe.cycleGeneration==cycleGeneration else{return .cancelled_or_stale}
+        return probe.terminalCompleted ? (probe.terminalResult ?? .cancelled_or_stale):.cancelled_or_stale
+    }
+    func installRecentSafetyProbeWaiterForTesting(probeToken:String,cycleGeneration:String,completion:@escaping (RecentSafetyProbeTerminalResult)->Void)->Bool {
+        guard var probe=recentSafetyProbe,probe.probeToken==probeToken,probe.cycleGeneration==cycleGeneration,
+              !probe.terminalCompleted,probe.waiter==nil else{return false}
+        probe.waiter=completion
+        recentSafetyProbe=probe
+        return true
+    }
+    @discardableResult func cancelRecentSafetyProbe(probeToken:String,cycleGeneration:String)->Bool {
+        completeRecentSafetyProbe(probeToken:probeToken,cycleGeneration:cycleGeneration,result:.cancelled_or_stale)
+    }
+    #if RECENT_SAFETY_PROBE_TESTING
+    var recentSafetyProbeJavaScriptOverride: ((String,String) async throws -> Any?)?
+    #endif
+    @MainActor func executeRecentSafetyProbeJavaScript(_ script:String,token:String) async throws -> Any? {
+        #if RECENT_SAFETY_PROBE_TESTING
+        if let execute=recentSafetyProbeJavaScriptOverride {return try await execute(script,token)}
+        #endif
+        return try await web.callAsyncJavaScript(script,arguments:["token":token],in:nil,contentWorld:.page)
+    }
+    @MainActor func runRecentSafetyProbe(_ probeToken:String) async -> String {
+        guard cycleDiscovering,cycleRootTriggerStarted,!cycleToken.isEmpty,
+              probeToken.range(of:"^[A-Za-z0-9_-]{1,128}$",options:.regularExpression) != nil else {return "stale_or_mismatched_probe_token"}
+        let generation=cycleToken
+        if let existing=recentSafetyProbe,existing.cycleGeneration==generation {return "stale_or_mismatched_probe_token"}
+        recentSafetyProbe=RecentSafetyProbeState(probeToken:probeToken,cycleGeneration:generation,events:["probe_js_invoked"])
+        let script="const r=await window.gptRunRecentSafetyProbe?.(token); const allowed=['template_invalid','request_failed','http_429','http_non_2xx','parse_failed','response_dispatched']; return allowed.includes(r?.outcome) ? r.outcome : 'request_failed';"
+        let value=(try? await executeRecentSafetyProbeJavaScript(script,token:probeToken)) as? String
+        let allowed:Set<String>=["template_invalid","request_failed","http_429","http_non_2xx","parse_failed","response_dispatched"]
+        let outcome=value.flatMap{allowed.contains($0) ? $0:nil} ?? "request_failed"
+        guard cycleDiscovering,cycleToken==generation,recentSafetyProbe?.probeToken==probeToken else{return "stale_or_mismatched_probe_token"}
+        recentSafetyProbe?.jsOutcome=outcome
+        recentSafetyProbe?.events.append("probe_js_outcome:\(outcome)")
+        if outcome != "response_dispatched" {_ = completeRecentSafetyProbe(probeToken:probeToken,cycleGeneration:generation,result:.js_terminal)}
+        return outcome
+    }
     var cycleOrigins=OriginLabelRegistry()
     var cyclePartitions:[PartitionDescriptor:PartitionObservation]=[:]
     var cycleCoverageReport=""
@@ -103,6 +364,7 @@ final class Prototype: NSObject, NSApplicationDelegate, WKScriptMessageHandler, 
     var cycleDiscovering=false
     var cycleListVersion=0
     var cycleRootStallDetail:String?
+    var originalNormalDiscoveryFailureReason:String?
     var cycleRootLastPageRelativeMs:Int?
     var cycleRootLastPageOffset:Int?
     var cycleRootLastPageNewIdentities=0
@@ -162,6 +424,12 @@ final class Prototype: NSObject, NSApplicationDelegate, WKScriptMessageHandler, 
     var cycleProjectIds=Set<String>()
     var cycleProjectStreams=Set<Int>()
     var cyclePageKeys=Set<String>()
+    func recordRootRequestCorrelation(sequence:Int,stage:RootRequestCorrelationStage) {
+        let payload:[String:Any] = ["sequence":sequence,"stage":stage.rawValue,"timestamp":Date().timeIntervalSince1970*1000,"transport":"unknown","method":"UNKNOWN"]
+        guard let event=RootRequestCorrelationEvent.make(payload) else{return}
+        if cycleState.lastRootRequestCorrelation==nil {cycleState.lastRootRequestCorrelation=RootRequestCorrelationState()}
+        cycleState.lastRootRequestCorrelation?.append(event)
+    }
     var cycleProjectPages=0
     var cyclePinnedResult:[String:Any]?
     var cycleActivity:[String:Any]?
@@ -5093,6 +5361,13 @@ let pinnedDiagnosticVersion="6.1.0"
         if message.name=="diagnostics",message.frameInfo.isMainFrame,message.frameInfo.securityOrigin.host=="chatgpt.com",
            let data=message.body as? [String:Any] {
             let event=data["event"] as? String ?? ""
+            if event=="root_request_correlation",cycleDiscovering,cycleRootTriggerStarted,
+               let correlation=RootRequestCorrelationEvent.make(data) {
+                if cycleState.lastRootRequestCorrelation==nil {cycleState.lastRootRequestCorrelation=RootRequestCorrelationState()}
+                cycleState.lastRootRequestCorrelation?.append(correlation)
+                saveCycle()
+                return
+            }
             if event=="session_paint_watch",data["generation"] as? String==visibleSessionPaintWatchGeneration,
                let result=data["result"] as? [String:Any] {
                 visibleSessionPresentationReport="\(visibleSessionPresentationReport) · post-restore \(sessionPaintWatchSummary(result)) · native [\(sessionPresentationSnapshot())]"
@@ -5242,20 +5517,7 @@ let pinnedDiagnosticVersion="6.1.0"
             return
         }
         if message.name == "list", message.frameInfo.isMainFrame, message.frameInfo.securityOrigin.host == "chatgpt.com", let data = message.body as? [String: Any] {
-            if let records = data["records"] as? [[String: Any]] {
-                if cycleDiscovering,cycleRootTriggerStarted {consumeDiscoveryPage(data,records:records)}
-                for r in records {
-                    guard let id = r["conversationId"] as? String, let title = r["title"] as? String, let time = r["updatedAt"] as? Double, time.isFinite else { continue }
-                    if time >= (discovered[id]?["updatedAt"] as? Double ?? 0) { discovered[id] = ["conversationId": id, "title": title, "updatedAt": time] }
-                }
-            }
-            let now = Date().timeIntervalSince1970 * 1000
-            let recent = recentRecords()
-            let lines = recent.prefix(10).map { r -> String in
-                let minutes = max(0, Int((now - (r["updatedAt"] as? Double ?? now)) / 60000))
-                return "\(r["title"] as? String ?? "") — \(minutes < 60 ? "\(minutes) min" : "\(minutes / 60) h") ago"
-            }.joined(separator: "\n")
-            listOutput.stringValue = "Recent activity window: 6 h\nReceived conversations: \(discovered.count)\nRecently active chats: \(recent.count)\n\(lines)\nList endpoints: root /backend-api/conversations; project /backend-api/gizmos/:id/conversations\nFields: id / title / update_time"
+            consumeValidatedListMessage(data)
             return
         }
         if cycleRunning {return}
@@ -5264,6 +5526,38 @@ let pinnedDiagnosticVersion="6.1.0"
         let numeric = ["messages", "user", "assistant", "other", "tokens", "images", "audio", "video", "files"]
         let counts = numeric.map { "\($0): \((summary[$0] as? NSNumber)?.intValue ?? 0)" }.joined(separator: " · ")
         output.stringValue = "\(status)\nChat: \((summary["title"] as? String ?? "").prefix(200))\n\(counts)\nHistory: \(summary["history"] as? String ?? "Unknown")\nEndpoint: \(summary["endpoint"] as? String ?? "Unknown")"
+    }
+    func consumeValidatedListMessage(_ data:[String:Any]) {
+        let isProbe=(data["provenance"] as? String)=="recent_safety_probe"
+        if isProbe {
+            guard let probe=recentSafetyProbe,cycleDiscovering,cycleRootTriggerStarted,!cycleToken.isEmpty,probe.cycleGeneration==cycleToken,
+                  data["cycleToken"] as? String==cycleToken,data["probeToken"] as? String==probe.probeToken,!probe.terminalCompleted else {
+                if recentSafetyProbe?.cycleGeneration==cycleToken {recentSafetyProbe?.events.append("stale_or_mismatched_probe_token")};return
+            }
+            recentSafetyProbe?.listMessageReceived=true
+            recentSafetyProbe?.events.append(contentsOf:["probe_list_message_received","probe_native_handoff"])
+        }
+        if cycleDiscovering,cycleRootTriggerStarted,let sequence=(data["rootRequestSequence"] as? NSNumber)?.intValue,sequence>0 {
+            recordRootRequestCorrelation(sequence:sequence,stage:.list_message_sent)
+            recordRootRequestCorrelation(sequence:sequence,stage:.native_handoff)
+        }
+        if let records = data["records"] as? [[String: Any]] {
+            if cycleDiscovering,cycleRootTriggerStarted {if let sequence=(data["rootRequestSequence"] as? NSNumber)?.intValue,sequence>0 {recordRootRequestCorrelation(sequence:sequence,stage:.consume_attempt)};if isProbe {recentSafetyProbe?.events.append("probe_consume_attempt")};let result=consumeDiscoveryPage(data,records:records,source:isProbe ? .recent_safety_probe:.normal_discovery);if isProbe {recentSafetyProbe?.consumeResult=result;recentSafetyProbe?.events.append("probe_consume_result:\(result.rawValue)");if result == .accepted_new || result == .accepted_repeated,let probe=recentSafetyProbe {_ = completeRecentSafetyProbe(probeToken:probe.probeToken,cycleGeneration:probe.cycleGeneration,result:.consume_terminal)}else if let probe=recentSafetyProbe {_ = completeRecentSafetyProbe(probeToken:probe.probeToken,cycleGeneration:probe.cycleGeneration,result:.bridge_failure)}}}
+            for r in records {
+                guard let id = r["conversationId"] as? String, let title = r["title"] as? String, let time = r["updatedAt"] as? Double, time.isFinite else { continue }
+                if time >= (discovered[id]?["updatedAt"] as? Double ?? 0) { discovered[id] = ["conversationId": id, "title": title, "updatedAt": time] }
+            }
+        } else if isProbe {
+            recentSafetyProbe?.bridgeFailureReason="invalid_probe_list_payload"
+            if let probe=recentSafetyProbe {_ = completeRecentSafetyProbe(probeToken:probe.probeToken,cycleGeneration:probe.cycleGeneration,result:.bridge_failure)}
+        }
+        let now = Date().timeIntervalSince1970 * 1000
+        let recent = recentRecords()
+        let lines = recent.prefix(10).map { r -> String in
+            let minutes = max(0, Int((now - (r["updatedAt"] as? Double ?? now)) / 60000))
+            return "\(r["title"] as? String ?? "") — \(minutes < 60 ? "\(minutes) min" : "\(minutes / 60) h") ago"
+        }.joined(separator: "\n")
+        listOutput.stringValue = "Recent activity window: 6 h\nReceived conversations: \(discovered.count)\nRecently active chats: \(recent.count)\n\(lines)\nList endpoints: root /backend-api/conversations; project /backend-api/gizmos/:id/conversations\nFields: id / title / update_time"
     }
     func recordRootDocumentSnapshot(_ snapshot:[String:Any]) {
         guard let lifecycle=snapshot["documentLifecycle"] as? [String:Any],
@@ -5394,10 +5688,31 @@ let pinnedDiagnosticVersion="6.1.0"
 }
 @main struct PrototypeMain {
  static func main() {
-  let app=NSApplication.shared
-  let delegate=Prototype()
-  app.setActivationPolicy(.accessory)
-  app.delegate=delegate
-  withExtendedLifetime(delegate) {app.run()}
+  if CommandLine.arguments.dropFirst().contains("--inspect-last-cycle") {print(inspectLastCycleTerminalSnapshot());return}
+  if CommandLine.arguments.dropFirst().contains("--inspect-single-instance") {print(SingleInstanceLock.inspect(bundleIdentifier:"com.alexandrast.gptlimitstool").output);return}
+  let id=RuntimeIdentity.make(buildMarker:gptLimitsExecutableBuildIDMarker,bundle:.main)
+  let ownerMetadata=SingleInstanceOwnerMetadata(buildID:id.buildID,bundlePath:id.bundlePath,executablePath:id.executablePath,bundleID:id.bundleID,version:id.version,launchTimestamp:ISO8601DateFormatter().string(from:Date()))
+  let acquire=SingleInstanceLock.acquire(bundleIdentifier:"com.alexandrast.gptlimitstool",ownerMetadata:ownerMetadata)
+  switch acquire {
+  case .acquired(let lock):
+   let didBootstrap=SingleInstanceStartup.run(lock:lock,activateExisting:{}) {
+    let app=NSApplication.shared
+    let delegate=Prototype()
+    app.setActivationPolicy(.accessory)
+    app.delegate=delegate
+    withExtendedLifetime((lock,delegate)){app.run()}
+   }
+   if !didBootstrap {exit(EXIT_SUCCESS)}
+  case .contended:
+   let existing=NSRunningApplication.runningApplications(withBundleIdentifier:"com.alexandrast.gptlimitstool").first
+   let diagnostic=SecondaryInstanceDiagnostic(requestedBundlePath:Bundle.main.bundleURL.path,bundleID:Bundle.main.bundleIdentifier,existingBundleURL:existing?.bundleURL)
+   NSLog("GPT Limits Tool startup diagnostic: %@",diagnostic.diagnosticsText)
+   existing?.activate(options:[])
+   exit(EXIT_SUCCESS)
+  case .failed(let error):
+   let name:[Int32:String]=[EPERM:"EPERM",EACCES:"EACCES",EINVAL:"EINVAL",EBADF:"EBADF"]
+   fputs("single_instance_lock_failed\nerrno=\(error)\nerrno_name=\(name[error] ?? "UNKNOWN")\n",stderr)
+   exit(EXIT_FAILURE)
+  }
  }
 }

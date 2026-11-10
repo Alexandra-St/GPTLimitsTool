@@ -227,7 +227,7 @@ test('an already-open Diagnostics window refreshes one cycle snapshot after cycl
   assert.match(engine,/func renderCycle\(\)[\s\S]*updateCurrentCycleSummary\(\)/);
   assert.match(refresh,/let perChatDiagnostics=cycleState\.perChatHistoryDiagnostics[\s\S]*let perChatSummary=perChatDiagnostics\?\.summary[\s\S]*let perChatDetails=perChatDiagnostics\?\.detailedResponseSummary[\s\S]*perChatHistoryRawOutput\.stringValue=[\s\S]*currentCycleSummaryOutput\.stringValue=/);
   assert.match(refresh,/let checkedLine=line\("Checked:"\)/);
-  assert.match(cycle,/cycleState\.finishPerChatHistoryDiagnostic\(terminal:terminal,telemetry:chatCheckTelemetry\)[\s\S]*cycleState\.records\[record\.conversationId\]=saved;saveCycle\(\)/);
+  assert.match(cycle,/cycleState\.finishPerChatHistoryDiagnostic\(terminal:terminal,telemetry:chatCheckTelemetry\)[\s\S]*cycleState\.records\[record\.conversationId\]=saved;[\s\S]*saveCycle\(\)/);
   assert.match(model,/func needsAttentionActionable\(record:ChatRecord/); // state selection remains in the existing display predicate
 });
 

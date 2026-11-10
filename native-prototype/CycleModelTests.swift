@@ -874,7 +874,32 @@ final class TestLockedCounter:@unchecked Sendable {
   assert(privacy.lastRenderReadiness?.reason == "unclassified")
   assert(renderReadinessDiagnosticSummary(privacy.lastRenderReadiness!).contains("route chat"))
  }
+ static func forensicHistoryTests() throws {
+  let id="private-chat-id",cycle=1_800_000_000_000.0
+  var state=CycleState();state.records[id]=ChatRecord(conversationId:id,title:"Private title",lastSeenUpdatedAt:cycle)
+  state.updateForensicEvent(chatID:id,cycleTimestamp:cycle,now:cycle) {$0.admissionSource = .recent;$0.queued=true}
+  assert(state.records[id]?.forensicHistory.count==1)
+  assert(state.records[id]?.forensicHistory[0].queued==true)
+  var updated=state.records[id]!
+  updated.title="Updated title"
+  mergingForensicHistory(from:state.records[id],into:&updated)
+  state.records[id]=updated
+  let reloaded=try JSONDecoder().decode(CycleState.self,from:JSONEncoder().encode(state))
+  let event=reloaded.records[id]!.forensicHistory[0]
+  assert(event.admissionSource == .recent && event.queued)
+  var legacy=try JSONSerialization.jsonObject(with:JSONEncoder().encode(state)) as! [String:Any]
+  var records=legacy["records"] as! [String:Any],record=records[id] as! [String:Any]
+  record.removeValue(forKey:"forensicHistory");records[id]=record;legacy["records"]=records
+  let old=try JSONSerialization.data(withJSONObject:legacy)
+  let decodedOld=try JSONDecoder().decode(CycleState.self,from:old)
+  assert(decodedOld.records[id]?.forensicHistory.isEmpty==true)
+  var merged=decodedOld
+  merged.records[id]?.forensicHistory=[event]
+  merged.merge([["conversationId":id,"title":"Updated title","updatedAt":cycle+10]],source:.rootConversationUpdateTime,observedAt:cycle+10)
+  assert(merged.records[id]?.forensicHistory==[event])
+ }
  static func main() async throws {
+  try forensicHistoryTests()
   try renderReadinessPersistenceTests()
   try perChatHistoryDiagnosticsTests()
   try pinnedUnknownRowDiagnosticTests()

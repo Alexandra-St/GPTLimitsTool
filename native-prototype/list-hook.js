@@ -1,7 +1,10 @@
 (() => {
  'use strict';
- let requestSequence=0,rootObservationSequence=0,nextProjectStream=1,nextQueryStream=10,starredNetworkWindow=null,observedListSources=[];
+ let requestSequence=0,rootObservationSequence=0,rootRequestSequence=0,nextProjectStream=1,nextQueryStream=10,starredNetworkWindow=null,observedListSources=[];
  let rootHookEvents=[],rootResourceEvents=[],rootSidebarTimeline=[],rootDiscoveryObservationToken=null,rootSidebarObserver=null,rootSidebarLastSignature=null,rootDiscoverySeenPageIds=new Map();
+ let latestRootRequestTemplate={valid:false,reason:'not_observed',metadata:null,request:null};
+ const recentSafetyProbeAttempts=new Map();
+ const unwrappedPageFetch=typeof window.fetch==='function'?window.fetch.bind(window):null;
  const rootTrafficFamilies=['root_conversation_list','project_conversation_list','conversation_messages','conversation_detail','other_chatgpt_backend'];
  const rootTraffic=Object.fromEntries(rootTrafficFamilies.map(family=>[family,{fetch:{requests:0,responses:0,failures:0,statuses:{}},XHR:{requests:0,responses:0,failures:0,statuses:{}},resource:{requests:0,responses:0,failures:0,statuses:{},zeroTransfer:0}}]));
  let rootTrafficToken=null,rootPageShowPersisted=null;
@@ -108,7 +111,7 @@
   const {rateContext:capturedRateContext,...safeDetails}=details;
   if(event==='response'&&details.status===429)recordRateLimit(details.pathname,details.status,capturedRateContext);
   if(event==='request'||event==='response'||event==='failure')recordStarredNetwork(event,safeDetails);
-  try {window.webkit?.messageHandlers?.diagnostics?.postMessage({event,timestamp:Date.now(),cycleToken:window.gptListCycleConfig?.token||null,...safeDetails});} catch {}
+  try {window.webkit?.messageHandlers?.diagnostics?.postMessage({event,timestamp:Date.now(),documentTimeOriginMs:Number.isFinite(performance.timeOrigin)?Math.round(performance.timeOrigin):null,cycleToken:window.gptListCycleConfig?.token||null,...safeDetails});} catch {}
  };
  const endpointFamily=(pathname,origin=location.origin)=>{
   if(typeof pathname!=='string')return 'unknown';
@@ -214,6 +217,8 @@
   }
   return {method,pathname:diagnosticPath(url.href)||'/backend-api/:path',queryKeys,queryValues,transport};
  };
+ const rootCorrelationEvents=[];
+ const emitRootCorrelation=(sequence,stage,details={})=>{if(!Number.isSafeInteger(sequence)||sequence<1)return;const event={sequence,stage,timestamp:Date.now(),transport:['fetch','xhr'].includes(details.transport)?details.transport:'fetch',method:/^(GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD)$/.test(details.method||'')?details.method:'UNKNOWN',offset:Number.isSafeInteger(details.offset)&&details.offset>=0?details.offset:null,status:Number.isInteger(details.status)&&details.status>=100&&details.status<=599?details.status:null,itemCount:Number.isSafeInteger(details.itemCount)&&details.itemCount>=0?details.itemCount:null,queryParameterNames:(details.queryParameterNames||[]).filter(k=>/^[A-Za-z][A-Za-z0-9_-]{0,39}$/.test(k)).slice(0,30),paginationParameterNames:(details.paginationParameterNames||[]).filter(k=>/^[A-Za-z][A-Za-z0-9_-]{0,39}$/.test(k)).slice(0,12),bodyPresent:details.bodyPresent===true,signalPresent:details.signalPresent===true,credentialsMode:['omit','same-origin','include'].includes(details.credentialsMode)?details.credentialsMode:'unknown',customHeadersPresent:details.customHeadersPresent===true,customHeaderCount:Number.isSafeInteger(details.customHeaderCount)?Math.min(100,Math.max(0,details.customHeaderCount)):0};rootCorrelationEvents.push(event);if(rootCorrelationEvents.length>500)rootCorrelationEvents.shift();try{window.webkit?.messageHandlers?.diagnostics?.postMessage({event:'root_request_correlation',...event});}catch{}};
  const likelyListDiagnosticPath=raw=>{try{return /(conversation|sidebar|starred|pinned|favorite|history|\/list|batch)/i.test(new URL(raw,location.href).pathname);}catch{return false;}};
  window.gptBeginStarredNetworkWindow=()=>{starredNetworkWindow=[];return true;};
  window.gptEndStarredNetworkWindow=()=>{const result=starredNetworkWindow||[];starredNetworkWindow=null;return result;};
@@ -288,14 +293,14 @@
  });
  const observe=(raw,payload,meta,backendTrafficContext=null)=>{
   window.gptObserveBackendResponse?.(raw,payload,meta?.status);
-  if((meta?.cycleToken??null)!==(window.gptListCycleConfig?.token||null))return Promise.resolve();
+  if((meta?.cycleToken??null)!==(window.gptListCycleConfig?.token||null))return Promise.resolve(false);
   const info=targetInfo(raw,meta?.method);if(!info?.isConversationList)return;
   const path=info.pathname;
   const records=GptConversationList.sanitizeList(payload),shape=responseShape(payload);
   const parserRejectionReason=records!==null?'none':(!payload||typeof payload!=='object'||Array.isArray(payload)?'payload_not_object':'items_not_array');
   recordStarredNetwork('shape',{...meta,pathname:path,status:meta?.status,safeShape:safeResponseShape(payload),recognized:records!==null,parserRejectionReason});
   post('parsed',{...meta,pathname:path,recognized:records!==null,...shape});
-  if(records===null)return Promise.resolve();
+  if(records===null)return Promise.resolve(false);
   const pageTimes=payload.items.map(item=>typeof item?.update_time==='string'&&/^\d{4}-\d{2}-\d{2}T/.test(item.update_time)?Date.parse(item.update_time):NaN);
   const timestampsValid=pageTimes.every(Number.isFinite);
   const sequenceKey=info.scope+':'+info.streamId,sequence=(streamSequences.get(sequenceKey)||0)+1;streamSequences.set(sequenceKey,sequence);
@@ -317,9 +322,9 @@
   let flags={orderedByUpdated:info.orderedByUpdated,hasPinned:info.hasPinned};
   // Preserve response-observation order while origin HMAC operations finish.
   deliveryQueue=deliveryQueue.then(async()=>{
-   if(cycleToken!==(window.gptListCycleConfig?.token||null))return;
+   if(cycleToken!==(window.gptListCycleConfig?.token||null))return false;
    const partition=info.scope==='project'?null:await partitionDescriptor(raw);
-   if(cycleToken!==(window.gptListCycleConfig?.token||null))return;
+   if(cycleToken!==(window.gptListCycleConfig?.token||null))return false;
    const partitionShape=partition?`archived:${partition.archived===null?'omitted':partition.archived};starred:${partition.starred===null?'omitted':partition.starred};origin:${partition.includeOrigin?'include':partition.excludeOrigin?'exclude':'omitted'}`:'project';
    // Page-memory-only metadata supports local pinned-link matching. IDs never
    // cross the native bridge through this diagnostic and are dropped on navigation.
@@ -336,15 +341,21 @@
       sourceFamily:info.scope==='project'?'project_conversation_list':'root_conversation_list'}];
     })});
    if(observedListSources.length>100)observedListSources.shift();
-   window.webkit.messageHandlers.list.postMessage({...flags,relativeMs:relativeNow(),partitionShape,
+   const rootSequence=Number.isSafeInteger(meta?.rootObservation?.rootRequestSequence)?meta.rootObservation.rootRequestSequence:null;
+   if(rootSequence!==null){
+    const correlation={sequence:rootSequence,stage:'list_message_sent',timestamp:Date.now(),transport:meta?.transport==='XHR'?'xhr':'fetch',method:meta?.method,offset:Number.isSafeInteger(offset)?offset:null,status:Number.isInteger(meta?.status)?meta.status:null,itemCount:pageTimes.length,queryParameterNames:info.queryKeys,paginationParameterNames:info.queryKeys.filter(k=>['offset','limit','cursor','before','after','page_token','pagination_token','continuation_token'].includes(k.toLowerCase())),bodyPresent:meta?.rootObservation?.template?.bodyPresent===true,signalPresent:meta?.rootObservation?.template?.signalPresent===true,credentialsMode:meta?.rootObservation?.template?.credentialsMode||'unknown',customHeadersPresent:meta?.rootObservation?.template?.customHeadersPresent===true,customHeaderCount:meta?.rootObservation?.template?.customHeaderCount||0};
+    try{window.webkit?.messageHandlers?.diagnostics?.postMessage({event:'root_request_correlation',...correlation});}catch{}
+   }
+   window.webkit.messageHandlers.list.postMessage({...flags,relativeMs:relativeNow(),documentTimeOriginMs:Number.isFinite(performance.timeOrigin)?Math.round(performance.timeOrigin):null,diagnosticRequestId:Number.isSafeInteger(meta?.requestId)?meta.requestId:null,...(rootSequence===null?{}:{rootRequestSequence:rootSequence}),partitionShape,
    scope:info.scope,streamId:info.streamId,sequence,paginationKind,offset,limit,cursorPresent:pageCursorPresent,cursorNull,cursorType,
    queryKeys:info.queryKeys,queryValues:info.queryValues,queryClassification:info.queryClassification,
    cycleToken,partitionDescriptor:partition,sortOrder:info.queryValues.order??null,requestCursorPresent:queryCursorPresent,
    httpStatus:Number.isFinite(meta?.status)?meta.status:null,
    total,itemCount:pageTimes.length,responseOffset,expectedNextOffset,paginationHint,paginationHintSource,frontendPageDecision,
    pageTimes:timestampsValid?pageTimes:[],timestampsValid,path,count:records.length,
-   isoTimestamp:timestampsValid,records});
-  }).catch(()=>post('failure',meta));
+   isoTimestamp:timestampsValid,...(meta?.probeToken?{provenance:'recent_safety_probe',probeToken:meta.probeToken}:{}),records});
+   return true;
+  }).catch(()=>{post('failure',meta);return false;});
   return deliveryQueue;
  };
  window.gptResolvePinnedRecords=ids=>[...new Set(ids)].map(conversationId=>{
@@ -455,13 +466,46 @@
  const isRootDiscoveryCandidate=raw=>{
   try{const url=new URL(raw,location.href);return url.origin===location.origin&&likelyListDiagnosticPath(url.href);}catch{return false;}
  };
- const beginRootDiscoveryObservation=(raw,method,transport)=>{
+ const beginRootDiscoveryObservation=(raw,method,transport,requestOptions={})=>{
   const context=rateContext(),token=window.gptListCycleConfig?.token;
   if(context.owner!=='scheduler_discovery'||!token||context.generation!==token||!isRootDiscoveryCandidate(raw))return null;
   attachRootDiscoveryObservations(token);
-  const url=new URL(raw,location.href),path=rootObservationPath(url.href)||'/unknown',entry={sequence:++rootObservationSequence,source:'hook',event:'request',category:rootEndpointCategory(url.pathname),pathname:path,method:/^(GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD)$/i.test(method||'')?String(method).toUpperCase():'UNKNOWN',transport:String(transport||'unknown').slice(0,16),relativeMs:relativeNow(),status:null,completed:false,itemCount:null,arrayCounts:[],partition:safeRootPartition(url.href),generation:'current'};
+  const url=new URL(raw,location.href),path=rootObservationPath(url.href)||'/unknown',partition=safeRootPartition(url.href),entry={sequence:++rootObservationSequence,rootRequestSequence:++rootRequestSequence,source:'hook',event:'request',category:rootEndpointCategory(url.pathname),pathname:path,method:/^(GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD)$/i.test(method||'')?String(method).toUpperCase():'UNKNOWN',transport:String(transport||'unknown').slice(0,16),relativeMs:relativeNow(),status:null,completed:false,itemCount:null,arrayCounts:[],partition,generation:'current',template:{queryParameterNames:[...new Set(url.searchParams.keys())],paginationParameterNames:[...new Set([...url.searchParams.keys()].filter(k=>['offset','limit','cursor','before','after','page_token','pagination_token','continuation_token'].includes(k.toLowerCase())))],bodyPresent:requestOptions.bodyPresent===true,signalPresent:requestOptions.signalPresent===true,credentialsMode:['omit','same-origin','include'].includes(requestOptions.credentialsMode)?requestOptions.credentialsMode:'unknown',customHeadersPresent:requestOptions.customHeaderCount>0,customHeaderCount:requestOptions.customHeaderCount||0,offset:partition?.offset??null}};
+  if(['root_conversation_list','project_conversation_list','conversation_messages','conversation_detail'].includes(entry.category)){
+   const queryEntries=[...url.searchParams.entries()].map(([key,value])=>[key,value]);
+   const cursorKeys=[...url.searchParams.keys()].filter(k=>/(^|_)(cursor|token)(_|$)/i.test(k)||['before','after'].includes(k.toLowerCase()));
+   const paginationKeys=[...url.searchParams.keys()].filter(k=>['offset','limit'].includes(k.toLowerCase())||cursorKeys.includes(k));
+   const offsetValues=url.searchParams.getAll('offset'),numericOffset=offsetValues.length===1&&/^(0|[1-9][0-9]{0,6})$/.test(offsetValues[0]);
+   let reason=null;
+   if(url.origin!==location.origin)reason='not_same_origin';else if(entry.category!=='root_conversation_list'||url.pathname!=='/backend-api/conversations')reason='not_root';else if(entry.method!=='GET')reason='invalid_method';else if(entry.template.bodyPresent)reason='invalid_body';else if(cursorKeys.length>0)reason='invalid_cursor_pagination';else if(!numericOffset)reason='invalid_pagination';else if(requestOptions.customHeaderCount>0)reason='unsafe_custom_headers';
+   latestRootRequestTemplate={valid:reason===null,reason:reason||'valid',metadata:{method:entry.method,transport:entry.transport,pathname:url.pathname,queryParameterNames:[...new Set(url.searchParams.keys())],paginationParameterNames:paginationKeys,offsetName:'offset',credentialsMode:entry.template.credentialsMode,signalPresent:entry.template.signalPresent,bodyPresent:entry.template.bodyPresent,customHeadersPresent:entry.template.customHeadersPresent,customHeaderCount:entry.template.customHeaderCount},request:reason===null?{queryEntries}:null};
+  }
   rootHookEvents.push({...entry});if(rootHookEvents.length>80)rootHookEvents.shift();
+  emitRootCorrelation(entry.rootRequestSequence,'request_observed',{...entry.template,transport:entry.transport,method:entry.method});
   return entry;
+ };
+ window.gptGetValidatedRecentSafetyTemplate=()=>({valid:latestRootRequestTemplate.valid,reason:latestRootRequestTemplate.reason,metadata:latestRootRequestTemplate.metadata?{...latestRootRequestTemplate.metadata}:null,request:latestRootRequestTemplate.valid?{queryEntries:latestRootRequestTemplate.request.queryEntries.map(x=>x.slice())}:null});
+ window.gptRunRecentSafetyProbe=probeToken=>{
+  if(typeof probeToken!=='string'||probeToken.length<1||probeToken.length>128||!/^[A-Za-z0-9_-]+$/.test(probeToken))return Promise.resolve({outcome:'template_invalid'});
+  if(recentSafetyProbeAttempts.has(probeToken))return recentSafetyProbeAttempts.get(probeToken);
+  const template=latestRootRequestTemplate;
+  if(!template.valid||!template.request||!unwrappedPageFetch){const result=Promise.resolve({outcome:'template_invalid'});recentSafetyProbeAttempts.set(probeToken,result);return result;}
+  const params=new URLSearchParams();let offsetReplaced=false;
+  for(const [key,value] of template.request.queryEntries){if(key==='offset'){if(!offsetReplaced){params.append(key,'0');offsetReplaced=true;}}else params.append(key,value);}
+  if(!offsetReplaced){const result=Promise.resolve({outcome:'template_invalid'});recentSafetyProbeAttempts.set(probeToken,result);return result;}
+  const url=new URL(template.metadata.pathname,location.origin);url.search=params.toString();
+  const init={method:'GET',credentials:['omit','same-origin','include'].includes(template.metadata.credentialsMode)?template.metadata.credentialsMode:'same-origin'};
+  const cycleToken=window.gptListCycleConfig?.token||null;
+  const attempt=(async()=>{
+   let response;try{response=await unwrappedPageFetch(url.href,init);}catch{return {outcome:'request_failed'};}
+   const status=Number.isInteger(response?.status)?response.status:null;
+   if(status===429)return {outcome:'http_429'};
+   if(status===null||status<200||status>=300)return {outcome:'http_non_2xx'};
+   let payload;try{payload=await response.json();}catch{return {outcome:'parse_failed'};}
+   const dispatched=await observe(url.href,payload,{method:'GET',transport:'fetch',status,cycleToken,probeToken});
+   return {outcome:dispatched?'response_dispatched':'parse_failed'};
+  })();
+  recentSafetyProbeAttempts.set(probeToken,attempt);return attempt;
  };
  const finishRootDiscoveryObservation=(entry,status,payload=null)=>{
   if(!entry||rootDiscoveryObservationToken!==window.gptListCycleConfig?.token)return;
@@ -502,11 +546,12 @@
     entry.pageDecision=paginationHint===false?'stop_end_confirmed':paginationHint===true?'request_next_page':pageNewIdentities===0?'waiting_frontend_no_new_identities':'waiting_frontend';
    }
   }
-  const responseEvent={sequence:entry.sequence,source:'hook',event:status==null?'failure':'response',category:entry.category,pathname:entry.pathname,method:entry.method,transport:entry.transport,
+  const responseEvent={sequence:entry.sequence,rootRequestSequence:entry.rootRequestSequence,source:'hook',event:status==null?'failure':'response',category:entry.category,pathname:entry.pathname,method:entry.method,transport:entry.transport,
    relativeMs:entry.responseRelativeMs,status:entry.status,itemCount:entry.itemCount,generation:entry.generation,partition:entry.partition,
    ...(entry.category==='root_conversation_list'?{responseOffset:entry.responseOffset??null,expectedNextOffset:entry.expectedNextOffset??null,responseLimit:entry.responseLimit??null,
     paginationHint:entry.paginationHint??null,paginationHintSource:entry.paginationHintSource??null,newIdentityCount:entry.newIdentityCount??null,identityCountReliable:entry.identityCountReliable??false,partitionShape:entry.partitionShape??'unknown',pageDecision:entry.pageDecision??'waiting_frontend'}:{})};
   rootHookEvents.push(responseEvent);if(rootHookEvents.length>80)rootHookEvents.shift();
+  if(status!==null)emitRootCorrelation(entry.rootRequestSequence,'response_observed',{...entry.template,transport:entry.transport,method:entry.method,status,itemCount:entry.itemCount});
  };
  const observeSameOriginListResponse=(raw,response,entry)=>{
   if(!entry)return;
@@ -551,7 +596,8 @@
   let raw=typeof args[0]==='string'?args[0]:args[0]?.url;
   let method=(args[1]?.method)||(typeof Request!=='undefined'&&args[0] instanceof Request?args[0].method:'GET');
   const backendTrafficContext=window.gptCaptureBackendTrafficContext?.()||null;
-  const rootObservation=beginRootDiscoveryObservation(raw,method,'fetch');
+  const init=args[1]||{},headers=init.headers||{};let headerCount=0;try{headerCount=Array.isArray(headers)?headers.length:typeof headers.forEach==='function'?(headers.forEach(()=>headerCount++),headerCount):Object.keys(headers).length;}catch{}
+  const rootObservation=beginRootDiscoveryObservation(raw,method,'fetch',{bodyPresent:init.body!=null,signalPresent:init.signal!=null,credentialsMode:init.credentials,customHeaderCount:headerCount});
   recordRootTraffic('request',raw,'fetch');
   const info=targetInfo(raw,method);
   if(!info){if(isConversationActivityPath(raw)){const requestRateContext=rateContext();window.gptReportHistoryRequest?.(raw,requestRateContext);return original.apply(this,args).then(response=>{recordRootTraffic('response',raw,'fetch',response.status);if(response.status===429){finishRootDiscoveryObservation(rootObservation,429);window.gptObserveConversationActivity?.(raw,null,429,requestRateContext,backendTrafficContext);}else response.clone().json().then(body=>{finishRootDiscoveryObservation(rootObservation,response.status,body);window.gptObserveConversationActivity?.(raw,body,response.status,requestRateContext,backendTrafficContext);}).catch(()=>{finishRootDiscoveryObservation(rootObservation,response.status);window.gptObserveBackendResponse?.(raw,null,response.status);});return response;},error=>{recordRootTraffic('failure',raw,'fetch');finishRootDiscoveryObservation(rootObservation,null);throw error;});}if(!starredNetworkWindow&&!backendTrafficContext){if(!isChatGPTBackendPath(raw)){if(!rootObservation)return original.apply(this,args);return original.apply(this,args).then(response=>{observeSameOriginListResponse(raw,response,rootObservation);return response;},error=>{finishRootDiscoveryObservation(rootObservation,null);throw error;});}return original.apply(this,args).then(response=>{recordRootTraffic('response',raw,'fetch',response.status);observePassiveBackendResponse(raw,response,rootObservation);return response;},error=>{recordRootTraffic('failure',raw,'fetch');finishRootDiscoveryObservation(rootObservation,null);throw error;});}const diagnostic=genericDiagnosticInfo(raw,method,'fetch');if(!diagnostic){if(!rootObservation)return original.apply(this,args);return original.apply(this,args).then(response=>{observeSameOriginListResponse(raw,response,rootObservation);return response;},error=>{finishRootDiscoveryObservation(rootObservation,null);throw error;});}const requestRateContext=rateContext();
@@ -559,7 +605,7 @@
    return pending.then(response=>{const meta={...diagnostic,status:Number.isFinite(response.status)?response.status:null};recordRootTraffic('response',raw,'fetch',meta.status);if(response.status===429)recordRateLimit(raw,429,requestRateContext);recordStarredNetwork('response',meta);
     observePassiveBackendResponse(raw,response);
     if(likelyListDiagnosticPath(raw))try{response.clone().json().then(payload=>{finishRootDiscoveryObservation(rootObservation,meta.status,payload);recordStarredNetwork('shape',{...meta,safeShape:safeResponseShape(payload),...listParserDiagnostic(raw,payload,method)});}).catch(()=>finishRootDiscoveryObservation(rootObservation,meta.status));}catch{finishRootDiscoveryObservation(rootObservation,meta.status);}else finishRootDiscoveryObservation(rootObservation,meta.status);return response;},error=>{recordRootTraffic('failure',raw,'fetch');finishRootDiscoveryObservation(rootObservation,null);recordStarredNetwork('failure',diagnostic);throw error;});}
-  const requestId=++requestSequence,meta={requestId,...info,transport:'fetch',rateContext:rateContext()};
+  const requestId=++requestSequence,meta={requestId,...info,rootObservation,transport:'fetch',rateContext:rateContext()};
   post('request',meta);
   observePartitionRequest(raw,meta);
   let promise;
@@ -598,14 +644,14 @@
   const wrapped=function(...args){
   const raw=urls.get(this),method=methods.get(this),info=targetInfo(raw,method),diagnostic=info?null:genericDiagnosticInfo(raw,method,'XHR');
   const backendTrafficContext=window.gptCaptureBackendTrafficContext?.()||null;
-  const rootObservation=beginRootDiscoveryObservation(raw,method,'XHR');
+  const rootObservation=beginRootDiscoveryObservation(raw,method,'XHR',{bodyPresent:false,signalPresent:false,credentialsMode:'unknown',customHeaderCount:0});
   recordRootTraffic('request',raw,'XHR');
   if(!info&&isConversationActivityPath(raw)){const requestRateContext=rateContext();window.gptReportHistoryRequest?.(raw,requestRateContext);this.addEventListener('load',()=>{recordRootTraffic('response',raw,'XHR',this.status);if(this.status===429){finishRootDiscoveryObservation(rootObservation,429);window.gptObserveConversationActivity?.(raw,null,429,requestRateContext,backendTrafficContext);return;}try{const payload=this.responseType==='json'?this.response:JSON.parse(this.responseText);finishRootDiscoveryObservation(rootObservation,this.status,payload);window.gptObserveConversationActivity?.(raw,payload,this.status,requestRateContext,backendTrafficContext);}catch{finishRootDiscoveryObservation(rootObservation,this.status);window.gptObserveBackendResponse?.(raw,null,this.status,backendTrafficContext);}},{once:true});for(const event of ['error','timeout','abort'])this.addEventListener(event,()=>{recordRootTraffic('failure',raw,'XHR');finishRootDiscoveryObservation(rootObservation,null);},{once:true});return send.apply(this,args);}
   if(!info&&(!starredNetworkWindow&&!backendTrafficContext||!diagnostic)){if(!info&&isChatGPTBackendPath(raw)){this.addEventListener('load',()=>{recordRootTraffic('response',raw,'XHR',this.status);observePassiveBackendResponse(raw,this,rootObservation);},{once:true});for(const event of ['error','timeout','abort'])this.addEventListener(event,()=>{recordRootTraffic('failure',raw,'XHR');finishRootDiscoveryObservation(rootObservation,null);},{once:true});}else if(rootObservation){this.addEventListener('load',()=>{let response=this;try{if(this.responseType==='json')response={status:this.status,clone:()=>({json:async()=>this.response})};else response={status:this.status,clone:()=>({json:async()=>JSON.parse(this.responseText)})};}catch{response={status:this.status,clone:()=>({json:()=>Promise.reject(Error('invalid_json'))})};}observeSameOriginListResponse(raw,response,rootObservation);},{once:true});for(const event of ['error','timeout','abort'])this.addEventListener(event,()=>finishRootDiscoveryObservation(rootObservation,null),{once:true});}return send.apply(this,args);}
   if(!info){const requestRateContext=rateContext();recordStarredNetwork('request',diagnostic);this.addEventListener('load',()=>{const meta={...diagnostic,status:Number.isFinite(this.status)?this.status:null};recordRootTraffic('response',raw,'XHR',meta.status);if(this.status===429)recordRateLimit(raw,429,requestRateContext);recordStarredNetwork('response',meta);
     try{const payload=this.responseType==='json'?this.response:JSON.parse(this.responseText);window.gptObserveBackendResponse?.(raw,payload,this.status);}catch{window.gptObserveBackendResponse?.(raw,null,this.status);}
     if(likelyListDiagnosticPath(raw))try{const payload=this.responseType==='json'?this.response:JSON.parse(this.responseText);finishRootDiscoveryObservation(rootObservation,meta.status,payload);recordStarredNetwork('shape',{...meta,safeShape:safeResponseShape(payload),...listParserDiagnostic(raw,payload,method)});}catch{finishRootDiscoveryObservation(rootObservation,meta.status);}else finishRootDiscoveryObservation(rootObservation,meta.status);},{once:true});for(const event of ['error','timeout','abort'])this.addEventListener(event,()=>{recordRootTraffic('failure',raw,'XHR');finishRootDiscoveryObservation(rootObservation,null);recordStarredNetwork('failure',diagnostic);},{once:true});return send.apply(this,args);}
-  const requestId=++requestSequence,meta={requestId,...info,transport:'XHR',rateContext:rateContext()};post('request',meta);
+  const requestId=++requestSequence,meta={requestId,...info,rootObservation,transport:'XHR',rateContext:rateContext()};post('request',meta);
   observePartitionRequest(raw,meta);
   this.addEventListener('load',()=>{
    recordRootTraffic('response',raw,'XHR',this.status);
