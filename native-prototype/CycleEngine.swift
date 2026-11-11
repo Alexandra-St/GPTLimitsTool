@@ -187,7 +187,15 @@ extension Prototype {
    recordRootRequestCorrelation(sequence:sequence,stage:isNew ? .consume_new:.consume_repeated)
    saveCycle()
   }
-  guard isNew else{return .accepted_repeated}
+  guard isNew else {
+   let itemCount=(data["itemCount"] as? NSNumber)?.intValue ?? records.count
+   let pageLimit=(data["limit"] as? NSNumber)?.intValue ?? 0
+   let exhausted=(data["paginationHint"] as? Bool)==false
+   if scope != .project,source == .normal_discovery,pageLimit>0,itemCount>=pageLimit,!exhausted {
+    cycleRootRepeatedFullPageNoProgress=true
+   }
+   return .accepted_repeated
+  }
   cycleValidListResponses+=1
   cycleState.merge(records,source:scope == .project ? .projectConversationUpdateTime:.rootConversationUpdateTime)
   let ids=Set(records.compactMap{$0["conversationId"] as? String})
@@ -469,7 +477,7 @@ extension Prototype {
   let pageTime=cycleRootLastPageRelativeMs.map(String.init) ?? "none"
   let pageOffset=cycleRootLastPageOffset.map(String.init) ?? "—"
   let identityOffset=cycleRootLastIdentityProgressOffset.map(String.init) ?? "—"
-  let stall=cycleRootStallDetail=="pagination_stall" ? "45-second cycleListVersion inactivity watchdog elapsed":"none"
+  let stall=cycleRootStallDetail=="pagination_stall" ? "45-second cycleListVersion inactivity watchdog elapsed":cycleRootStallDetail=="pagination_repeated_page_no_progress" ? "repeated full page without identity progress; terminated early":"none"
   return "Root pagination sequence: \(timeline.isEmpty ? "no hook events":timeline.joined(separator:" → "))\nAccepted root pages: \(acceptedPageLines.isEmpty ? "none":acceptedPageLines.joined(separator:" → "))\nRoot pagination stall detail: \(stall) · last successful offset \(lastSuccessfulOffset) · expected next offset \(expected.map(String.init) ?? "—") · next request state \(requestState) · last request +\(int(lastRequest,"relativeMs").map(String.init) ?? "—") ms [\(lastRequest.map(partitionKey) ?? "—")] · last response/failure +\(int(lastResponse,"relativeMs").map(String.init) ?? "—") ms [\(lastResponse.map(partitionKey) ?? "—")] · last non-empty accepted page +\(int(lastNonempty,"relativeMs").map(String.init) ?? "—") ms · last accepted page +\(pageTime) ms offset \(pageOffset) new identities \(cycleRootLastPageNewIdentities) · last new-identity progress +\(identityTime) ms offset \(identityOffset)"
  }
  func updatePartitionReport(_ override:CompositeCoverage? = nil) {
@@ -962,6 +970,7 @@ extension Prototype {
     cycleState.discoveryStatus = .inProgress
     let cycleGeneration=cycleToken
     cycleDiscovering=true;cycleIds=[];cycleListVersion=0;cycleValidListResponses=0;cycleRootResponseReceived=false;originalNormalDiscoveryFailureReason=nil
+    cycleRootRepeatedFullPageNoProgress=false
     recentSafetyProbeAttempted=false;recentSafetyProbePending=false;recentSafetyProbeTerminalResult=nil;recentSafetyProbeToken=nil;recentSafetyProbe=nil
     cycleDiscoverySource="network";cycleDOMCandidateCount=0;cycleDOMAcceptedRowCount=0;cycleDOMRejectedNavigationRowCount=0;cycleDOMDuplicateRowCount=0;cycleDOMFallbackIds=[]
     cycleRootStallDetail=nil;cycleRootLastPageRelativeMs=nil;cycleRootLastPageOffset=nil;cycleRootLastPageNewIdentities=0;cycleRootAcceptedPageEvents=[]
@@ -1011,6 +1020,7 @@ extension Prototype {
      try await pauseCycle(0.25)
      refreshCycleRootNavigationSnapshot()
      if discoveryRateLimited(Array(cycleRootStatuses)) {break}
+     if cycleRootRepeatedFullPageNoProgress {stallDetail="pagination_repeated_page_no_progress";break}
      if version != cycleListVersion {version=cycleListVersion;changedAt=Date()}
      if hasCompletePartitionSet(Array(cyclePartitions.values),base:PartitionDescriptor(archived:false,starred:false),cutoff:cycleCutoffTimestamp) {break}
      if Date().timeIntervalSince(changedAt)>45 {

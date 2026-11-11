@@ -40,6 +40,14 @@ test('recent safety bridge restricts token ownership and exposes sanitized consu
 test('repeated logical pages receive a distinct repeated outcome without changing deduplication behavior',()=>{
  assert.match(engine,/isNew \? \.consume_new:\.consume_repeated/);
  assert.match(engine,/let isNew=cyclePageKeys\.insert\(signature\)\.inserted/);
+ const consume=section(engine,'@discardableResult func consumeDiscoveryPage','func rootDiscoverySnapshotScript');
+ assert.match(consume,/guard isNew else \{[\s\S]*itemCount>=pageLimit,!exhausted[\s\S]*cycleRootRepeatedFullPageNoProgress=true[\s\S]*return \.accepted_repeated/);
+ const cycle=section(engine,'var changedAt=Date\(\),version=0,scrolledVersion = -1','// One bounded retry of the existing home navigation');
+ assert.match(cycle,/if cycleRootRepeatedFullPageNoProgress \{stallDetail="pagination_repeated_page_no_progress";break\}/);
+ assert.match(engine,/else if let stallDetail \{composite\.status = \.incompleteStall;composite\.detail=stallDetail\}/);
+ assert.match(main,/pagination_repeated_page_no_progress.*coverage is incomplete/);
+ assert.match(cycle,/if Date\(\)\.timeIntervalSince\(changedAt\)>45/);
+ assert.match(consume,/cycleRootRepeatedFullPageNoProgress=true[\s\S]*return \.accepted_repeated/);
 });
 test('correlation schema has no sensitive production payload fields and persists no request identifier',()=>{
  const schema=section(model,'struct RootRequestCorrelationEvent:Codable,Equatable','struct RootRequestCorrelationState:Codable,Equatable');

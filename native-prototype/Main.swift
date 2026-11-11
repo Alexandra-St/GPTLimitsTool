@@ -510,6 +510,7 @@ final class Prototype: NSObject, NSApplicationDelegate, WKScriptMessageHandler, 
     var cycleRootNavigationObserved=false
     var cycleRootDelegateEvents=[String]()
     var cycleRootTerminalReason="not_run"
+    var cycleRootRepeatedFullPageNoProgress=false
     var cycleProjectIds=Set<String>()
     var cycleProjectStreams=Set<Int>()
     var cyclePageKeys=Set<String>()
@@ -1822,6 +1823,7 @@ let pinnedDiagnosticVersion="6.1.0"
         case "no_list_response":return "No recent chat list response."
         case "root_http_429":return "ChatGPT rate-limited recent-chat discovery (HTTP 429)."
         case "root_request_without_response":return "The recent-chat request received no response."
+        case "pagination_repeated_page_no_progress":return "Recent-chat pagination repeated a full page without new chats; coverage is incomplete."
         case "render_surface_readiness_failed":return "The ChatGPT page could not be prepared for monitoring."
         default:return "Recent chats could not be fully scanned."
         }
