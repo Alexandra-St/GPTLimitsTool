@@ -818,6 +818,7 @@ extension Prototype {
    chatCheckTelemetry=telemetry
   }
   if automationUpdate?.token==ownerGeneration {chatCheckTerminalUpdate=automationUpdate}
+  if var source=continuationSourcePreview,source.ownerGeneration==ownerGeneration,source.status == .loading {source.status = .failed;continuationSourcePreview=source}
   if let data=try? JSONSerialization.data(withJSONObject:[ownerGeneration]),let token=String(data:data,encoding:.utf8) {
    web.evaluateJavaScript("window.gptClearCheckGeneration?.(\(token)[0])",completionHandler:nil)
   }
@@ -1513,8 +1514,10 @@ extension Prototype {
   let id=parts[index+1]
   return id.range(of:"^[A-Za-z0-9-]{1,128}$",options:.regularExpression) != nil ? id:nil
  }
- func checkRecord(_ record: ChatRecord,continuation:ChatCheckContinuationCheckpoint?=nil,budget:ChatCheckBudgetController) async throws -> (SafeAggregate?,String) {
-  let token=UUID().uuidString;automationToken=token;automationUpdate=nil;chatCheckTerminalUpdate=nil;navigationFinished=false
+ func checkRecord(_ record: ChatRecord,continuation:ChatCheckContinuationCheckpoint?=nil,budget:ChatCheckBudgetController,captureContinuationSource:Bool=false,captureGeneration:String?=nil) async throws -> (SafeAggregate?,String) {
+  let token=captureGeneration ?? UUID().uuidString;automationToken=token;automationUpdate=nil;chatCheckTerminalUpdate=nil;navigationFinished=false
+  let sourceGeneration=token
+  let shouldCaptureContinuationSource=captureContinuationSource && bindContinuationSourceCheckOwner(conversationID:record.conversationId,generation:sourceGeneration,ownerGeneration:token)
   chatCheckTraceGeneration=token
   cycleState.beginPerChatHistoryDiagnostic(ordinal:cycleCurrentChatCheckOrdinal)
   cycleState.beginHistoryResponseParsing()
@@ -1614,7 +1617,8 @@ extension Prototype {
       chatCheckTelemetry=t
      }
     }
-    var config:[String:Any]=["id":record.conversationId,"token":token]
+    var config:[String:Any]=["id":record.conversationId,"token":token,"captureContinuationSource":shouldCaptureContinuationSource]
+    if shouldCaptureContinuationSource {config["captureGeneration"]=sourceGeneration}
     if let continuation {
      config["continuation"]=true;config["expectedFrontier"]=continuation.frontierTimestamp
      config["replayProgressObserved"]=continuation.replayProgressObserved;config["newHistoryProgressObserved"]=continuation.newHistoryProgressObserved

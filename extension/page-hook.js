@@ -7,6 +7,13 @@
   let responsePipelineSequence = 0;
   let historyRequestOrdinal = 0;
   let latestSanitizedCapture = null;
+  let continuationSourceMessages = [];
+  let continuationSourceGeneration = null;
+  let continuationSourceTruncated = false;
+  window.gptClearContinuationSource = generation => {
+    if (generation == null || continuationSourceGeneration === generation) { continuationSourceMessages = []; continuationSourceGeneration = null; continuationSourceTruncated = false; return true; }
+    return false;
+  };
   const historyRequestRecords = new Map();
   const firstPassRequestCursors = [];
   let firstPassRequestCount = 0;
@@ -610,6 +617,40 @@
     }
     return total;
   }
+  function buildContinuationSource(config, conversationID, generation) {
+    if (!config || config.captureContinuationSource !== true || config.conversationID !== conversationID ||
+        config.generation !== generation || typeof generation !== "string") return null;
+    if (continuationSourceGeneration !== generation) { continuationSourceGeneration = generation; continuationSourceMessages = []; continuationSourceTruncated = false; }
+    const unique = new Map();
+    for (const message of continuationSourceMessages) if (!unique.has(message.id)) unique.set(message.id, message);
+    const ordered = [...unique.values()].sort((a, b) => a.createdAt != null && b.createdAt != null ? a.createdAt - b.createdAt : a.order - b.order);
+    const totalTokens = ordered.reduce((sum, item) => sum + estimateTokens(item.text), 0);
+    if (ordered.length <= 160 && totalTokens <= 4000) return { conversationID, generation, messages: ordered.map(({id,role,text,createdAt}) => ({id,role,text,...(createdAt == null ? {} : {createdAt})})), estimatedTextTokens: totalTokens, truncated: continuationSourceTruncated, earlyMessageCount: ordered.length, recentMessageCount: 0 };
+    let earlyBudget = 1000, recentBudget = 3000, slots = 160;
+    const early = [], recent = [], selected = new Set();
+    const fit = (item, budget) => {
+      if (budget <= 0 || slots <= 0) return null;
+      if (estimateTokens(item.text) <= budget) return {...item};
+      let lo = 0, hi = item.text.length;
+      while (lo < hi) { const mid = Math.ceil((lo + hi) / 2); if (estimateTokens(item.text.slice(0, mid)) <= budget) lo = mid; else hi = mid - 1; }
+      if (!lo) return null;
+      return {...item, text: item.text.slice(0, lo)};
+    };
+    for (const item of ordered) {
+      const picked = fit(item, earlyBudget); if (!picked) break;
+      const cost = estimateTokens(picked.text); early.push(picked); selected.add(item.id); earlyBudget -= cost; slots--;
+      if (earlyBudget <= 0) break;
+    }
+    for (let i = ordered.length - 1; i >= 0 && slots > 0 && recentBudget > 0; i--) {
+      const item = ordered[i]; if (selected.has(item.id)) continue;
+      const picked = fit(item, recentBudget); if (!picked) break;
+      const cost = estimateTokens(picked.text); recent.unshift(picked); selected.add(item.id); recentBudget -= cost; slots--;
+      if (recentBudget <= 0) break;
+    }
+    const kept = [...early, ...recent].sort((a,b) => ordered.indexOf(a) - ordered.indexOf(b));
+    const estimatedTextTokens = kept.reduce((sum,item) => sum + estimateTokens(item.text), 0);
+    return { conversationID, generation, messages: kept.map(({id,role,text,createdAt}) => ({id,role,text,...(createdAt == null ? {} : {createdAt})})), estimatedTextTokens: Math.min(4000,estimatedTextTokens), truncated: continuationSourceTruncated || selected.size < ordered.length || kept.some(item => item.text !== ordered.find(source => source.id === item.id)?.text), earlyMessageCount: early.length, recentMessageCount: recent.length };
+  }
 
   function countAttachments(message) {
     const counts = { images: 0, audio: 0, video: 0, files: 0 };
@@ -959,10 +1000,37 @@
     }
 
     const items = [];
+    const continuationConfig = window.gptContinuationSourceConfig;
+    const captureGeneration = metadata?.liveResumeGeneration;
+    const canCaptureSource = continuationConfig?.captureContinuationSource === true &&
+      continuationConfig.conversationID === conversationId && bodyConversationId === continuationConfig.conversationID &&
+      continuationConfig.generation === captureGeneration &&
+      captureGeneration === window.gptLiveResumeCaptureGeneration;
+    if (canCaptureSource && continuationSourceGeneration !== captureGeneration) {
+      continuationSourceGeneration=captureGeneration;continuationSourceMessages=[];continuationSourceTruncated=false;
+    }
     for (const message of payload.messages) {
       if (!message || typeof message !== "object" || message.id == null) continue;
       const id = String(message.id);
       if (id.length === 0 || id.length > 256) continue;
+      if (canCaptureSource) {
+        const role = String(message.author?.role || "").toLowerCase();
+        const metadata = message.metadata && typeof message.metadata === "object" ? message.metadata : {};
+        const channel = String(metadata.channel || "").toLowerCase();
+        const messageType = String(metadata.message_type || "").toLowerCase();
+        const recipient = String(message.recipient || metadata.recipient || "all").toLowerCase();
+        const internal = role === "assistant" && (internalChannels.has(channel) || internalChannels.has(messageType) || (recipient && recipient !== "all"));
+        if ((role === "user" || role === "assistant") && !internal) {
+          const textParts = []; extractText(message.content, textParts);
+          let text = textParts.join("\n").trim();
+          if (text) {
+            if (text.length > 30000) {text=text.slice(0,30000);continuationSourceTruncated=true;}
+            const created = Number(message.create_time);
+            continuationSourceMessages.push({id,role,text,createdAt:Number.isFinite(created) && created > 0 ? created : null,order:continuationSourceMessages.length});
+            if (continuationSourceMessages.length > 500) {continuationSourceMessages=continuationSourceMessages.slice(0,160).concat(continuationSourceMessages.slice(-340));continuationSourceTruncated=true;}
+          }
+        }
+      }
       items.push(classifyMessage(message));
     }
 
@@ -1020,6 +1088,14 @@
       captureSequence: sequence,
       responsePipeline: pipeline,
     }, window.location.origin);
+    if (canCaptureSource) {
+      const source = buildContinuationSource(continuationConfig, conversationId, captureGeneration);
+      if (source) {
+        continuationSourceTruncated=source.truncated;
+        continuationSourceMessages=source.messages.map((item,order)=>({...item,order}));
+        window.postMessage({source:"gpt-limits-tool-continuation-source-v1",continuationSource:source},window.location.origin);
+      }
+    }
   }
 
   const originalFetch = window.fetch;

@@ -239,6 +239,95 @@ func inspectLastCycleTerminalSnapshot(applicationSupportDirectory:URL?=nil)->Str
     ].joined(separator:"\n")
 }
 
+struct ContinuationSourceMessage:Equatable {let id:String;let role:String;let text:String;let createdAt:Double?}
+func continuationTextTokenEstimate(_ text:String)->Int {
+    guard let regex=try? NSRegularExpression(pattern:"[\\p{L}\\p{N}_]+|[^\\s\\p{L}\\p{N}_]") else{return Int.max}
+    let ns=text as NSString
+    return regex.matches(in:text,range:NSRange(location:0,length:ns.length)).reduce(0){total,match in
+        let piece=ns.substring(with:match.range)
+        return total+(piece.unicodeScalars.allSatisfy{$0.properties.isAlphabetic || CharacterSet.decimalDigits.contains($0) || $0=="_"} ? max(1,(piece.unicodeScalars.count+3)/4):1)
+    }
+}
+func continuationRiskDisplayLabel(record:ChatRecord,model:RiskModel,nowMs:Double)->String? {
+    switch monitoringState(record:record,model:model,nowMs:nowMs) {
+    case .near:return "Near"
+    case .critical:return "Critical"
+    case .limitFloor:return "Limit floor"
+    default:break
+    }
+    switch confirmedRiskFromLowerBound(record.aggregate?.estimatedTextTokens,model:model) {
+    case .near:return "At least Near"
+    case .critical:return "At least Critical"
+    case .limitFloor:return "At least Limit floor"
+    case .normal,.uncertain,.watch:return nil
+    }
+}
+func buildContinuationHandoff(sourceTitle:String,riskDisplayLabel:String,measurementComplete:Bool,truncated:Bool,messages:[ContinuationSourceMessage])->String {
+    let selected=Array(messages.prefix(160)).filter{["user","assistant"].contains($0.role) && !$0.text.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty}
+    guard !selected.isEmpty else{return ""}
+    let chronological:[ContinuationSourceMessage]
+    if selected.allSatisfy({$0.createdAt?.isFinite == true}) {
+        chronological=selected.enumerated().sorted{left,right in
+            let a=left.element.createdAt!,b=right.element.createdAt!
+            return a == b ? left.offset<right.offset:a<b
+        }.map(\.element)
+    } else {chronological=selected}
+    var bounded=[ContinuationSourceMessage](),totalUnits=0
+    for message in chronological {
+        let available=min(30000,max(0,32000-totalUnits));guard available>0 else{break}
+        let value=message.text as NSString
+        var end=min(value.length,available)
+        if end>0,end<value.length,(0xD800...0xDBFF).contains(value.character(at:end-1)){end-=1}
+        let text=value.substring(to:end)
+        guard !text.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty else{continue}
+        totalUnits+=(text as NSString).length
+        bounded.append(ContinuationSourceMessage(id:"",role:message.role,text:text,createdAt:message.createdAt))
+    }
+    guard !bounded.isEmpty else{return ""}
+    let title=sourceTitle.components(separatedBy:.newlines).joined(separator:" ").trimmingCharacters(in:.whitespacesAndNewlines)
+    let risk=riskDisplayLabel.components(separatedBy:.newlines).joined(separator:" ").trimmingCharacters(in:.whitespacesAndNewlines)
+    let coverage:String
+    if measurementComplete {coverage=truncated ? "Bounded excerpt; the captured context was truncated to fit the limits.":"Bounded excerpt; only the captured context is included."}
+    else {coverage=truncated ? "Partial measurement and truncated bounded excerpt; context may be incomplete.":"Partial measurement; bounded excerpt may be incomplete."}
+    let excerpts=bounded.map{"\($0.role == "user" ? "User":"Assistant"):\n\($0.text)"}.joined(separator:"\n\n")
+    return [
+        "# Conversation continuation",
+        "",
+        "Source: \(title.isEmpty ? "Untitled conversation":title)",
+        "Risk: \(risk)",
+        "Context coverage: \(coverage)",
+        "",
+        "This handoff was prepared from a bounded excerpt and may omit important context.",
+        "",
+        "## Context excerpts",
+        "",
+        excerpts,
+        "",
+        "## Continuation instruction",
+        "",
+        "Continue from the context above. Preserve established constraints and decisions that are explicitly present in the excerpts. If an important detail is missing or ambiguous, ask instead of inventing it."
+    ].joined(separator:"\n")
+}
+struct ContinuationSourcePreview {
+    enum Status {case loading,ready,failed}
+    let conversationID:String
+    let title:String
+    let riskDisplayLabel:String
+    let measurementComplete:Bool
+    var generation:String?
+    var ownerGeneration:String?
+    var status:Status
+    var messages=[ContinuationSourceMessage]()
+    var estimatedTextTokens=0
+    var truncated=false
+    var earlyMessageCount=0
+    var recentMessageCount=0
+    var handoffText=""
+    var copyFeedback:String?
+    var statusText:String {switch status {case .loading:return "Preparing source context…";case .ready:return "Source captured";case .failed:return "Couldn’t prepare source context."}}
+    var metadataText:String? {status == .ready ? "\(messages.count) messages · ~\(estimatedTextTokens) tokens":nil}
+}
+
 final class Prototype: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKNavigationDelegate, WKUIDelegate, UNUserNotificationCenterDelegate, NSWindowDelegate {
     struct AutomationUpdate: Decodable {
         var token: String;var state: SafeAggregate;var overlap: Bool;var oldest: Bool;var received: Int
@@ -658,6 +747,19 @@ final class Prototype: NSObject, NSApplicationDelegate, WKScriptMessageHandler, 
     var navigationFinished=false
     var chatCheckNavigation:WKNavigation?
     var chatCheckExpectedConversationID:String?
+    var continuationSourcePreview:ContinuationSourcePreview?
+    var continuationPreviewWindow:NSWindow?
+    var continuationPreviewTitleLabel:NSTextField?
+    var continuationPreviewRiskLabel:NSTextField?
+    var continuationPreviewStatusLabel:NSTextField?
+    var continuationPreviewMetadataLabel:NSTextField?
+    var continuationPreviewNeutralLabel:NSTextField?
+    var continuationPreviewFeedbackLabel:NSTextField?
+    var continuationHandoffTextView:NSTextView?
+    var continuationCopyButton:NSButton?
+    var continuationOpenButton:NSButton?
+    var continuationPrepareTagToConversationID=[Int:String]()
+    var nextContinuationPrepareTag=5100
     var chatCheckTelemetry:ChatCheckStageTelemetry?
     var chatCheckBudgetController:ChatCheckBudgetController?
     var chatCheckLastCheckpointAt:Date?
@@ -1281,7 +1383,9 @@ let pinnedDiagnosticVersion="6.1.0"
         recordMainWindowLifecycleSnapshot("B main resigned key")
     }
     func windowWillClose(_ notification:Notification) {
-        guard let window=notification.object as? NSWindow,window===panel else{return}
+        guard let window=notification.object as? NSWindow else{return}
+        if window===continuationPreviewWindow {closeContinuationSourcePreview();return}
+        guard window===panel else{return}
         recordMainWindowLifecycleSnapshot("C diagnostics will close")
         DispatchQueue.main.async { self.recordMainWindowLifecycleSnapshot("C after diagnostics close") }
     }
@@ -1415,6 +1519,125 @@ let pinnedDiagnosticVersion="6.1.0"
         let settingsContainer=NSView();settingsContainer.addSubview(settingsContent);settingsWindow.contentView=settingsContainer
         NSLayoutConstraint.activate([settingsContent.leadingAnchor.constraint(equalTo:settingsContainer.leadingAnchor,constant:24),settingsContent.trailingAnchor.constraint(equalTo:settingsContainer.trailingAnchor,constant:-24),settingsContent.topAnchor.constraint(equalTo:settingsContainer.topAnchor,constant:24)])
     }
+    func beginContinuationSourcePreview(conversationID:String,title:String,riskDisplayLabel:String,measurementComplete:Bool,generation:String) {
+        continuationSourcePreview=ContinuationSourcePreview(conversationID:conversationID,title:title,riskDisplayLabel:riskDisplayLabel,measurementComplete:measurementComplete,generation:generation,ownerGeneration:nil,status:.loading)
+    }
+    func bindContinuationSourceCheckOwner(conversationID:String,generation:String,ownerGeneration:String)->Bool {
+        guard var preview=continuationSourcePreview,preview.status == .loading,preview.conversationID==conversationID,preview.generation==generation else{return false}
+        preview.generation=generation;preview.ownerGeneration=ownerGeneration;continuationSourcePreview=preview;return true
+    }
+    @objc func prepareContinuation(_ sender:NSButton) {
+        guard let id=continuationPrepareTagToConversationID[sender.tag],let record=cycleState.records[id],!cycleRunning,
+              backgroundRenderLease==nil,manualDiagnosticOwnerLabel()==nil,
+              let risk=continuationRiskDisplayLabel(record:record,model:currentRiskModel(),nowMs:Date().timeIntervalSince1970*1000) else{return}
+        let generation=UUID().uuidString
+        beginContinuationSourcePreview(conversationID:id,title:record.title,riskDisplayLabel:risk,
+            measurementComplete:riskMeasurementStatus(result:record.lastCheckResult,aggregate:record.aggregate) == .complete,generation:generation)
+        presentContinuationPreview()
+        guard cycleGate.begin() else{if var preview=continuationSourcePreview{preview.status = .failed;continuationSourcePreview=preview;renderContinuationPreview()};return}
+        cyclePhase="Preparing source context";renderCycle()
+        cycleTask=Task { @MainActor [weak self] in
+            guard let self else{return}
+            defer {self.cyclePhase="";self.cycleGate.end();self.cycleTask=nil;self.flushPendingForegroundPresentationIfIdle();self.renderCycle()}
+            let budget=ChatCheckBudgetController(checkStartedAt:Date(),cycleDeadline:Date().addingTimeInterval(180))
+            self.cycleCurrentChatCheckOrdinal=1
+            let result:Result<(SafeAggregate?,String),Error>
+            do {result=try await isolateCheck(budget:budget) {try await self.checkRecord(record,budget:budget,captureContinuationSource:true,captureGeneration:generation)}}
+            catch {result = .failure(error)}
+            if case .failure=result,var preview=self.continuationSourcePreview,preview.generation==generation,preview.status == .loading {
+                preview.status = .failed;self.continuationSourcePreview=preview;self.renderContinuationPreview()
+            }
+        }
+    }
+    func closeContinuationSourcePreview() {
+        continuationSourcePreview=nil
+        continuationPreviewWindow?.orderOut(nil);continuationPreviewWindow=nil
+        continuationPreviewTitleLabel=nil;continuationPreviewRiskLabel=nil;continuationPreviewStatusLabel=nil
+        continuationPreviewMetadataLabel=nil;continuationPreviewNeutralLabel=nil;continuationPreviewFeedbackLabel=nil
+        continuationHandoffTextView=nil;continuationCopyButton=nil;continuationOpenButton=nil
+    }
+    func presentContinuationPreview() {
+        guard let preview=continuationSourcePreview else{return}
+        if continuationPreviewWindow==nil {
+            let window=NSWindow(contentRect:NSRect(x:0,y:0,width:680,height:620),styleMask:[.titled,.closable,.resizable],backing:.buffered,defer:false)
+            window.title="Prepare continuation";window.isReleasedWhenClosed=false;window.delegate=self
+            let titleLabel=uiLabel("Source: \(preview.title)",size:16,bold:true)
+            let riskLabel=uiLabel("Risk: \(preview.riskDisplayLabel)")
+            let statusLabel=uiLabel(preview.statusText)
+            let metadataLabel=uiLabel("")
+            let neutralLabel=uiLabel("Continuation handoff will be prepared from this conversation.")
+            let feedbackLabel=uiLabel("")
+            let textView=NSTextView();textView.isEditable=false;textView.isSelectable=true;textView.isRichText=false;textView.font = .systemFont(ofSize:13);textView.string=""
+            let scroll=NSScrollView();scroll.hasVerticalScroller=true;scroll.autohidesScrollers=true;scroll.documentView=textView;scroll.heightAnchor.constraint(equalToConstant:330).isActive=true
+            let copy=button("Copy handoff",#selector(copyContinuationHandoff));let open=button("Open new chat",#selector(openContinuationNewChat))
+            let close=button("Close",#selector(closeContinuationPreviewWindow))
+            let actions=NSStackView(views:[copy,open,close]);actions.orientation = .horizontal;actions.alignment = .centerY;actions.spacing=10
+            let stack=NSStackView(views:[titleLabel,riskLabel,statusLabel,metadataLabel,neutralLabel,scroll,feedbackLabel,actions]);stack.orientation = .vertical;stack.alignment = .leading;stack.spacing=10;stack.translatesAutoresizingMaskIntoConstraints=false
+            let container=NSView();container.addSubview(stack);window.contentView=container
+            NSLayoutConstraint.activate([stack.leadingAnchor.constraint(equalTo:container.leadingAnchor,constant:22),stack.trailingAnchor.constraint(equalTo:container.trailingAnchor,constant:-22),stack.topAnchor.constraint(equalTo:container.topAnchor,constant:20),stack.bottomAnchor.constraint(equalTo:container.bottomAnchor,constant:-20),scroll.widthAnchor.constraint(equalTo:stack.widthAnchor)])
+            continuationPreviewWindow=window;continuationPreviewTitleLabel=titleLabel;continuationPreviewRiskLabel=riskLabel
+            continuationPreviewStatusLabel=statusLabel;continuationPreviewMetadataLabel=metadataLabel;continuationPreviewNeutralLabel=neutralLabel
+            continuationPreviewFeedbackLabel=feedbackLabel;continuationHandoffTextView=textView;continuationCopyButton=copy;continuationOpenButton=open
+        }
+        renderContinuationPreview()
+        if let window=continuationPreviewWindow {_=presentWindow(window,intent:.userInitiated,callSite:"prepare_continuation_preview")}
+    }
+    func renderContinuationPreview() {
+        guard let preview=continuationSourcePreview else{return}
+        continuationPreviewTitleLabel?.stringValue="Source: \(preview.title)"
+        continuationPreviewRiskLabel?.stringValue="Risk: \(preview.riskDisplayLabel)"
+        continuationPreviewStatusLabel?.stringValue=preview.statusText
+        continuationPreviewMetadataLabel?.stringValue=preview.metadataText ?? ""
+        continuationPreviewMetadataLabel?.isHidden=preview.metadataText==nil
+        continuationPreviewNeutralLabel?.isHidden=preview.status != .loading
+        continuationHandoffTextView?.string=preview.handoffText
+        let ready=preview.status == .ready && !preview.handoffText.isEmpty
+        continuationCopyButton?.isHidden = !ready;continuationOpenButton?.isHidden = !ready
+        continuationPreviewFeedbackLabel?.stringValue=preview.copyFeedback ?? ""
+    }
+    @objc func closeContinuationPreviewWindow() {continuationPreviewWindow?.close()}
+    @objc func copyContinuationHandoff() {
+        guard var preview=continuationSourcePreview,preview.status == .ready,!preview.handoffText.isEmpty else{return}
+        let exact=preview.handoffText
+        NSPasteboard.general.clearContents()
+        guard NSPasteboard.general.setString(exact,forType:.string) else{return}
+        preview.copyFeedback="Copied";continuationSourcePreview=preview;renderContinuationPreview()
+    }
+    @objc func openContinuationNewChat() {
+        guard let preview=continuationSourcePreview,preview.status == .ready,!preview.handoffText.isEmpty,
+              let url=URL(string:"https://chatgpt.com/") else{return}
+        NSWorkspace.shared.open(url)
+    }
+    func receiveContinuationSourceEvent(_ data:[String:Any]) {
+        guard data["event"] as? String=="continuation_source",var preview=continuationSourcePreview,
+              preview.status == .loading,let id=data["conversationID"] as? String,id==preview.conversationID,
+              let generation=data["generation"] as? String,generation==preview.generation,
+              let owner=data["ownerGeneration"] as? String,owner==preview.ownerGeneration,
+              automationToken==owner,chatCheckExpectedConversationID==id else{return}
+        let incoming=data["messages"] as? [[String:Any]] ?? []
+        var result=[ContinuationSourceMessage](),seen=Set<String>(),totalUnits=0,totalTokens=0
+        for item in incoming.prefix(160) {
+            guard let messageID=item["id"] as? String,!messageID.isEmpty,seen.insert(messageID).inserted,
+                  let role=item["role"] as? String,["user","assistant"].contains(role),let raw=item["text"] as? String else{continue}
+            let available=min(30000,max(0,32000-totalUnits));guard available>0 else{break}
+            let source=raw as NSString
+            var end=min(source.length,available)
+            if end>0,end<source.length,(0xD800...0xDBFF).contains(source.character(at:end-1)){end-=1}
+            let text=source.substring(to:end)
+            let estimate=continuationTextTokenEstimate(text)
+            if totalTokens+estimate>4000 {break}
+            totalUnits+=(text as NSString).length;totalTokens+=estimate
+            let created=(item["createdAt"] as? NSNumber)?.doubleValue
+            result.append(ContinuationSourceMessage(id:String(messageID.prefix(256)),role:role,text:text,createdAt:created?.isFinite == true ? created:nil))
+        }
+        guard !result.isEmpty else{preview.status = .failed;continuationSourcePreview=preview;renderContinuationPreview();return}
+        preview.messages=result;preview.estimatedTextTokens=min(4000,totalTokens);preview.truncated=(data["truncated"] as? Bool)==true || result.count<incoming.count
+        preview.earlyMessageCount=min(result.count,max(0,(data["earlyMessageCount"] as? Int) ?? 0))
+        preview.recentMessageCount=min(result.count-preview.earlyMessageCount,max(0,(data["recentMessageCount"] as? Int) ?? 0))
+        preview.handoffText=buildContinuationHandoff(sourceTitle:preview.title,riskDisplayLabel:preview.riskDisplayLabel,measurementComplete:preview.measurementComplete,truncated:preview.truncated,messages:result)
+        guard !preview.handoffText.isEmpty else{preview.status = .failed;continuationSourcePreview=preview;renderContinuationPreview();return}
+        preview.status = .ready;preview.copyFeedback=nil;continuationSourcePreview=preview;renderContinuationPreview()
+    }
     func renderUserUI() {
         guard mainWindow != nil else{return}
         let formatter=DateFormatter();formatter.timeStyle = .short
@@ -1432,17 +1655,18 @@ let pinnedDiagnosticVersion="6.1.0"
         let relevant=cycleState.records.values.compactMap { record -> (ChatRecord,RiskMonitoringState,RiskMonitoringState,RiskMonitoringState)? in
             let completeness=monitoringState(record:record,model:model,nowMs:nowMs)
             let lowerBoundRisk=confirmedRiskFromLowerBound(record.aggregate?.estimatedTextTokens,model:model)
-            let riskStates:[RiskMonitoringState]=[.watch,.near,.critical]
+            let riskStates:[RiskMonitoringState]=[.watch,.near,.critical,.limitFloor]
             let riskState=riskStates.contains(completeness) ? completeness:lowerBoundRisk
             let displayState=riskState == .normal ? completeness:riskState
             return completeness == .normal && lowerBoundRisk == .normal ? nil:(record,completeness,lowerBoundRisk,displayState)
         }.sorted { a,b in
-            func rank(_ state:RiskMonitoringState)->Int {switch state {case .critical:return 4;case .near:return 3;case .watch:return 2;case .uncertain:return 1;case .normal:return 0}}
+            func rank(_ state:RiskMonitoringState)->Int {switch state {case .limitFloor:return 5;case .critical:return 4;case .near:return 3;case .watch:return 2;case .uncertain:return 1;case .normal:return 0}}
             if rank(a.3) != rank(b.3) {return rank(a.3)>rank(b.3)}
             return a.0.lastSeenUpdatedAt>b.0.lastSeenUpdatedAt
         }
         mainRiskRows.setViews([],in:.leading);mainUncertaintyRows.setViews([],in:.leading)
         warningAcknowledgeTagToConversationID=[:];nextWarningAcknowledgeTag=4100
+        continuationPrepareTagToConversationID=[:];nextContinuationPrepareTag=5100
         let confirmed=relevant.filter{$0.3 != .uncertain}
         let uncertainWithoutConfirmedRisk=relevant.filter{$0.1 == .uncertain && $0.2 == .normal && needsAttentionActionable(record:$0.0,model:model,nowMs:nowMs)}
         let activeUncertain=uncertainWithoutConfirmedRisk.filter{warningBadgeVisible(record:$0.0,model:model,nowMs:nowMs)}
@@ -1478,7 +1702,7 @@ let pinnedDiagnosticVersion="6.1.0"
                 continue
             }
             let label:String
-            switch state {case .watch:label="Watch";case .near:label="Near";case .critical:label="Critical";case .uncertain,.normal:continue}
+            switch state {case .watch:label="Watch";case .near:label="Near";case .critical:label="Critical";case .limitFloor:label="Limit floor";case .uncertain,.normal:continue}
             let titleRow=uiLabel("⚠ \(label) · \(title)",size:13,bold:true)
             let reason:String
             if completeness == .uncertain {
@@ -1490,6 +1714,12 @@ let pinnedDiagnosticVersion="6.1.0"
             let detailText=completeness == .uncertain ? "\(reason)\nLast checked: \(checked)":"\(reason)\nLast check: \(checked) · \(record.lastCheckResult ?? "Not checked")"
             let details=uiLabel(detailText)
             let row=NSStackView(views:[titleRow,details]);row.orientation = .vertical;row.alignment = .leading;row.spacing=4
+            if continuationRiskDisplayLabel(record:record,model:model,nowMs:nowMs) != nil {
+                let prepare=button("Prepare continuation",#selector(prepareContinuation(_:)))
+                prepare.tag=nextContinuationPrepareTag;prepare.isEnabled = !cycleRunning
+                continuationPrepareTagToConversationID[nextContinuationPrepareTag]=record.conversationId;nextContinuationPrepareTag+=1
+                row.addArrangedSubview(prepare)
+            }
             mainRiskRows.addArrangedSubview(row)
         }
         updateWarningIndicator(records:relevant.map{$0.0},model:model,nowMs:nowMs)
@@ -1601,7 +1831,7 @@ let pinnedDiagnosticVersion="6.1.0"
         for record in records {
             let completeness=monitoringState(record:record,model:model,nowMs:nowMs)
             let lowerBoundRisk=confirmedRiskFromLowerBound(record.aggregate?.estimatedTextTokens,model:model)
-            let confirmedStates:[RiskMonitoringState]=[.watch,.near,.critical]
+            let confirmedStates:[RiskMonitoringState]=[.watch,.near,.critical,.limitFloor]
             let risk=confirmedStates.contains(completeness) ? completeness:lowerBoundRisk
             if risk != .normal {counts[risk,default:0]+=1}
             else if completeness == .uncertain && needsAttentionActionable(record:record,model:model,nowMs:nowMs) && warningBadgeVisible(record:record,model:model,nowMs:nowMs) {counts[.uncertain,default:0]+=1}
@@ -1609,12 +1839,13 @@ let pinnedDiagnosticVersion="6.1.0"
         let degraded=cycleState.monitoringDegraded == true
         var parts=[String]()
         if counts[.critical,default:0]>0 {parts.append("Critical confirmed: \(counts[.critical]!)")}
+        if counts[.limitFloor,default:0]>0 {parts.append("Limit floor confirmed: \(counts[.limitFloor]!)")}
         if counts[.near,default:0]>0 {parts.append("Near confirmed: \(counts[.near]!)")}
         if counts[.watch,default:0]>0 {parts.append("Watch confirmed: \(counts[.watch]!)")}
         let uncertaintyCount=counts[.uncertain,default:0]
         if uncertaintyCount>0 {parts.append("Needs attention: \(uncertaintyCount) chat histories couldn't be fully checked")}
         if degraded {parts.append("Recent chat coverage needs attention")}
-        let confirmedCount=counts[.critical,default:0]+counts[.near,default:0]+counts[.watch,default:0]
+        let confirmedCount=counts[.critical,default:0]+counts[.limitFloor,default:0]+counts[.near,default:0]+counts[.watch,default:0]
         let summary=parts.isEmpty ? "No confirmed risks or checks needing attention":parts.joined(separator:" · ")
         statusItem.button?.title=confirmedCount>0 ? "GL ⚠":"GL"
         statusItem.button?.toolTip="GPT Limits Tool · \(summary)"
@@ -5286,7 +5517,8 @@ let pinnedDiagnosticVersion="6.1.0"
                 handlePinnedBackendTraffic(data,token:token);return
             }
             if message.name=="chatCheck",message.frameInfo.isMainFrame,message.frameInfo.securityOrigin.host=="chatgpt.com",let data=message.body as? [String:Any] {
-                if data["event"] as? String=="history_request" {recordChatCheckHistoryRequest(data)}
+                if data["event"] as? String=="continuation_source" {receiveContinuationSourceEvent(data)}
+                else if data["event"] as? String=="history_request" {recordChatCheckHistoryRequest(data)}
                 else if data["event"] as? String=="stage" {recordChatCheckScriptStage(data)}
                 else if data["event"] as? String=="continuation_stage" {recordChatCheckContinuationStage(data)}
                 else if data["event"] as? String=="continuation_response_pipeline" {recordChatCheckContinuationResponse(data)}

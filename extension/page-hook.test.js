@@ -28,6 +28,51 @@ function response(body, url) {
   return { ok: true, status: 200, url, headers: { get: () => 'application/json' }, clone: () => ({ json: async () => body }) };
 }
 async function drain() { await new Promise(resolve => setImmediate(resolve)); await new Promise(resolve => setImmediate(resolve)); }
+const sourceEvent = f => f.messages.find(item => item.source === 'gpt-limits-tool-continuation-source-v1')?.continuationSource;
+
+test('continuation source capture is disabled by default and requires exact ID and generation', async()=>{
+ const f=fixture(url=>Promise.resolve(response(payload('ordinary'),url)));
+ f.window.gptLiveResumeCaptureGeneration='generation-1';
+ await f.window.fetch('https://chatgpt.com/backend-api/conversations/chat-secret/messages');await drain();
+ assert.equal(sourceEvent(f),undefined);
+ f.window.gptContinuationSourceConfig={captureContinuationSource:true,conversationID:'other-chat',generation:'generation-1'};
+ await f.window.fetch('https://chatgpt.com/backend-api/conversations/chat-secret/messages');await drain();assert.equal(sourceEvent(f),undefined);
+ f.window.gptContinuationSourceConfig={captureContinuationSource:true,conversationID:'chat-secret',generation:'stale'};
+ await f.window.fetch('https://chatgpt.com/backend-api/conversations/chat-secret/messages');await drain();assert.equal(sourceEvent(f),undefined);
+ f.window.gptContinuationSourceConfig={captureContinuationSource:true,conversationID:'chat-secret',generation:'generation-1'};
+ await f.window.fetch('https://chatgpt.com/backend-api/conversations/chat-secret/messages');await drain();
+ assert.equal(sourceEvent(f).conversationID,'chat-secret');assert.equal(sourceEvent(f).generation,'generation-1');
+});
+
+test('continuation source includes normal user and assistant text only, excluding internal and attachment content', async()=>{
+ const f=fixture(url=>Promise.resolve(response({conversation_id:'chat-secret',messages:[
+  {id:'u',author:{role:'user'},content:{content_type:'text',parts:['hello user']}},
+  {id:'a',author:{role:'assistant'},content:{content_type:'text',parts:['hello assistant']}},
+  {id:'s',author:{role:'system'},content:{parts:['system secret']}},
+  {id:'d',author:{role:'developer'},content:{parts:['developer secret']}},
+  {id:'t',author:{role:'tool'},content:{parts:['tool secret']}},
+  {id:'i',author:{role:'assistant'},metadata:{channel:'analysis'},content:{parts:['internal secret']}},
+  {id:'x',author:{role:'user'},content:{parts:[{content_type:'image',text:'attachment secret'}]}}
+ ]},url)));
+ f.window.gptLiveResumeCaptureGeneration='g';f.window.gptContinuationSourceConfig={captureContinuationSource:true,conversationID:'chat-secret',generation:'g'};
+ await f.window.fetch('https://chatgpt.com/backend-api/conversations/chat-secret/messages');await drain();
+ const source=sourceEvent(f);assert.deepEqual(Array.from(source.messages,x=>x.role),['user','assistant']);
+ assert.match(JSON.stringify(source),/hello user/);assert.match(JSON.stringify(source),/hello assistant/);
+ for(const secret of ['system secret','developer secret','tool secret','internal secret','attachment secret'])assert.equal(JSON.stringify(source).includes(secret),false);
+});
+
+test('continuation source deduplicates and selects bounded chronological early and recent excerpts',async()=>{
+ const messages=Array.from({length:165},(_,i)=>({id:`m${i}`,author:{role:i%2?'assistant':'user'},content:{content_type:'text',parts:[`message ${i} `+'x'.repeat(180)]},create_time:i+1}));
+ messages.push({...messages[10]});
+ const f=fixture(url=>Promise.resolve(response({conversation_id:'chat-secret',messages},url)));
+ f.window.gptLiveResumeCaptureGeneration='g';f.window.gptContinuationSourceConfig={captureContinuationSource:true,conversationID:'chat-secret',generation:'g'};
+ await f.window.fetch('https://chatgpt.com/backend-api/conversations/chat-secret/messages');await drain();
+ const source=sourceEvent(f);assert.ok(source);assert.equal(source.truncated,true);assert.ok(source.messages.length<=160);assert.ok(source.estimatedTextTokens<=4000);
+ assert.equal(new Set(source.messages.map(x=>x.id)).size,source.messages.length);
+ assert.ok(source.earlyMessageCount>0&&source.recentMessageCount>0);
+ assert.deepEqual(source.messages.map(x=>x.id),source.messages.map(x=>x.id).slice().sort((a,b)=>Number(a.slice(1))-Number(b.slice(1))));
+ assert.equal(source.messages[0].id,'m0');assert.equal(source.messages.at(-1).id,'m164');
+});
 
 test('first-pass cursor chain is bounded and continuation comparisons use sanitized fingerprints', async () => {
   const f = fixture(url => Promise.resolve(response(payload('message-secret'), url)));

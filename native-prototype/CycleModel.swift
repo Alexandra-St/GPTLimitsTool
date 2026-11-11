@@ -400,12 +400,12 @@ func buildRiskModel(samples:[RiskCalibrationSample]) -> RiskModel {
 }
 func assessRisk(model:RiskModel,estimatedTextTokens:Int?,measurement:RiskMeasurementStatus)->RiskAssessment {
  guard let tokens=estimatedTextTokens,tokens>=0,measurement != .unknown else{return RiskAssessment(level:"Unknown",rank:nil,measurement:measurement)}
- let rank=tokens>=model.critical ? 3 : tokens>=model.near ? 2 : tokens>=model.watch ? 1 : 0
+ let rank=tokens>=model.limitFloor ? 4 : tokens>=model.critical ? 3 : tokens>=model.near ? 2 : tokens>=model.watch ? 1 : 0
  if measurement == .partial {
   guard rank>0 else{return RiskAssessment(level:"Unknown",rank:nil,measurement:.partial)}
-  return RiskAssessment(level:["","At least Watch","At least Near","At least Critical"][rank],rank:rank,measurement:.partial)
+  return RiskAssessment(level:["","At least Watch","At least Near","At least Critical","At least Limit floor"][rank],rank:rank,measurement:.partial)
  }
- return RiskAssessment(level:["Normal","Watch","Near","Critical"][rank],rank:rank,measurement:.complete)
+ return RiskAssessment(level:["Normal","Watch","Near","Critical","Limit floor"][rank],rank:rank,measurement:.complete)
 }
 func riskMeasurementStatus(result:String?,aggregate:SafeAggregate?)->RiskMeasurementStatus {
  guard let aggregate,result != nil else{return .unknown}
@@ -414,21 +414,21 @@ func riskMeasurementStatus(result:String?,aggregate:SafeAggregate?)->RiskMeasure
  return .unknown
 }
 func riskUpwardCrossing(previousRank:Int?,next:RiskAssessment)->String? {
- guard next.measurement == .complete,let rank=next.rank,(1...3).contains(rank),rank>(previousRank ?? 0) else{return nil}
- return ["Normal","Watch","Near","Critical"][rank]
+ guard next.measurement == .complete,let rank=next.rank,(1...4).contains(rank),rank>(previousRank ?? 0) else{return nil}
+ return ["Normal","Watch","Near","Critical","Limit floor"][rank]
 }
 func riskNotificationNeeded(previousObservedRank:Int?,lastAcceptedRank:Int?,next:RiskAssessment)->String? {
- guard next.measurement == .complete,let rank=next.rank,(1...3).contains(rank) else{return nil}
- if lastAcceptedRank == nil || rank>lastAcceptedRank! {return ["Normal","Watch","Near","Critical"][rank]}
- if let previousObservedRank,rank>previousObservedRank {return ["Normal","Watch","Near","Critical"][rank]}
+ guard next.measurement == .complete,let rank=next.rank,(1...4).contains(rank) else{return nil}
+ if lastAcceptedRank == nil || rank>lastAcceptedRank! {return ["Normal","Watch","Near","Critical","Limit floor"][rank]}
+ if let previousObservedRank,rank>previousObservedRank {return ["Normal","Watch","Near","Critical","Limit floor"][rank]}
  return nil
 }
 func partialRiskNotificationNeeded(lastAcceptedRank:Int?,lowerBoundTokens:Int?,model:RiskModel)->String? {
  let confirmed=confirmedRiskFromLowerBound(lowerBoundTokens,model:model)
  let rank:Int
- switch confirmed {case .near:rank=2;case .critical:rank=3;case .normal,.uncertain,.watch:return nil}
+ switch confirmed {case .near:rank=2;case .critical:rank=3;case .limitFloor:rank=4;case .normal,.uncertain,.watch:return nil}
  guard lastAcceptedRank == nil || rank>lastAcceptedRank! else{return nil}
- return rank==2 ? "Near":"Critical"
+ return ["","","Near","Critical","Limit floor"][rank]
 }
 func incompleteRiskNotificationNeeded(measurement:RiskMeasurementStatus,lastAcceptedRank:Int?,lowerBoundTokens:Int?,model:RiskModel)->String? {
  guard measurement != .complete else{return nil}
@@ -439,7 +439,7 @@ func retryRiskNotificationLevel(lastOutcome:String?,previousObservedRank:Int?,la
  return riskNotificationNeeded(previousObservedRank:previousObservedRank,lastAcceptedRank:lastAcceptedRank,next:next)
 }
 func shouldDispatchSystemRiskNotification(kind:String,level:String)->Bool {
- kind=="risk" && ["Watch","Near","Critical"].contains(level)
+ kind=="risk" && ["Watch","Near","Critical","Limit floor"].contains(level)
 }
 func shouldRetryRootDiscovery(stallDetail:String?,rateLimited:Bool,retriesUsed:Int)->Bool {
  stallDetail=="no_list_response" && !rateLimited && retriesUsed==0
@@ -451,9 +451,10 @@ func isMonitoringDiscoveryFailure(_ detail:String?)->Bool {
  guard let detail=detail?.lowercased() else{return false}
  return detail=="no_list_response" || detail=="dom_fallback_visible_sidebar_rows_only" || detail=="root_http_429" || detail.hasPrefix("root_request_without_response") || detail.hasPrefix("root_response_unclassified") || detail.hasPrefix("root_trigger_") || detail=="render_surface_readiness_failed" || detail=="hard_safety_timeout_600s"
 }
-enum RiskMonitoringState:String {case normal="Normal",uncertain="Uncertain",watch="Watch",near="Near",critical="Critical"}
+enum RiskMonitoringState:String {case normal="Normal",uncertain="Uncertain",watch="Watch",near="Near",critical="Critical",limitFloor="Limit floor"}
 func confirmedRiskFromLowerBound(_ lowerBoundTokens:Int?,model:RiskModel)->RiskMonitoringState {
  guard let tokens=lowerBoundTokens,tokens>=0 else{return .normal}
+ if tokens>=model.limitFloor {return .limitFloor}
  if tokens>=model.critical {return .critical}
  if tokens>=model.near {return .near}
  if tokens>=model.watch {return .watch}
@@ -501,6 +502,7 @@ func monitoringState(record:ChatRecord,model:RiskModel,nowMs:Double)->RiskMonito
   case 1:return .watch
   case 2:return .near
   case 3:return .critical
+  case 4:return .limitFloor
   default:return .normal
   }
  }
@@ -522,6 +524,7 @@ func monitoringWarningReason(record:ChatRecord,model:RiskModel,nowMs:Double)->St
  case .watch:return "Complete history confirms Watch risk."
  case .near:return "Complete history confirms Near risk."
  case .critical:return "Complete history confirms Critical risk."
+ case .limitFloor:return "Complete history confirms Limit floor risk."
  case .uncertain:
   let result=record.lastCheckResult ?? ""
   if result.contains("pagination_progressing") {return "History is incomplete; pagination was still progressing when the check timed out."}
@@ -619,6 +622,7 @@ func partialRiskNotificationContent(level:String)->(title:String,body:String)? {
  switch level {
  case "Near":body="This chat is at least Near limit. Full history couldn't be verified, so the actual size may be higher."
  case "Critical":body="This chat is at least Critical. Full history couldn't be verified, so the actual size may be higher."
+ case "Limit floor":body="This chat is at least Limit floor. Full history couldn't be verified, so the actual size may be higher."
  default:return nil
  }
  return ("GPT Limits Tool",body)
@@ -631,10 +635,10 @@ func validatedRiskNotificationRoute(_ route:String)->String? {
  guard route.range(of:"^/(?:c/[A-Za-z0-9-]{1,128}|g/[A-Za-z0-9-]{1,128}/c/[A-Za-z0-9-]{1,128})/?$",options:.regularExpression) != nil else{return nil}
  return route
 }
-func riskRank(_ level:String)->Int? { ["Normal":0,"Watch":1,"Near":2,"Critical":3][level] }
+func riskRank(_ level:String)->Int? { ["Normal":0,"Watch":1,"Near":2,"Critical":3,"Limit floor":4][level] }
 func userFacingRiskLabel(_ assessment:RiskAssessment)->String? {
  let normalized=assessment.level.replacingOccurrences(of:"At least ",with:"")
- guard ["Watch","Near","Critical"].contains(normalized) else{return nil}
+ guard ["Watch","Near","Critical","Limit floor"].contains(normalized) else{return nil}
  return assessment.level
 }
 func userFacingRiskChatTitle(_ title:String,showTitles:Bool)->String {

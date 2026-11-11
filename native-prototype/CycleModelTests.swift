@@ -282,6 +282,13 @@ final class TestLockedCounter:@unchecked Sendable {
   assert(assessRisk(model:beta,estimatedTextTokens:beta.watch,measurement:.complete).level=="Watch")
   assert(assessRisk(model:beta,estimatedTextTokens:beta.near,measurement:.complete).level=="Near")
   assert(assessRisk(model:beta,estimatedTextTokens:beta.critical,measurement:.complete).level=="Critical")
+  assert(assessRisk(model:beta,estimatedTextTokens:beta.limitFloor-1,measurement:.complete).level=="Critical")
+  assert(assessRisk(model:beta,estimatedTextTokens:beta.limitFloor,measurement:.complete).level=="Limit floor")
+  assert(assessRisk(model:personal,estimatedTextTokens:personal.limitFloor,measurement:.complete).level=="Limit floor")
+  assert(assessRisk(model:beta,estimatedTextTokens:beta.limitFloor,measurement:.partial).level=="At least Limit floor")
+  assert(riskNotificationNeeded(previousObservedRank:3,lastAcceptedRank:3,next:assessRisk(model:beta,estimatedTextTokens:beta.limitFloor,measurement:.complete))=="Limit floor")
+  assert(riskNotificationNeeded(previousObservedRank:4,lastAcceptedRank:4,next:assessRisk(model:beta,estimatedTextTokens:beta.critical,measurement:.complete))==nil)
+  assert(partialRiskNotificationNeeded(lastAcceptedRank:3,lowerBoundTokens:beta.limitFloor,model:beta)=="Limit floor")
   let cutoff=1_800_000_000_000.0
   func maintenanceRecord(_ id:String,checked:Double,tokens:Int=131_546,result:String="Partial · pagination_progressing")->ChatRecord {
    let aggregate=SafeAggregate(conversationId:id,title:"private",processedMessageIds:[],messagesCollected:1282,userMessages:641,assistantMessages:641,otherMessages:0,estimatedTextTokens:tokens,attachments:.init(images:0,audio:0,video:0,files:0),historyComplete:false,hasPreviousPage:true,hasNextPage:nil,responsesCaptured:2,updatedAt:nil)
@@ -337,7 +344,7 @@ final class TestLockedCounter:@unchecked Sendable {
   assert(persistedChatRecordDiagnostic(routeConversationID:nil,state:diagnosticState).displayText=="matched: no · reason route_id_unavailable")
   assert(persistedChatRecordDiagnostic(routeConversationID:"route-secret-id",state:nil).displayText=="matched: no · reason state_not_loaded")
   // Token thresholds never label a chat Limit reached.
-  assert(assessRisk(model:beta,estimatedTextTokens:900000,measurement:.complete).level=="Critical")
+  assert(assessRisk(model:beta,estimatedTextTokens:900000,measurement:.complete).level=="Limit floor")
   assert(assessRisk(model:beta,estimatedTextTokens:beta.watch-1,measurement:.partial).level=="Unknown")
   let timedOutMeasurement=riskMeasurementStatus(result:"Timed out · per_chat_timeout · pagination · timeout_during_cached_replay",aggregate:nil)
   assert(assessRisk(model:beta,estimatedTextTokens:nil,measurement:timedOutMeasurement).level=="Unknown")

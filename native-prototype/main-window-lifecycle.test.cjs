@@ -4,6 +4,7 @@ const fs=require('node:fs');
 const path=require('node:path');
 
 const main=fs.readFileSync(path.join(__dirname,'Main.swift'),'utf8');
+const engine=fs.readFileSync(path.join(__dirname,'CycleEngine.swift'),'utf8');
 const model=fs.readFileSync(path.join(__dirname,'CycleModel.swift'),'utf8');
 const section=(source,start,end)=>{
   const from=source.indexOf(start);
@@ -82,6 +83,50 @@ test('main window separates confirmed risks from compact plain-language uncertai
   assert.match(uncertainty,/Hide until new activity/);
   assert.match(uncertainty,/Last checked:/);
   assert.doesNotMatch(uncertainty,/monitoringWarningReason|lastCheckResult|per_chat_timeout|pagination_progressing|waiting_history/);
+});
+
+test('Task 91 continuation source delivery is transient and exact-owner fenced',()=>{
+  assert.match(main,/struct ContinuationSourceMessage:Equatable/);
+  assert.match(main,/struct ContinuationSourcePreview/);
+  assert.match(main,/Preparing source context…/);assert.match(main,/Source captured/);assert.match(main,/Couldn’t prepare source context\./);
+  assert.match(main,/func beginContinuationSourcePreview\(/);assert.match(main,/func closeContinuationSourcePreview\(\)[\s\S]*continuationSourcePreview=nil/);
+  assert.match(main,/func bindContinuationSourceCheckOwner\(conversationID:String,generation:String,ownerGeneration:String\)->Bool/);
+  const receive=section(main,'func receiveContinuationSourceEvent(_ data:[String:Any])','func renderUserUI()');
+  for(const guardPart of ['preview.status == .loading','id==preview.conversationID','generation==preview.generation','owner==preview.ownerGeneration','automationToken==owner','chatCheckExpectedConversationID==id'])assert.ok(receive.includes(guardPart),`missing source ownership guard ${guardPart}`);
+  assert.match(receive,/incoming\.prefix\(160\)/);assert.match(receive,/min\(30000/);assert.match(receive,/32000-totalUnits/);assert.match(receive,/totalTokens\+estimate>4000/);
+  assert.match(receive,/preview.status = \.ready/);assert.match(receive,/preview.status = \.failed/);
+  assert.match(main,/data\["event"\] as\? String=="continuation_source" \{receiveContinuationSourceEvent\(data\)\}/);
+  assert.match(engine,/source\.status == \.loading \{source\.status = \.failed/);
+});
+
+test('Task 91 continuation UI uses exact risk rows, bounded handoff, stored copy, and external root chat',()=>{
+  const risk=section(main,'func continuationRiskDisplayLabel(','func buildContinuationHandoff(');
+  for(const expected of ['case .near:return "Near"','case .critical:return "Critical"','case .limitFloor:return "Limit floor"','case .near:return "At least Near"','case .critical:return "At least Critical"','case .limitFloor:return "At least Limit floor"'])assert.ok(risk.includes(expected),`missing eligible risk label ${expected}`);
+  assert.doesNotMatch(risk,/case \.watch:return|case \.normal:return|case \.uncertain:return/);
+  const rowRender=section(main,'func renderUserUI()','func mainUILayoutRect(');
+  assert.match(rowRender,/continuationRiskDisplayLabel\(record:record,model:model,nowMs:nowMs\) != nil/);
+  assert.match(rowRender,/continuationPrepareTagToConversationID\[nextContinuationPrepareTag\]=record\.conversationId/);
+  const prepare=section(main,'@objc func prepareContinuation(_ sender:NSButton)','func closeContinuationSourcePreview()');
+  assert.match(prepare,/continuationPrepareTagToConversationID\[sender\.tag\]/);assert.match(prepare,/cycleState\.records\[id\]/);
+  assert.doesNotMatch(prepare,/record\.title\s*==|web\.url|conversationID\(in:/);
+  assert.match(prepare,/let generation=UUID\(\)\.uuidString/);
+  assert.match(prepare,/captureContinuationSource:true,captureGeneration:generation/);
+  assert.match(prepare,/beginContinuationSourcePreview\(conversationID:id,title:record\.title,riskDisplayLabel:risk/);
+  const builder=section(main,'func buildContinuationHandoff(','struct ContinuationSourcePreview');
+  for(const required of ['# Conversation continuation','Source: \\(title','Risk: \\(risk','Context coverage: \\(coverage','User','Assistant','bounded excerpt','may omit important context','## Continuation instruction','ask instead of inventing it'])assert.ok(builder.includes(required),`handoff missing ${required}`);
+  assert.match(builder,/createdAt/);assert.doesNotMatch(builder,/conversationID|conversationId|generation|full history|complete summary/i);
+  const preview=section(main,'func renderContinuationPreview()','@objc func closeContinuationPreviewWindow()');
+  assert.match(preview,/preview\.status == \.ready && !preview\.handoffText\.isEmpty/);
+  const copy=section(main,'@objc func copyContinuationHandoff()','@objc func openContinuationNewChat()');
+  assert.match(copy,/preview\.status == \.ready,!preview\.handoffText\.isEmpty/);assert.match(copy,/let exact=preview\.handoffText/);
+  assert.match(copy,/setString\(exact,forType:\.string\)/);assert.match(copy,/preview\.copyFeedback="Copied"/);
+  assert.doesNotMatch(copy,/buildContinuationHandoff|conversationID|generation|URL\(|web\.load/);
+  const open=section(main,'@objc func openContinuationNewChat()','func receiveContinuationSourceEvent(');
+  assert.match(open,/URL\(string:"https:\/\/chatgpt\.com\/"\)/);assert.match(open,/NSWorkspace\.shared\.open\(url\)/);
+  assert.doesNotMatch(open,/\/c\/|branch|NSPasteboard|paste|send|web\.load/);
+  assert.match(main,/func beginContinuationSourcePreview\([\s\S]*?ContinuationSourcePreview\(conversationID:conversationID[\s\S]*status:\.loading\)/);
+  assert.match(main,/var handoffText=""/);assert.match(main,/var copyFeedback:String\?/);
+  assert.match(main,/func closeContinuationSourcePreview\(\)[\s\S]*continuationSourcePreview=nil/);
 });
 
 test('Needs attention hides stale Partial rows and only uses the activity timestamp gate for new activity copy',()=>{

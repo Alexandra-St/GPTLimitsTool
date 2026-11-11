@@ -702,7 +702,7 @@ test('v5.59 allows one bounded same-document continuation after replay or new-hi
  assert.match(start,/activeChatCheckWorkers\.contains/);
  assert.match(start,/scheduler-continuation-/);
  assert.match(start,/withBackgroundRenderSurface\(owner:continuationLeaseOwner\)/);
- assert.match(record,/checkRecord\(_ record: ChatRecord,continuation:ChatCheckContinuationCheckpoint\?=nil,budget:ChatCheckBudgetController\)/);
+ assert.match(record,/checkRecord\(_ record: ChatRecord,continuation:ChatCheckContinuationCheckpoint\?=nil,budget:ChatCheckBudgetController(?:,captureContinuationSource:Bool=false,captureGeneration:String\?=nil)?\)/);
  assert.match(record,/chatCheckTerminalUpdate=nil/);
  assert.match(record,/context\?\["documentIdentity"\] as\? String==continuation\.documentIdentity/);
  assert.match(record,/web\.load\(URLRequest\(url:URL\(string:"https:\/\/chatgpt\.com\/c\/"\+record\.conversationId\)!\)\)/);
@@ -1163,7 +1163,7 @@ test('native risk UI uses a local beta fallback and only sanitized transition no
  assert.match(model,/normals.count>=2,limits.count>=2,let safe=normals.max\(\),let floor=limits.min\(\),safe<floor/);
  assert.match(model,/func riskUpwardCrossing/);assert.match(model,/measurement == \.complete/);
  assert.match(model,/func shouldDispatchSystemRiskNotification\(kind:String,level:String\)->Bool/);
- assert.match(model,/kind=="risk" && \["Watch","Near","Critical"\]\.contains\(level\)/);
+ assert.match(model,/kind=="risk" && \["Watch","Near","Critical","Limit floor"\]\.contains\(level\)/);
  assert.match(engine,/guard shouldDispatchSystemRiskNotification\(kind:kind,level:level\) else\{return\}/);
  assert.match(engine,/notifications accepted/);assert.match(engine,/dispatch audit stored locally/);
  assert.match(model,/A recent chat is approaching the conversation length limit/);
@@ -1185,10 +1185,20 @@ test('native risk UI uses a local beta fallback and only sanitized transition no
 assert.match(main,/pinnedDiagnosticVersion="6.1.0"/);
 });
 
+test('Task 91 continuation source capture is opt-in on exact-ID checkRecord',()=>{
+ const record=section(engine,'func checkRecord(','\n}');
+ assert.match(engine,/func checkRecord\([^\n]*captureContinuationSource:Bool=false,captureGeneration:String\?=nil/);
+ assert.match(record,/bindContinuationSourceCheckOwner\(conversationID:record\.conversationId,generation:sourceGeneration,ownerGeneration:token\)/);
+ assert.match(record,/"captureContinuationSource":shouldCaptureContinuationSource/);
+ assert.match(record,/if shouldCaptureContinuationSource \{config\["captureGeneration"\]=sourceGeneration\}/);
+ const normal=section(engine,'func startCycle(trigger:String)','func checkRecord(');
+ assert.doesNotMatch(normal,/captureContinuationSource\s*:\s*true/);
+});
+
 test('v6.1.1 partial-risk notifications use one post-result decision for timeout and other incomplete outcomes',()=>{
  assert.match(model,/func incompleteRiskNotificationNeeded\(measurement:RiskMeasurementStatus,lastAcceptedRank:Int\?,lowerBoundTokens:Int\?,model:RiskModel\)->String\?/);
  assert.match(model,/guard measurement != \.complete else\{return nil\}[\s\S]*partialRiskNotificationNeeded/);
- assert.match(model,/case \.near:rank=2;case \.critical:rank=3;case \.normal,\.uncertain,\.watch:return nil/);
+ assert.match(model,/case \.near:rank=2;case \.critical:rank=3;case \.limitFloor:rank=4;case \.normal,\.uncertain,\.watch:return nil/);
  assert.match(engine,/case \.failure\(let error\):[\s\S]*let partialAggregate=timeoutProgressPartialAggregate[\s\S]*terminal="Partial · pagination_progressing · per_chat_timeout[\s\S]*saved\.lastCheckResult=terminal[\s\S]*terminal="Timed out · per_chat_timeout[\s\S]*saved\.lastCheckResult=terminal[\s\S]*saved\.lastCheckResult="Failed · check_error"/);
  assert.match(engine,/let finalMeasurement=riskMeasurementStatus\(result:saved\.lastCheckResult,aggregate:saved\.aggregate\)[\s\S]*if let aggregate=saved\.aggregate,finalMeasurement != \.complete[\s\S]*incompleteRiskNotificationNeeded\(measurement:finalMeasurement,lastAcceptedRank:saved\.lastNotifiedRiskRank,lowerBoundTokens:aggregate\.estimatedTextTokens,model:model\)/);
  assert.match(engine,/func finishNotificationAudit[\s\S]*if kind=="risk",let rank=riskRank\(level\) \{record\.lastNotifiedRiskRank=rank\}/);
