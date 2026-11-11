@@ -1,17 +1,34 @@
 #!/bin/sh
 set -eu
+mode=build
+out_arg=""
+case "${1:-}" in
+  --typecheck)
+    [ "$#" -eq 1 ] || { echo "Usage: build.sh --typecheck" >&2; exit 2; }
+    mode=typecheck
+    ;;
+  --verify)
+    [ "$#" -le 2 ] || { echo "Usage: build.sh --verify [bundle-path]" >&2; exit 2; }
+  mode=verify
+    out_arg=${2:-}
+    ;;
+  "") ;;
+  -* ) echo "Unknown option: $1" >&2; exit 2 ;;
+  *)
+    [ "$#" -eq 1 ] || { echo "Usage: build.sh [bundle-path]" >&2; exit 2; }
+    out_arg=$1
+    ;;
+esac
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 default_out="$root/native-prototype/build/GPTLimitsNativePrototype.app"
-mode=build
-if [ "${1:-}" = "--typecheck" ]; then
-  [ "$#" -eq 1 ] || { echo "Usage: build.sh --typecheck" >&2; exit 2; }
-  mode=typecheck
-  out=$default_out
-elif [ "${1:-}" = "--verify" ]; then
-  mode=verify
-  out=${2:-$default_out}
-else
-  out=${1:-$default_out}
+if [ "$mode" = build ]; then
+  if [ -n "$out_arg" ]; then out=$out_arg
+  else
+    staging_dir=$(mktemp -d /private/tmp/GPTLimitsTool-build.XXXXXX)
+    out="$staging_dir/GPTLimitsNativePrototype.app"
+  fi
+elif [ "$mode" = verify ]; then out=${out_arg:-$default_out}
+else out="$default_out"
 fi
 main="$root/native-prototype/Main.swift"
 manifest="$root/extension/manifest.json"
@@ -120,6 +137,10 @@ PLIST
 /usr/bin/sed -i '' -e "s/__VERSION__/$version/g" -e "s/__BUILD_ID__/$build_id/g" -e "s/__BUILT_AT__/$built_at/g" "$out/Contents/Info.plist"
 printf 'APPL????' > "$out/Contents/PkgInfo"
 /usr/bin/plutil -lint "$out/Contents/Info.plist" >/dev/null
+# The synced workspace may attach Finder/FileProvider metadata to generated output.
+# Remove filesystem metadata from this disposable bundle only before signing.
+xattr -cr "$out"
+find "$out" -name '._*' -type f -delete
 /usr/bin/codesign --force --deep --sign - "$out" >/dev/null
 verify_bundle
 printf 'Built stable app: %s\nBuild timestamp UTC: %s\n' "$out" "$built_at"

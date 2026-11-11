@@ -2,21 +2,21 @@
 set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 build_script="$root/native-prototype/build.sh"
-build_app="$root/native-prototype/build/GPTLimitsNativePrototype.app"
+build_app=${1:?Usage: install-local.sh <verified-source-app> [--test-root /private/tmp/test-root]}
 bundle_id="com.alexandrast.gptlimitstool"
 executable_name="GPTLimitsNativePrototype"
 install_name="GPT Limits Tool.app"
 test_mode=0
 
+shift
 if [ "${1:-}" = "--test-root" ]; then
   test_mode=1
-  install_root=${2:?Usage: install-local.sh --test-root /private/tmp/test-root [--build-app path]}
+  install_root=${2:?Usage: install-local.sh <verified-source-app> --test-root /private/tmp/test-root}
   case "$install_root" in /private/tmp/*) ;; *) echo "Test root must be under /private/tmp." >&2; exit 2;; esac
   shift 2
-  if [ "${1:-}" = "--build-app" ]; then build_app=${2:?Missing test build app}; shift 2; fi
   [ "$#" -eq 0 ] || { echo "Unexpected installer arguments." >&2; exit 2; }
 else
-  [ "$#" -eq 0 ] || { echo "Usage: install-local.sh [--test-root /private/tmp/test-root [--build-app path]]" >&2; exit 2; }
+  [ "$#" -eq 0 ] || { echo "Usage: install-local.sh <verified-source-app>" >&2; exit 2; }
   install_root=/Applications
 fi
 

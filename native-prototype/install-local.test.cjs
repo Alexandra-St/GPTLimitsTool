@@ -7,9 +7,10 @@ const { spawnSync } = require('node:child_process');
 
 const root = path.resolve(__dirname, '..');
 const installer = path.join(__dirname, 'install-local.sh');
-const stableBundle = process.env.GPT_LIMITS_TEST_APP || path.join(__dirname, 'build', 'GPTLimitsNativePrototype.app');
+const stagingBundle = '/private/tmp/GPTLimitsTool-Step27.app';
+const stableBundle = process.env.GPT_LIMITS_TEST_APP || (fs.existsSync(stagingBundle) ? stagingBundle : path.join(__dirname, 'build', 'GPTLimitsNativePrototype.app'));
 const tempRoot = () => fs.mkdtempSync(path.join('/private/tmp', 'gpt-limits-install-test-'));
-const installAt = (dir, build = stableBundle) => spawnSync('sh', [installer, '--test-root', dir, '--build-app', build], { encoding: 'utf8' });
+const installAt = (dir, build = stableBundle) => spawnSync('sh', [installer, build, '--test-root', dir], { encoding: 'utf8' });
 const plist = (bundle, key) => spawnSync('/usr/libexec/PlistBuddy', ['-c', `Print :${key}`, path.join(bundle, 'Contents', 'Info.plist')], { encoding: 'utf8' }).stdout.trim();
 
  test('installer performs a fresh local install using release name and app icon metadata', () => {
@@ -63,8 +64,28 @@ test('installer rejects a stale build before touching an existing installation',
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('explicit staging source is installed and verified independent of repository build artifact', () => {
+  const dir = tempRoot();
+  try {
+    const result = installAt(dir, stableBundle);
+    assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+    const installed = path.join(dir, 'GPT Limits Tool.app');
+    const sourceId = plist(stableBundle, 'GPTLimitsBuildID');
+    assert.ok(sourceId);
+    assert.equal(plist(installed, 'GPTLimitsBuildID'), sourceId);
+    const executable = fs.readFileSync(path.join(installed, 'Contents', 'MacOS', 'GPTLimitsNativePrototype'));
+    assert.ok(executable.includes(Buffer.from(sourceId)));
+    const verify = spawnSync('sh', [path.join(__dirname, 'build.sh'), '--verify', installed], { encoding: 'utf8' });
+    assert.equal(verify.status, 0, `${verify.stdout}\n${verify.stderr}`);
+    const signature = spawnSync('/usr/bin/codesign', ['--verify', '--deep', '--strict', installed], { encoding: 'utf8' });
+    assert.equal(signature.status, 0, `${signature.stdout}\n${signature.stderr}`);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('production installer stops only matching app executables before replacing the installed bundle', () => {
   const source = fs.readFileSync(installer, 'utf8');
+  assert.match(source,/build_app=\$\{1:/);
+  assert.doesNotMatch(source,/build_app=\"\$root\/native-prototype\/build\/GPTLimitsNativePrototype\.app\"/);
   assert.ok(source.indexOf('process_ids=$(pgrep -x') < source.indexOf('ditto --rsrc --extattr'));
   assert.match(source, /case "\$process_executable" in[\s\S]*"\$build_executable"\|"\$installed_executable"/);
   assert.match(source, /"\$lsregister" -f "\$install_app"/);
