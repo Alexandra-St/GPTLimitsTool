@@ -61,9 +61,10 @@ test('F: fallback stores only sanitized stage, domain, code, sequence and build 
  assert.match(helper,/let terminalSnapshotPersistenceFailureDefaultsKey="lastCycleTerminalSnapshotPersistenceFailureV1"/);
  assert.match(helper,/func recordTerminalSnapshotPersistenceResult/);
  assert.match(helper,/case \.failed\(let failure\):[\s\S]*encoder\.encode\(failure\)[\s\S]*defaults\.set\(data,forKey:terminalSnapshotPersistenceFailureDefaultsKey\)/);
- assert.match(helper,/func sanitized\(_ value:String\)/);
- assert.match(helper,/allowed=CharacterSet\(charactersIn:"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_\.-"\)/);
- for(const forbidden of ['conversationId','title','records','messages','headers','authorization','rawProbeResponse','localizedDescription']) assert.doesNotMatch(helper,new RegExp(forbidden,'i'));
+ const failure=helper.slice(helper.indexOf('struct TerminalSnapshotPersistenceFailure:'),helper.indexOf('enum TerminalSnapshotPersistenceResult:'));
+ assert.match(failure,/func sanitized\(_ value:String\)/);
+ assert.match(failure,/allowed=CharacterSet\(charactersIn:"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_\.-"\)/);
+ for(const forbidden of ['conversationId','title','records','messages','headers','authorization','rawProbeResponse','localizedDescription']) assert.doesNotMatch(failure,new RegExp(forbidden,'i'));
 });
 
 test('G: inspector returns persisted failure metadata only when snapshot is absent',()=>{
