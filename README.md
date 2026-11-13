@@ -1,18 +1,23 @@
 # GPTLimitsTool
 
-**Frozen research prototype**
+**Frozen research prototype · Native macOS and JavaScript**
 
-GPTLimitsTool explored whether a local macOS app could warn when a ChatGPT conversation was approaching its practical conversation or context limit.
+GPTLimitsTool explored an early warning for conversations approaching their practical ChatGPT limit. I built a native macOS app connected to the authenticated ChatGPT page through a JavaScript/native bridge, then live-tested its conversation inspection pipeline.
 
-## What was built
+The prototype reached working discovery and bounded checks across real conversations. Development stopped at a product viability gate: the available client data could not support an authoritative near-limit metric. No reliable remaining-capacity warning was shipped.
 
-- A native macOS prototype integrated with the authenticated ChatGPT page.
-- Network and deterministic virtualized-sidebar discovery, combined into one conversation set.
-- Bounded conversation inspection, persistent cycle state, budget-aware scheduling, deferred work, and pagination/liveness handling.
-- Cached-history aggregation with stable message deduplication.
+## Engineering highlights
 
-The discovery and execution pipeline became functional and was exercised against real conversations. The available ChatGPT web-client contract did not expose authoritative current context usage, remaining capacity, or an established failure threshold. Long-history pagination also lacked enough guarantees to establish a trustworthy complete total.
+- Deterministic discovery across ChatGPT’s virtualized sidebar, combined with network discoveries.
+- A JavaScript ↔ native macOS bridge for conversation discovery and bounded inspection.
+- Persistent cycle and check state across runs and builds, including deferred work.
+- Budget-aware scheduling and pagination/liveness handling for long conversations.
+- Live validation of the inspection pipeline and an evidence-based product viability decision.
 
-An exact “remaining capacity” warning would therefore present heuristics as authoritative data. The project was intentionally frozen rather than shipping a misleading metric.
+## Why the prototype is frozen
+
+The available page contract did not expose authoritative current context usage, remaining capacity, or an established failure threshold. Message counts can be incomplete, and estimated text tokens are heuristic. Long-history pagination also lacked the guarantees needed to prove a complete total. Using these signals for an exact remaining-capacity warning would overstate what the data supports.
+
+The result is a working inspection prototype, not a reliable near-limit warning product. Resuming product development requires an authoritative usage signal and a trustworthy threshold to compare against.
 
 See [Architecture](docs/ARCHITECTURE.md), [Validation](docs/VALIDATION.md), and [Postmortem](docs/POSTMORTEM.md).

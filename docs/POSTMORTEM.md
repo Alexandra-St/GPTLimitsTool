@@ -1,33 +1,25 @@
 # Postmortem
 
-## Original hypothesis
+## Hypothesis
 
-A local macOS tool could warn before a ChatGPT conversation became unusable or needed continuation in a new chat.
+A local macOS tool could warn before a ChatGPT conversation approached the point where it became unusable or needed continuation in a new chat.
 
-## Technical approach
+## Architecture and implementation
 
-The prototype combined a native macOS cycle engine with JavaScript running in the authenticated ChatGPT page. Network and deterministic sidebar discovery fed a unified conversation set. A bounded queue checked selected conversations, persisted unfinished work across cycles, and merged observed history using stable message identities.
+The native macOS app owned cycle scheduling, persistence, and per-chat execution. A JavaScript bridge in the authenticated ChatGPT page combined network discovery with deterministic traversal of the virtualized sidebar. A bounded queue checked discovered conversations, preserved deferred work across cycles, and aggregated observed history using stable message identities.
 
-## What worked
+## Live evidence
 
-Discovery, cycle persistence, budget-aware scheduling, deferred work, and pagination progress handling became functional and were exercised against real conversations. Focused regression tests preserved these mechanisms as the implementation evolved.
+The discovery and inspection pipeline worked against real conversations. Live cycles exercised unified network/sidebar discovery, budget-aware scheduling, persistent cycle state, and completed checks. Regression work corrected cross-build completion persistence, budget over-admission, and a false no-progress watchdog result. These fixes made the pipeline more dependable; they did not establish that all history had been collected.
 
-## What failed
+## Data-contract limitation
 
-The product needed a trustworthy estimate of how close a conversation was to its practical limit. The available page contract did not expose current context usage, remaining capacity, or the threshold corresponding to failure. History pagination could return useful pages but did not provide enough ordering and adjacency guarantees to prove a complete long-history total.
+The page contract did not provide authoritative current context usage, remaining capacity, or a trustworthy threshold tied to the point of failure. Message counts were lower bounds when history was incomplete. `estimatedTextTokens` and locally learned thresholds were heuristics. Pagination responses lacked enough ordering and cursor-adjacency guarantees to prove a complete long-history total or reconstruct a safe incremental frontier.
 
-## Important bugs and lessons
+## Decision
 
-The work uncovered and fixed issues in completed-cycle persistence, scheduling under a finite cycle budget, and pagination liveness. Accepted page activity, aggregated new messages, and proven history completion are separate facts; treating one as another produced misleading state. Preserving those distinctions improved the execution pipeline but did not solve the product’s measurement problem.
+I rejected using those estimates as an exact near-limit warning. The prototype reached a working inspection pipeline, then development was intentionally stopped at the viability gate because the available data source could not support the product’s accuracy requirement. The exact remaining-capacity warning was not shipped.
 
-## Viability gate
+## Redesign requirement
 
-Observed message counts are lower bounds when history is incomplete. `estimatedTextTokens` is a heuristic derived from collected text, and locally learned thresholds are heuristic rather than tied to the actual failure condition. These estimates were rejected as insufficient for a reliable near-limit warning.
-
-## Why the project was frozen
-
-The prototype was not frozen because conversation discovery or execution could not be implemented. It was frozen because the available source data could not satisfy the accuracy guarantee required by the product. Presenting an exact remaining-capacity warning from these estimates would be misleading.
-
-## What a future redesign would require
-
-A future version must begin with an authoritative signal for current conversation/context usage or remaining capacity, plus the trustworthy limit threshold being compared against. Implementation should not resume until both sides of that comparison have established semantics.
+A viable redesign must begin with an authoritative signal for current conversation/context usage or remaining capacity, and an established limit threshold for comparison. Implementation should resume only after both signals and their semantics are confirmed.
