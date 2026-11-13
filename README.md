@@ -21,3 +21,7 @@ The available page contract did not expose authoritative current context usage, 
 The result is a working inspection prototype, not a reliable near-limit warning product. Resuming product development requires an authoritative usage signal and a trustworthy threshold to compare against.
 
 See [Architecture](docs/ARCHITECTURE.md), [Validation](docs/VALIDATION.md), and [Postmortem](docs/POSTMORTEM.md).
+
+## License / Usage
+
+Source is available for portfolio review and personal, non-commercial evaluation. This project is not open source. Reuse, redistribution, derivative works, and commercial use require prior written permission. See the [Portfolio Source-Available Notice](LICENSE).
