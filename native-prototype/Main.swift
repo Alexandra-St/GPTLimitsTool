@@ -1940,10 +1940,9 @@ let pinnedDiagnosticVersion="6.1.0"
         guard bundleBuildVersion==gptLimitsAppVersion,
               gptLimitsExecutableBuildVersionMarker==gptLimitsAppVersion,
               bundleBuildID==gptLimitsExecutableBuildIDMarker else { return "unexpected" }
-        let stableRoot="/Users/alexandra/Projects/GPTLimitsTool/native-prototype/build/GPTLimitsNativePrototype.app/Contents/MacOS/"
         let installedRoot="/Applications/GPT Limits Tool.app/Contents/MacOS/"
         if executable.hasPrefix(installedRoot) { return "installed/local release" }
-        if executable.hasPrefix(stableRoot) { return "stable build" }
+        if executable.contains("/native-prototype/build/GPTLimitsNativePrototype.app/Contents/MacOS/") { return "stable build" }
         return "unexpected"
     }
     func appWindowType(_ number:Int)->String {

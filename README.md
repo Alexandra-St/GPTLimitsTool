@@ -6,6 +6,8 @@ GPTLimitsTool explored an early warning for conversations approaching their prac
 
 The prototype reached working discovery and bounded checks across real conversations. Development stopped at a product viability gate: the available client data could not support an authoritative near-limit metric. No reliable remaining-capacity warning was shipped.
 
+> **Historical warning:** Builds and source may still show experimental Near/Critical labels based on heuristic token estimates. These are not authoritative measurements of ChatGPT context limits or remaining capacity.
+
 ## Engineering highlights
 
 - Deterministic discovery across ChatGPT’s virtualized sidebar, combined with network discoveries.
@@ -21,6 +23,8 @@ The available page contract did not expose authoritative current context usage, 
 The result is a working inspection prototype, not a reliable near-limit warning product. Resuming product development requires an authoritative usage signal and a trustworthy threshold to compare against.
 
 See [Architecture](docs/ARCHITECTURE.md), [Validation](docs/VALIDATION.md), and [Postmortem](docs/POSTMORTEM.md).
+
+The prototype processes conversation metadata locally; local state may include conversation titles, IDs, and derived estimates. Rescue exports intentionally contain selected conversation content as user-created local HTML and TXT files.
 
 ## License / Usage
 

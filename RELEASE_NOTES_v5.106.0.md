@@ -1,3 +1,5 @@
+> **Historical research build:** Later validation found no authoritative context-usage or remaining-capacity signal and no trustworthy failure threshold. The warning labels in this beta were experimental heuristics; do not use this build as an accurate remaining-capacity tool. The current [README](README.md) and [postmortem](docs/POSTMORTEM.md) record the final research conclusion.
+
 # GPT Limits Tool v5.106.0 Beta
 
 The first public beta of GPT Limits Tool is ready.

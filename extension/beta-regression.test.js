@@ -324,9 +324,9 @@ test("beta 25: calibration labels and research controls are collapsed by default
   assert.match(html, /id="calibration-points"/);
 });
 
-test("beta 26: privacy copy states local aggregate and message text policy", () => {
+test("beta 26: privacy copy and frozen research status", () => {
   assert.match(read("popup.html"), /GPT Limits Tool stores local aggregate counts and message IDs for deduplication\. Message text is not stored\./);
   const readme = read("../README.md");
-  for (const phrase of ["No paid API is used", "do not make their own undocumented ChatGPT API requests", "do not extract cookies, tokens, or passwords", "does not store message text", "runs locally"]) assert.ok(readme.includes(phrase), `README includes ${phrase}`);
+  for (const phrase of ["Frozen research prototype", "No reliable remaining-capacity warning was shipped", "conversation titles, IDs, and derived estimates", "user-created local HTML and TXT files"]) assert.ok(readme.includes(phrase), `README includes ${phrase}`);
 });
 
